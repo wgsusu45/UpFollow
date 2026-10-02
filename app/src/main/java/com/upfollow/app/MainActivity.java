@@ -160,17 +160,27 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
-    // 100% FIXED FOLLOW SCRIPT (Exact Button Match, Ignores Stats Text)
+    // Follow Script with Auto Action-Block & Suspension Detection
     private void injectFollowScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
-            "       // 1. Dismiss any overlay popups first" +
+            "       var bodyText = (document.body.innerText || '').toLowerCase();" +
+            "       // 1. Check Action Block / Suspension / Limit" +
+            "       if (bodyText.includes('try again later') || bodyText.includes('we limit how often') || bodyText.includes('action blocked') || bodyText.includes('feedback_required')) {" +
+            "           window.WorkerBridge.onTaskResult(false, 'Account Limit Reached (Action Blocked)');" +
+            "           return;" +
+            "       }" +
+            "       if (bodyText.includes('suspended') || bodyText.includes('help us confirm') || bodyText.includes('confirm your info') || bodyText.includes('checkpoint')) {" +
+            "           window.WorkerBridge.onTaskResult(false, 'Account Suspended/Checkpoint');" +
+            "           return;" +
+            "       }" +
+            "       // 2. Dismiss Popups" +
             "       var dismissBtns = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
             "       dismissBtns.forEach(p => {" +
             "           var pt = (p.innerText || '').trim().toLowerCase();" +
             "           if (pt === 'not now' || pt === 'cancel' || pt === 'allow all' || pt === 'accept' || pt === 'close') p.click();" +
             "       });" +
-            "       // 2. Exact match for Follow button ONLY" +
+            "       // 3. Search Follow Button" +
             "       var allButtons = Array.from(document.querySelectorAll('header button, main button, button, div[role=\"button\"]'));" +
             "       var followBtn = allButtons.find(b => {" +
             "           var t = (b.innerText || b.textContent || '').trim();" +
@@ -182,11 +192,17 @@ public class MainActivity extends Activity {
             "               followBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "           });" +
             "           setTimeout(function() {" +
-            "               window.WorkerBridge.onTaskResult(true, 'Success');" +
+            "               // Check if clicked turned into Action Block" +
+            "               var afterText = (document.body.innerText || '').toLowerCase();" +
+            "               if (afterText.includes('try again later') || afterText.includes('limit how often') || afterText.includes('action blocked')) {" +
+            "                   window.WorkerBridge.onTaskResult(false, 'Account Limit Reached (Action Blocked)');" +
+            "               } else {" +
+            "                   window.WorkerBridge.onTaskResult(true, 'Success');" +
+            "               }" +
             "           }, 900);" +
             "           return;" +
             "       }" +
-            "       // 3. Header button check for already following" +
+            "       // 4. Header Following Check" +
             "       var headerFollowingBtn = allButtons.find(b => {" +
             "           var t = (b.innerText || b.textContent || '').trim();" +
             "           return (/^following$/i.test(t) || /^requested$/i.test(t)) && b.closest('header, main');" +
@@ -204,17 +220,27 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(js, null);
     }
 
-    // 100% FIXED LIKES SCRIPT (Reels + Posts)
+    // Like Script with Auto Action-Block & Suspension Detection
     private void injectLikeAndReelsScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
-            "       // 1. Dismiss popups" +
+            "       var bodyText = (document.body.innerText || '').toLowerCase();" +
+            "       // 1. Check Action Block / Suspension / Limit" +
+            "       if (bodyText.includes('try again later') || bodyText.includes('we limit how often') || bodyText.includes('action blocked')) {" +
+            "           window.WorkerBridge.onTaskResult(false, 'Account Limit Reached (Action Blocked)');" +
+            "           return;" +
+            "       }" +
+            "       if (bodyText.includes('suspended') || bodyText.includes('help us confirm') || bodyText.includes('checkpoint')) {" +
+            "           window.WorkerBridge.onTaskResult(false, 'Account Suspended/Checkpoint');" +
+            "           return;" +
+            "       }" +
+            "       // 2. Dismiss popups" +
             "       var popups = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
             "       popups.forEach(p => {" +
             "           var pt = (p.innerText || '').trim().toLowerCase();" +
             "           if (pt === 'not now' || pt === 'cancel' || pt === 'close') p.click();" +
             "       });" +
-            "       // 2. Direct Like heart SVG search" +
+            "       // 3. Direct Like heart SVG search" +
             "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"], svg[aria-label=\"पसंद करें\"], svg[aria-label=\"Me gusta\"]');" +
             "       if (likeSvg) {" +
             "           var btn = likeSvg.closest('button') || likeSvg.closest('div[role=\"button\"]') || likeSvg.closest('span[role=\"button\"]') || likeSvg.parentElement;" +
@@ -227,7 +253,7 @@ public class MainActivity extends Activity {
             "           }, 900);" +
             "           return;" +
             "       }" +
-            "       // 3. Double tap video if Reel video exists" +
+            "       // 4. Double tap video if Reel exists" +
             "       var videoEl = document.querySelector('video');" +
             "       if (videoEl) {" +
             "           videoEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));" +
@@ -236,13 +262,13 @@ public class MainActivity extends Activity {
             "           }, 900);" +
             "           return;" +
             "       }" +
-            "       // 4. Check if already liked on post page" +
+            "       // 5. Check if already liked" +
             "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"], svg[aria-label=\"पसंद रद्द करें\"]');" +
             "       if (unlike) {" +
             "           window.WorkerBridge.onTaskResult(false, 'Already Liked');" +
             "           return;" +
             "       }" +
-            "       // 5. If on profile page, open first post" +
+            "       // 6. Open first post on profile" +
             "       var postLink = document.querySelector('main a[href*=\"/p/\"], main a[href*=\"/reel/\"]');" +
             "       if (postLink) {" +
             "           window.location.href = postLink.href;" +
