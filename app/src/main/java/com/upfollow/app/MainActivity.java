@@ -11,7 +11,11 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
+import android.provider.Settings;
+import android.util.Log;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
@@ -33,16 +37,26 @@ public class MainActivity extends Activity {
     private static final String CHANNEL_ID = "upfollow_automation_channel";
     private static final int NOTIFICATION_ID = 1001;
     private NotificationManager notificationManager;
+    private PowerManager.WakeLock wakeLock;
 
     private String currentTaskType = "follow";
-    // Flag to detect if adding secondary account vs main login
     private boolean isAddingSecondaryAccount = false;
+    private String hardwareDeviceId = "";
 
     @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        // Hardware Device ID (Persistent across app re-installs)
+        hardwareDeviceId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+
+        // WakeLock Setup
+        PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (powerManager != null) {
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UpFollow:AutomationWakeLock");
+        }
 
         createNotificationChannel();
         if (Build.VERSION.SDK_INT >= 33) {
@@ -54,6 +68,7 @@ public class MainActivity extends Activity {
         mainWebView = findViewById(R.id.webView);
         setupWebView(mainWebView);
 
+        // Worker WebView
         workerWebView = new WebView(this);
         setupWebView(workerWebView);
         
@@ -72,7 +87,6 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
 
-                // Detect when adding another account is requested
                 if (url != null && url.contains("force_authentication=1")) {
                     isAddingSecondaryAccount = true;
                 }
@@ -82,16 +96,15 @@ public class MainActivity extends Activity {
                     if (cookies != null && cookies.contains("sessionid")) {
                         try {
                             String encoded = URLEncoder.encode(cookies, "UTF-8");
+                            String dest = HOSTING_DASHBOARD + "?hw_id=" + hardwareDeviceId;
                             if (isAddingSecondaryAccount) {
                                 isAddingSecondaryAccount = false;
-                                // Append as secondary account
-                                mainWebView.loadUrl(HOSTING_DASHBOARD + "?add_cookies=" + encoded);
+                                mainWebView.loadUrl(dest + "&add_cookies=" + encoded);
                             } else {
-                                // Primary Login
-                                mainWebView.loadUrl(HOSTING_DASHBOARD + "?cookies=" + encoded);
+                                mainWebView.loadUrl(dest + "&cookies=" + encoded);
                             }
                         } catch (Exception e) {
-                            mainWebView.loadUrl(HOSTING_DASHBOARD);
+                            mainWebView.loadUrl(HOSTING_DASHBOARD + "?hw_id=" + hardwareDeviceId);
                         }
                     }
                 }
@@ -105,7 +118,7 @@ public class MainActivity extends Activity {
 
                 new Handler(Looper.getMainLooper()).postDelayed(() -> {
                     if ("like".equalsIgnoreCase(currentTaskType)) {
-                        injectLikeScript(view);
+                        injectLikeAndReelsScript(view);
                     } else {
                         injectFollowScript(view);
                     }
@@ -113,12 +126,12 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Auto login check
+        // Pass Hardware ID on App Launch
         String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
         if (cookies != null && cookies.contains("sessionid")) {
-            mainWebView.loadUrl(HOSTING_DASHBOARD);
+            mainWebView.loadUrl(HOSTING_DASHBOARD + "?hw_id=" + hardwareDeviceId);
         } else {
-            mainWebView.loadUrl(IG_LOGIN_URL);
+            mainWebView.loadUrl(HOSTING_DASHBOARD + "?hw_id=" + hardwareDeviceId + "&check_saved=1");
         }
     }
 
@@ -127,6 +140,7 @@ public class MainActivity extends Activity {
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setDatabaseEnabled(true);
+        s.setMediaPlaybackRequiresUserGesture(false);
         s.setUserAgentString(USER_AGENT);
 
         CookieManager cm = CookieManager.getInstance();
@@ -134,6 +148,7 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
+    // Follow Script
     private void injectFollowScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
@@ -155,8 +170,7 @@ public class MainActivity extends Activity {
             "           return;" +
             "       }" +
             "       ['mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
-            "           var e = new MouseEvent(evt, { bubbles: true, cancelable: true, view: window });" +
-            "           followBtn.dispatchEvent(e);" +
+            "           followBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "       });" +
             "       setTimeout(function() {" +
             "           window.WorkerBridge.onTaskResult(true, 'Success');" +
@@ -169,27 +183,40 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(js, null);
     }
 
-    private void injectLikeScript(WebView view) {
+    // Fixed Reel & Post Like Script
+    private void injectLikeAndReelsScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
-            "       var unlikeSvg = document.querySelector('svg[aria-label=\"Unlike\"]') || document.querySelector('svg[aria-label=\"पसंद रद्द करें\"]');" +
-            "       if (unlikeSvg) {" +
+            "       // 1. Check if already liked" +
+            "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"]') || document.querySelector('svg[aria-label=\"पसंद रद्द करें\"]');" +
+            "       if (unlike) {" +
             "           window.WorkerBridge.onTaskResult(true, 'Success');" +
             "           return;" +
             "       }" +
+            "       // 2. Direct Like SVG (Reels sidebar, Post heart icon)" +
             "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"]') || document.querySelector('svg[aria-label=\"पसंद करें\"]');" +
             "       if (likeSvg) {" +
             "           var btn = likeSvg.closest('button') || likeSvg.closest('div[role=\"button\"]') || likeSvg.parentElement;" +
             "           ['mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
-            "               var e = new MouseEvent(evt, { bubbles: true, cancelable: true, view: window });" +
-            "               btn.dispatchEvent(e);" +
+            "               btn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "           });" +
             "           setTimeout(function() {" +
             "               window.WorkerBridge.onTaskResult(true, 'Success');" +
             "           }, 1000);" +
             "           return;" +
             "       }" +
-            "       var firstPost = document.querySelector('article a[href*=\"/p/\"]') || document.querySelector('a[href*=\"/p/\"]');" +
+            "       // 3. Reels Video Container Double-Tap Fallback" +
+            "       var videoEl = document.querySelector('video');" +
+            "       if (videoEl) {" +
+            "           var dblClick = new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window });" +
+            "           videoEl.dispatchEvent(dblClick);" +
+            "           setTimeout(function() {" +
+            "               window.WorkerBridge.onTaskResult(true, 'Success');" +
+            "           }, 1000);" +
+            "           return;" +
+            "       }" +
+            "       // 4. Profile page fallback (Open first post)" +
+            "       var firstPost = document.querySelector('article a[href*=\"/p/\"]') || document.querySelector('article a[href*=\"/reel/\"]');" +
             "       if (firstPost) {" +
             "           firstPost.click();" +
             "           setTimeout(function() {" +
@@ -206,7 +233,7 @@ public class MainActivity extends Activity {
             "           }, 2000);" +
             "           return;" +
             "       }" +
-            "       window.WorkerBridge.onTaskResult(false, 'Like button not found');" +
+            "       window.WorkerBridge.onTaskResult(false, 'Post not found');" +
             "   } catch (err) {" +
             "       window.WorkerBridge.onTaskResult(false, 'Action error');" +
             "   }" +
@@ -255,6 +282,7 @@ public class MainActivity extends Activity {
         }
     }
 
+    // App Bridges
     public class MainAppInterface {
         @JavascriptInterface
         public void executeBrowserAction(String target, String taskType, String mediaId) {
@@ -266,6 +294,9 @@ public class MainActivity extends Activity {
                     if (mediaId != null && !mediaId.isEmpty() && !mediaId.equals("25025320")) {
                         if (mediaId.startsWith("http")) {
                             workerWebView.loadUrl(mediaId);
+                        } else if (mediaId.length() <= 12) {
+                            // Instagram Shortcode (Reel / Post)
+                            workerWebView.loadUrl("https://www.instagram.com/reel/" + mediaId + "/");
                         } else {
                             workerWebView.loadUrl("https://www.instagram.com/p/" + mediaId + "/");
                         }
@@ -278,9 +309,22 @@ public class MainActivity extends Activity {
             });
         }
 
+        // Screen Keep-On & WakeLock Toggle
         @JavascriptInterface
-        public void executeBrowserFollow(String target) {
-            executeBrowserAction(target, "follow", "");
+        public void setKeepScreenOn(boolean keepOn) {
+            new Handler(Looper.getMainLooper()).post(() -> {
+                if (keepOn) {
+                    getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    if (wakeLock != null && !wakeLock.isHeld()) {
+                        wakeLock.acquire(12 * 60 * 60 * 1000L); // 12 hours max
+                    }
+                } else {
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    if (wakeLock != null && wakeLock.isHeld()) {
+                        wakeLock.release();
+                    }
+                }
+            });
         }
 
         @JavascriptInterface
@@ -296,6 +340,13 @@ public class MainActivity extends Activity {
                 clearAutomationNotification();
             });
         }
+
+        @JavascriptInterface
+        public void openInstagramLogin() {
+            new Handler(Looper.getMainLooper()).post(() -> {
+                mainWebView.loadUrl(IG_LOGIN_URL);
+            });
+        }
     }
 
     public class WorkerAppInterface {
@@ -308,11 +359,25 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onPause() {
+        super.onPause();
+        // Do NOT pause webview timers so background tasking keeps running
+    }
+
+    @Override
     public void onBackPressed() {
         if (mainWebView.canGoBack()) {
             mainWebView.goBack();
         } else {
             super.onBackPressed();
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+        }
+        super.onDestroy();
     }
 }
