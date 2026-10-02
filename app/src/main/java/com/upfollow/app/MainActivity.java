@@ -13,7 +13,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
-import android.util.Log;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
@@ -118,18 +117,23 @@ public class MainActivity extends Activity {
             }
         });
 
+        // Worker: Immediate script injection with active polling
         workerWebView.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
+                
+                // Instant URL level checkpoint detection
+                if (url != null && (url.contains("/challenge/") || url.contains("/suspended/") || url.contains("/checkpoint/"))) {
+                    mainWebView.evaluateJavascript("if(window.onWorkerResult) window.onWorkerResult(false, 'Blocked: Account Checkpoint / Suspended');", null);
+                    return;
+                }
 
-                new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                    if ("like".equalsIgnoreCase(currentTaskType)) {
-                        injectLikeAndReelsScript(view);
-                    } else {
-                        injectFollowScript(view);
-                    }
-                }, 1800);
+                if ("like".equalsIgnoreCase(currentTaskType)) {
+                    injectFastLikeScript(view);
+                } else {
+                    injectFastFollowScript(view);
+                }
             }
 
             @Override
@@ -160,124 +164,138 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
-    // Follow Script with Auto Action-Block & Suspension Detection
-    private void injectFollowScript(WebView view) {
+    // FAST FOLLOW SCRIPT (250ms Polling + Instant Checkpoint Detection)
+    private void injectFastFollowScript(WebView view) {
         String js = "(function() {" +
-            "   try {" +
-            "       var bodyText = (document.body.innerText || '').toLowerCase();" +
-            "       // 1. Check Action Block / Suspension / Limit" +
-            "       if (bodyText.includes('try again later') || bodyText.includes('we limit how often') || bodyText.includes('action blocked') || bodyText.includes('feedback_required')) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Account Limit Reached (Action Blocked)');" +
-            "           return;" +
-            "       }" +
-            "       if (bodyText.includes('suspended') || bodyText.includes('help us confirm') || bodyText.includes('confirm your info') || bodyText.includes('checkpoint')) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Account Suspended/Checkpoint');" +
+            "   var startTime = Date.now();" +
+            "   var timer = setInterval(function() {" +
+            "       var url = window.location.href.toLowerCase();" +
+            "       var text = (document.body ? document.body.innerText : '').toLowerCase();" +
+            "       // 1. Instant Checkpoint / Block / Human Verification Detection" +
+            "       if (url.includes('/challenge/') || url.includes('/suspended/') || url.includes('/checkpoint/') || " +
+            "           text.includes('confirm you\\'re human') || text.includes('try again later') || " +
+            "           text.includes('action blocked') || text.includes('we limit how often') || " +
+            "           text.includes('help us confirm') || text.includes('suspended')) {" +
+            "           clearInterval(timer);" +
+            "           window.WorkerBridge.onTaskResult(false, 'Blocked: Action Limited / Checkpoint');" +
             "           return;" +
             "       }" +
             "       // 2. Dismiss Popups" +
-            "       var dismissBtns = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
-            "       dismissBtns.forEach(p => {" +
-            "           var pt = (p.innerText || '').trim().toLowerCase();" +
-            "           if (pt === 'not now' || pt === 'cancel' || pt === 'allow all' || pt === 'accept' || pt === 'close') p.click();" +
-            "       });" +
+            "       var popups = document.querySelectorAll('button, div[role=\"button\"]');" +
+            "       for (var i = 0; i < popups.length; i++) {" +
+            "           var pt = (popups[i].innerText || '').trim().toLowerCase();" +
+            "           if (pt === 'not now' || pt === 'cancel' || pt === 'allow all' || pt === 'accept') {" +
+            "               popups[i].click();" +
+            "           }" +
+            "       }" +
             "       // 3. Search Follow Button" +
-            "       var allButtons = Array.from(document.querySelectorAll('header button, main button, button, div[role=\"button\"]'));" +
-            "       var followBtn = allButtons.find(b => {" +
+            "       var buttons = Array.from(document.querySelectorAll('header button, main button, button, div[role=\"button\"]'));" +
+            "       var followBtn = buttons.find(b => {" +
             "           var t = (b.innerText || b.textContent || '').trim();" +
             "           return /^follow$/i.test(t) || /^follow back$/i.test(t) || t === 'फॉलो करें' || t === 'Seguir';" +
             "       });" +
             "       if (followBtn) {" +
+            "           clearInterval(timer);" +
             "           followBtn.click();" +
-            "           ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {" +
+            "           ['touchstart', 'touchend', 'mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
             "               followBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "           });" +
             "           setTimeout(function() {" +
-            "               // Check if clicked turned into Action Block" +
-            "               var afterText = (document.body.innerText || '').toLowerCase();" +
-            "               if (afterText.includes('try again later') || afterText.includes('limit how often') || afterText.includes('action blocked')) {" +
-            "                   window.WorkerBridge.onTaskResult(false, 'Account Limit Reached (Action Blocked)');" +
+            "               var afterText = (document.body ? document.body.innerText : '').toLowerCase();" +
+            "               if (afterText.includes('try again later') || afterText.includes('action blocked')) {" +
+            "                   window.WorkerBridge.onTaskResult(false, 'Blocked: Action Limited');" +
             "               } else {" +
             "                   window.WorkerBridge.onTaskResult(true, 'Success');" +
             "               }" +
-            "           }, 900);" +
+            "           }, 400);" +
             "           return;" +
             "       }" +
-            "       // 4. Header Following Check" +
-            "       var headerFollowingBtn = allButtons.find(b => {" +
+            "       // 4. Check if already following" +
+            "       var isFollowing = buttons.some(b => {" +
             "           var t = (b.innerText || b.textContent || '').trim();" +
             "           return (/^following$/i.test(t) || /^requested$/i.test(t)) && b.closest('header, main');" +
             "       });" +
-            "       if (headerFollowingBtn) {" +
+            "       if (isFollowing) {" +
+            "           clearInterval(timer);" +
             "           window.WorkerBridge.onTaskResult(false, 'Already Following');" +
             "           return;" +
             "       }" +
-            "       window.WorkerBridge.onTaskResult(false, 'Follow button not found');" +
-            "   } catch (err) {" +
-            "       window.WorkerBridge.onTaskResult(false, 'Action error');" +
-            "   }" +
+            "       // Timeout after 4.5 seconds" +
+            "       if (Date.now() - startTime > 4500) {" +
+            "           clearInterval(timer);" +
+            "           window.WorkerBridge.onTaskResult(false, 'Follow button not found');" +
+            "       }" +
+            "   }, 250);" +
             "})();";
 
         view.evaluateJavascript(js, null);
     }
 
-    // Like Script with Auto Action-Block & Suspension Detection
-    private void injectLikeAndReelsScript(WebView view) {
+    // FAST LIKE SCRIPT (Reels + Posts)
+    private void injectFastLikeScript(WebView view) {
         String js = "(function() {" +
-            "   try {" +
-            "       var bodyText = (document.body.innerText || '').toLowerCase();" +
-            "       // 1. Check Action Block / Suspension / Limit" +
-            "       if (bodyText.includes('try again later') || bodyText.includes('we limit how often') || bodyText.includes('action blocked')) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Account Limit Reached (Action Blocked)');" +
+            "   var startTime = Date.now();" +
+            "   var timer = setInterval(function() {" +
+            "       var url = window.location.href.toLowerCase();" +
+            "       var text = (document.body ? document.body.innerText : '').toLowerCase();" +
+            "       // 1. Instant Checkpoint / Block Detection" +
+            "       if (url.includes('/challenge/') || url.includes('/suspended/') || url.includes('/checkpoint/') || " +
+            "           text.includes('confirm you\\'re human') || text.includes('try again later') || " +
+            "           text.includes('action blocked') || text.includes('we limit how often')) {" +
+            "           clearInterval(timer);" +
+            "           window.WorkerBridge.onTaskResult(false, 'Blocked: Action Limited / Checkpoint');" +
             "           return;" +
             "       }" +
-            "       if (bodyText.includes('suspended') || bodyText.includes('help us confirm') || bodyText.includes('checkpoint')) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Account Suspended/Checkpoint');" +
+            "       // 2. Dismiss Popups" +
+            "       var popups = document.querySelectorAll('button, div[role=\"button\"]');" +
+            "       for (var i = 0; i < popups.length; i++) {" +
+            "           var pt = (popups[i].innerText || '').trim().toLowerCase();" +
+            "           if (pt === 'not now' || pt === 'cancel') popups[i].click();" +
+            "       }" +
+            "       // 3. Check if already liked" +
+            "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"], svg[aria-label=\"पसंद रद्द करें\"]');" +
+            "       if (unlike) {" +
+            "           clearInterval(timer);" +
+            "           window.WorkerBridge.onTaskResult(false, 'Already Liked');" +
             "           return;" +
             "       }" +
-            "       // 2. Dismiss popups" +
-            "       var popups = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
-            "       popups.forEach(p => {" +
-            "           var pt = (p.innerText || '').trim().toLowerCase();" +
-            "           if (pt === 'not now' || pt === 'cancel' || pt === 'close') p.click();" +
-            "       });" +
-            "       // 3. Direct Like heart SVG search" +
+            "       // 4. Direct Like heart SVG search" +
             "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"], svg[aria-label=\"पसंद करें\"], svg[aria-label=\"Me gusta\"]');" +
             "       if (likeSvg) {" +
+            "           clearInterval(timer);" +
             "           var btn = likeSvg.closest('button') || likeSvg.closest('div[role=\"button\"]') || likeSvg.closest('span[role=\"button\"]') || likeSvg.parentElement;" +
             "           btn.click();" +
-            "           ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {" +
+            "           ['touchstart', 'touchend', 'mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
             "               btn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "           });" +
             "           setTimeout(function() {" +
             "               window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "           }, 900);" +
+            "           }, 400);" +
             "           return;" +
             "       }" +
-            "       // 4. Double tap video if Reel exists" +
+            "       // 5. Reels Video Double-Tap" +
             "       var videoEl = document.querySelector('video');" +
             "       if (videoEl) {" +
+            "           clearInterval(timer);" +
             "           videoEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));" +
             "           setTimeout(function() {" +
             "               window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "           }, 900);" +
+            "           }, 400);" +
             "           return;" +
             "       }" +
-            "       // 5. Check if already liked" +
-            "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"], svg[aria-label=\"पसंद रद्द करें\"]');" +
-            "       if (unlike) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Already Liked');" +
-            "           return;" +
-            "       }" +
-            "       // 6. Open first post on profile" +
-            "       var postLink = document.querySelector('main a[href*=\"/p/\"], main a[href*=\"/reel/\"]');" +
+            "       // 6. Profile fallback: open first post" +
+            "       var postLink = document.querySelector('main a[href^=\"/p/\"], main a[href^=\"/reel/\"]');" +
             "       if (postLink) {" +
+            "           clearInterval(timer);" +
             "           window.location.href = postLink.href;" +
             "           return;" +
             "       }" +
-            "       window.WorkerBridge.onTaskResult(false, 'Like button not found');" +
-            "   } catch (err) {" +
-            "       window.WorkerBridge.onTaskResult(false, 'Action error');" +
-            "   }" +
+            "       // Timeout after 4.5 seconds" +
+            "       if (Date.now() - startTime > 4500) {" +
+            "           clearInterval(timer);" +
+            "           window.WorkerBridge.onTaskResult(false, 'Like button not found');" +
+            "       }" +
+            "   }, 250);" +
             "})();";
 
         view.evaluateJavascript(js, null);
