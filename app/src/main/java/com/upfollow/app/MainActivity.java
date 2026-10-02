@@ -35,6 +35,8 @@ public class MainActivity extends Activity {
     private NotificationManager notificationManager;
 
     private String currentTaskType = "follow";
+    // Flag to detect if adding secondary account vs main login
+    private boolean isAddingSecondaryAccount = false;
 
     @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
     @Override
@@ -42,7 +44,6 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // 1. Notification Setup
         createNotificationChannel();
         if (Build.VERSION.SDK_INT >= 33) {
             if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -50,11 +51,9 @@ public class MainActivity extends Activity {
             }
         }
 
-        // 2. Main WebView
         mainWebView = findViewById(R.id.webView);
         setupWebView(mainWebView);
 
-        // 3. Worker WebView (Off-screen)
         workerWebView = new WebView(this);
         setupWebView(workerWebView);
         
@@ -65,7 +64,6 @@ public class MainActivity extends Activity {
         ViewGroup rootView = (ViewGroup) findViewById(android.R.id.content);
         rootView.addView(workerWebView);
 
-        // Bridges
         mainWebView.addJavascriptInterface(new MainAppInterface(), "Android");
         workerWebView.addJavascriptInterface(new WorkerAppInterface(), "WorkerBridge");
 
@@ -73,12 +71,25 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
+
+                // Detect when adding another account is requested
+                if (url != null && url.contains("force_authentication=1")) {
+                    isAddingSecondaryAccount = true;
+                }
+
                 if (url != null && (url.contains("instagram.com/?") || url.equals("https://www.instagram.com/"))) {
                     String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
                     if (cookies != null && cookies.contains("sessionid")) {
                         try {
                             String encoded = URLEncoder.encode(cookies, "UTF-8");
-                            mainWebView.loadUrl(HOSTING_DASHBOARD + "?cookies=" + encoded);
+                            if (isAddingSecondaryAccount) {
+                                isAddingSecondaryAccount = false;
+                                // Append as secondary account
+                                mainWebView.loadUrl(HOSTING_DASHBOARD + "?add_cookies=" + encoded);
+                            } else {
+                                // Primary Login
+                                mainWebView.loadUrl(HOSTING_DASHBOARD + "?cookies=" + encoded);
+                            }
                         } catch (Exception e) {
                             mainWebView.loadUrl(HOSTING_DASHBOARD);
                         }
@@ -107,12 +118,8 @@ public class MainActivity extends Activity {
         if (cookies != null && cookies.contains("sessionid")) {
             mainWebView.loadUrl(HOSTING_DASHBOARD);
         } else {
-            webViewLoadLogin();
+            mainWebView.loadUrl(IG_LOGIN_URL);
         }
-    }
-
-    private void webViewLoadLogin() {
-        mainWebView.loadUrl(IG_LOGIN_URL);
     }
 
     private void setupWebView(WebView wv) {
@@ -127,7 +134,6 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
-    // Follow Script
     private void injectFollowScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
@@ -163,7 +169,6 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(js, null);
     }
 
-    // Like Script
     private void injectLikeScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
@@ -210,7 +215,6 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(js, null);
     }
 
-    // Notification Channel
     private void createNotificationChannel() {
         notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -238,7 +242,7 @@ public class MainActivity extends Activity {
         }
 
         builder.setContentTitle("UpFollow Running")
-               .setContentText("Accounts: " + accounts + "  |  Tasks: " + tasks + "  |  Coins: +" + coins)
+               .setContentText("Accounts: " + accounts + " Active  |  Tasks: " + tasks + "  |  Coins: +" + coins)
                .setSmallIcon(android.R.drawable.stat_notify_sync)
                .setOngoing(true);
 
@@ -251,7 +255,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // App Bridges
     public class MainAppInterface {
         @JavascriptInterface
         public void executeBrowserAction(String target, String taskType, String mediaId) {
