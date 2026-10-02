@@ -48,14 +48,12 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // Hardware Device ID (Persistent across app installs)
         try {
             hardwareDeviceId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
         } catch (Exception e) {
             hardwareDeviceId = "DEV_FALLBACK";
         }
 
-        // WakeLock Setup (Screen & CPU keep awake)
         try {
             PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (powerManager != null) {
@@ -63,10 +61,8 @@ public class MainActivity extends Activity {
             }
         } catch (Exception ignored) {}
 
-        // Notification Channel
         createNotificationChannel();
 
-        // Android 13+ Notification Permission Check
         if (Build.VERSION.SDK_INT >= 33) {
             if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 101);
@@ -76,7 +72,6 @@ public class MainActivity extends Activity {
         mainWebView = findViewById(R.id.webView);
         setupWebView(mainWebView);
 
-        // Worker WebView (1px Off-screen safe layout)
         workerWebView = new WebView(this);
         setupWebView(workerWebView);
         
@@ -136,7 +131,6 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Launch Check
         String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
         if (cookies != null && cookies.contains("sessionid")) {
             mainWebView.loadUrl(HOSTING_DASHBOARD + "?hw_id=" + hardwareDeviceId);
@@ -158,6 +152,7 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
+    // Follow Script (No Free Duplicate Coins!)
     private void injectFollowScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
@@ -171,14 +166,15 @@ public class MainActivity extends Activity {
             "               var t = (b.innerText || b.textContent || '').trim().toLowerCase();" +
             "               return t === 'following' || t === 'requested';" +
             "           });" +
+            "           // Agar already follow hai toh task ko skip karo (No free coins!)" +
             "           if (isFollowing) {" +
-            "               window.WorkerBridge.onTaskResult(true, 'Success');" +
+            "               window.WorkerBridge.onTaskResult(false, 'Already Following');" +
             "               return;" +
             "           }" +
             "           window.WorkerBridge.onTaskResult(false, 'Follow button not found');" +
             "           return;" +
             "       }" +
-            "       ['mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
+            "       ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {" +
             "           followBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "       });" +
             "       setTimeout(function() {" +
@@ -192,18 +188,22 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(js, null);
     }
 
+    // 100% Working Reels & Posts Like Script
     private void injectLikeAndReelsScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
+            "       // 1. Check if already liked (No duplicate coins!)" +
             "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"]') || document.querySelector('svg[aria-label=\"पसंद रद्द करें\"]');" +
             "       if (unlike) {" +
-            "           window.WorkerBridge.onTaskResult(true, 'Success');" +
+            "           window.WorkerBridge.onTaskResult(false, 'Already Liked');" +
             "           return;" +
             "       }" +
+            "       // 2. Direct Like Heart Icon (Post & Reel action bar)" +
             "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"]') || document.querySelector('svg[aria-label=\"पसंद करें\"]');" +
             "       if (likeSvg) {" +
-            "           var btn = likeSvg.closest('button') || likeSvg.closest('div[role=\"button\"]') || likeSvg.parentElement;" +
-            "           ['mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
+            "           var btn = likeSvg.closest('button') || likeSvg.closest('div[role=\"button\"]') || likeSvg.closest('span[role=\"button\"]') || likeSvg.parentElement;" +
+            "           btn.click();" +
+            "           ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {" +
             "               btn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "           });" +
             "           setTimeout(function() {" +
@@ -211,33 +211,22 @@ public class MainActivity extends Activity {
             "           }, 1000);" +
             "           return;" +
             "       }" +
+            "       // 3. Reels Video Container Double-Tap" +
             "       var videoEl = document.querySelector('video');" +
             "       if (videoEl) {" +
-            "           var dblClick = new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window });" +
-            "           videoEl.dispatchEvent(dblClick);" +
+            "           videoEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));" +
             "           setTimeout(function() {" +
             "               window.WorkerBridge.onTaskResult(true, 'Success');" +
             "           }, 1000);" +
             "           return;" +
             "       }" +
-            "       var firstPost = document.querySelector('article a[href*=\"/p/\"]') || document.querySelector('article a[href*=\"/reel/\"]');" +
-            "       if (firstPost) {" +
-            "           firstPost.click();" +
-            "           setTimeout(function() {" +
-            "               var modalLike = document.querySelector('svg[aria-label=\"Like\"]');" +
-            "               if (modalLike) {" +
-            "                   var mBtn = modalLike.closest('button') || modalLike.parentElement;" +
-            "                   ['mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
-            "                       mBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
-            "                   });" +
-            "                   window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "               } else {" +
-            "                   window.WorkerBridge.onTaskResult(false, 'Like button not found');" +
-            "               }" +
-            "           }, 2000);" +
+            "       // 4. Profile page fallback: Open first post" +
+            "       var postLink = document.querySelector('main a[href^=\"/p/\"], main a[href^=\"/reel/\"]');" +
+            "       if (postLink) {" +
+            "           window.location.href = postLink.href;" +
             "           return;" +
             "       }" +
-            "       window.WorkerBridge.onTaskResult(false, 'Post not found');" +
+            "       window.WorkerBridge.onTaskResult(false, 'Like button not found');" +
             "   } catch (err) {" +
             "       window.WorkerBridge.onTaskResult(false, 'Action error');" +
             "   }" +
@@ -272,7 +261,6 @@ public class MainActivity extends Activity {
             builder = new Notification.Builder(this);
         }
 
-        // System built-in sync icon (Zero custom file dependency)
         builder.setContentTitle("UpFollow Running")
                .setContentText("Accounts: " + accounts + " Active  |  Tasks: " + tasks + "  |  Coins: +" + coins)
                .setSmallIcon(android.R.drawable.stat_notify_sync)
@@ -351,11 +339,6 @@ public class MainActivity extends Activity {
                 mainWebView.evaluateJavascript("window.onWorkerResult(" + success + ", '" + message.replace("'", "\\'") + "');", null);
             });
         }
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
     }
 
     @Override
