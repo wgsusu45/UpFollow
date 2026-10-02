@@ -18,6 +18,8 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -121,13 +123,20 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
 
+                // Quick 1.5s delay for fast rendering
                 new Handler(Looper.getMainLooper()).postDelayed(() -> {
                     if ("like".equalsIgnoreCase(currentTaskType)) {
                         injectLikeAndReelsScript(view);
                     } else {
                         injectFollowScript(view);
                     }
-                }, 2500);
+                }, 1500);
+            }
+
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                super.onReceivedError(view, request, error);
+                mainWebView.evaluateJavascript("if(window.onWorkerResult) window.onWorkerResult(false, 'Page load error');", null);
             }
         });
 
@@ -152,11 +161,18 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
-    // Follow Script (No Free Duplicate Coins!)
+    // Follow Script (Auto-Dismiss Popups + Click)
     private void injectFollowScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
-            "       var buttons = Array.from(document.querySelectorAll('button'));" +
+            "       // 1. Auto dismiss 'Open in App' or Cookie banners" +
+            "       var popups = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
+            "       popups.forEach(p => {" +
+            "           var pt = (p.innerText || '').trim().toLowerCase();" +
+            "           if (pt === 'not now' || pt === 'cancel' || pt === 'allow all' || pt === 'accept') p.click();" +
+            "       });" +
+            "       // 2. Search Follow Button" +
+            "       var buttons = Array.from(document.querySelectorAll('button, header button, section button, div[role=\"button\"]'));" +
             "       var followBtn = buttons.find(b => {" +
             "           var t = (b.innerText || b.textContent || '').trim().toLowerCase();" +
             "           return t === 'follow' || t === 'follow back';" +
@@ -166,7 +182,6 @@ public class MainActivity extends Activity {
             "               var t = (b.innerText || b.textContent || '').trim().toLowerCase();" +
             "               return t === 'following' || t === 'requested';" +
             "           });" +
-            "           // Agar already follow hai toh task ko skip karo (No free coins!)" +
             "           if (isFollowing) {" +
             "               window.WorkerBridge.onTaskResult(false, 'Already Following');" +
             "               return;" +
@@ -174,12 +189,13 @@ public class MainActivity extends Activity {
             "           window.WorkerBridge.onTaskResult(false, 'Follow button not found');" +
             "           return;" +
             "       }" +
+            "       followBtn.click();" +
             "       ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {" +
             "           followBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "       });" +
             "       setTimeout(function() {" +
             "           window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "       }, 1000);" +
+            "       }, 800);" +
             "   } catch (err) {" +
             "       window.WorkerBridge.onTaskResult(false, 'Action error');" +
             "   }" +
@@ -188,18 +204,18 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(js, null);
     }
 
-    // 100% Working Reels & Posts Like Script
+    // Like Script (Reels + Posts)
     private void injectLikeAndReelsScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
-            "       // 1. Check if already liked (No duplicate coins!)" +
-            "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"]') || document.querySelector('svg[aria-label=\"पसंद रद्द करें\"]');" +
+            "       // 1. Check if already liked" +
+            "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"], svg[aria-label=\"पसंद रद्द करें\"]');" +
             "       if (unlike) {" +
             "           window.WorkerBridge.onTaskResult(false, 'Already Liked');" +
             "           return;" +
             "       }" +
-            "       // 2. Direct Like Heart Icon (Post & Reel action bar)" +
-            "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"]') || document.querySelector('svg[aria-label=\"पसंद करें\"]');" +
+            "       // 2. Direct Like SVG" +
+            "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"], svg[aria-label=\"पसंद करें\"]');" +
             "       if (likeSvg) {" +
             "           var btn = likeSvg.closest('button') || likeSvg.closest('div[role=\"button\"]') || likeSvg.closest('span[role=\"button\"]') || likeSvg.parentElement;" +
             "           btn.click();" +
@@ -208,19 +224,19 @@ public class MainActivity extends Activity {
             "           });" +
             "           setTimeout(function() {" +
             "               window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "           }, 1000);" +
+            "           }, 800);" +
             "           return;" +
             "       }" +
-            "       // 3. Reels Video Container Double-Tap" +
+            "       // 3. Double-tap video on reels" +
             "       var videoEl = document.querySelector('video');" +
             "       if (videoEl) {" +
             "           videoEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));" +
             "           setTimeout(function() {" +
             "               window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "           }, 1000);" +
+            "           }, 800);" +
             "           return;" +
             "       }" +
-            "       // 4. Profile page fallback: Open first post" +
+            "       // 4. Open first post if on profile" +
             "       var postLink = document.querySelector('main a[href^=\"/p/\"], main a[href^=\"/reel/\"]');" +
             "       if (postLink) {" +
             "           window.location.href = postLink.href;" +
@@ -339,6 +355,11 @@ public class MainActivity extends Activity {
                 mainWebView.evaluateJavascript("window.onWorkerResult(" + success + ", '" + message.replace("'", "\\'") + "');", null);
             });
         }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
     }
 
     @Override
