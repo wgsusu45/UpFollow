@@ -14,7 +14,7 @@ public class MainActivity extends Activity {
     private WebView webView;
 
     // Yahan apni hosting ka dashboard link daalein:
-    private static final String HOSTING_DASHBOARD = "https://yourdomain.com/index.php";
+    private static final String HOSTING_DASHBOARD = "https://follow2follow.shop/index.php";
     
     // Seedha official Instagram login URL jo WebView mein open hoga:
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
