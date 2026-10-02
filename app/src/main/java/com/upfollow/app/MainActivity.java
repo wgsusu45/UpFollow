@@ -123,14 +123,13 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
 
-                // Quick 1.5s delay for fast rendering
                 new Handler(Looper.getMainLooper()).postDelayed(() -> {
                     if ("like".equalsIgnoreCase(currentTaskType)) {
                         injectLikeAndReelsScript(view);
                     } else {
                         injectFollowScript(view);
                     }
-                }, 1500);
+                }, 1800);
             }
 
             @Override
@@ -161,41 +160,42 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
-    // Follow Script (Auto-Dismiss Popups + Click)
+    // 100% FIXED FOLLOW SCRIPT (Exact Button Match, Ignores Stats Text)
     private void injectFollowScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
-            "       // 1. Auto dismiss 'Open in App' or Cookie banners" +
-            "       var popups = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
-            "       popups.forEach(p => {" +
+            "       // 1. Dismiss any overlay popups first" +
+            "       var dismissBtns = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
+            "       dismissBtns.forEach(p => {" +
             "           var pt = (p.innerText || '').trim().toLowerCase();" +
-            "           if (pt === 'not now' || pt === 'cancel' || pt === 'allow all' || pt === 'accept') p.click();" +
+            "           if (pt === 'not now' || pt === 'cancel' || pt === 'allow all' || pt === 'accept' || pt === 'close') p.click();" +
             "       });" +
-            "       // 2. Search Follow Button" +
-            "       var buttons = Array.from(document.querySelectorAll('button, header button, section button, div[role=\"button\"]'));" +
-            "       var followBtn = buttons.find(b => {" +
-            "           var t = (b.innerText || b.textContent || '').trim().toLowerCase();" +
-            "           return t === 'follow' || t === 'follow back';" +
+            "       // 2. Exact match for Follow button ONLY" +
+            "       var allButtons = Array.from(document.querySelectorAll('header button, main button, button, div[role=\"button\"]'));" +
+            "       var followBtn = allButtons.find(b => {" +
+            "           var t = (b.innerText || b.textContent || '').trim();" +
+            "           return /^follow$/i.test(t) || /^follow back$/i.test(t) || t === 'फॉलो करें' || t === 'Seguir';" +
             "       });" +
-            "       if (!followBtn) {" +
-            "           var isFollowing = buttons.some(b => {" +
-            "               var t = (b.innerText || b.textContent || '').trim().toLowerCase();" +
-            "               return t === 'following' || t === 'requested';" +
+            "       if (followBtn) {" +
+            "           followBtn.click();" +
+            "           ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {" +
+            "               followBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "           });" +
-            "           if (isFollowing) {" +
-            "               window.WorkerBridge.onTaskResult(false, 'Already Following');" +
-            "               return;" +
-            "           }" +
-            "           window.WorkerBridge.onTaskResult(false, 'Follow button not found');" +
+            "           setTimeout(function() {" +
+            "               window.WorkerBridge.onTaskResult(true, 'Success');" +
+            "           }, 900);" +
             "           return;" +
             "       }" +
-            "       followBtn.click();" +
-            "       ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {" +
-            "           followBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
+            "       // 3. Header button check for already following" +
+            "       var headerFollowingBtn = allButtons.find(b => {" +
+            "           var t = (b.innerText || b.textContent || '').trim();" +
+            "           return (/^following$/i.test(t) || /^requested$/i.test(t)) && b.closest('header, main');" +
             "       });" +
-            "       setTimeout(function() {" +
-            "           window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "       }, 800);" +
+            "       if (headerFollowingBtn) {" +
+            "           window.WorkerBridge.onTaskResult(false, 'Already Following');" +
+            "           return;" +
+            "       }" +
+            "       window.WorkerBridge.onTaskResult(false, 'Follow button not found');" +
             "   } catch (err) {" +
             "       window.WorkerBridge.onTaskResult(false, 'Action error');" +
             "   }" +
@@ -204,18 +204,18 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(js, null);
     }
 
-    // Like Script (Reels + Posts)
+    // 100% FIXED LIKES SCRIPT (Reels + Posts)
     private void injectLikeAndReelsScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
-            "       // 1. Check if already liked" +
-            "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"], svg[aria-label=\"पसंद रद्द करें\"]');" +
-            "       if (unlike) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Already Liked');" +
-            "           return;" +
-            "       }" +
-            "       // 2. Direct Like SVG" +
-            "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"], svg[aria-label=\"पसंद करें\"]');" +
+            "       // 1. Dismiss popups" +
+            "       var popups = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
+            "       popups.forEach(p => {" +
+            "           var pt = (p.innerText || '').trim().toLowerCase();" +
+            "           if (pt === 'not now' || pt === 'cancel' || pt === 'close') p.click();" +
+            "       });" +
+            "       // 2. Direct Like heart SVG search" +
+            "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"], svg[aria-label=\"पसंद करें\"], svg[aria-label=\"Me gusta\"]');" +
             "       if (likeSvg) {" +
             "           var btn = likeSvg.closest('button') || likeSvg.closest('div[role=\"button\"]') || likeSvg.closest('span[role=\"button\"]') || likeSvg.parentElement;" +
             "           btn.click();" +
@@ -224,20 +224,26 @@ public class MainActivity extends Activity {
             "           });" +
             "           setTimeout(function() {" +
             "               window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "           }, 800);" +
+            "           }, 900);" +
             "           return;" +
             "       }" +
-            "       // 3. Double-tap video on reels" +
+            "       // 3. Double tap video if Reel video exists" +
             "       var videoEl = document.querySelector('video');" +
             "       if (videoEl) {" +
             "           videoEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));" +
             "           setTimeout(function() {" +
             "               window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "           }, 800);" +
+            "           }, 900);" +
             "           return;" +
             "       }" +
-            "       // 4. Open first post if on profile" +
-            "       var postLink = document.querySelector('main a[href^=\"/p/\"], main a[href^=\"/reel/\"]');" +
+            "       // 4. Check if already liked on post page" +
+            "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"], svg[aria-label=\"पसंद रद्द करें\"]');" +
+            "       if (unlike) {" +
+            "           window.WorkerBridge.onTaskResult(false, 'Already Liked');" +
+            "           return;" +
+            "       }" +
+            "       // 5. If on profile page, open first post" +
+            "       var postLink = document.querySelector('main a[href*=\"/p/\"], main a[href*=\"/reel/\"]');" +
             "       if (postLink) {" +
             "           window.location.href = postLink.href;" +
             "           return;" +
