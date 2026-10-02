@@ -19,10 +19,10 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
 
-    - name: Set up Android SDK
-      uses: android-actions/setup-android@v3
-      with:
-        accept-android-sdk-licenses: true
+    - name: Accept Licenses & Install SDK
+      run: |
+        yes | sdkmanager --licenses > /dev/null || true
+        sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@v4
