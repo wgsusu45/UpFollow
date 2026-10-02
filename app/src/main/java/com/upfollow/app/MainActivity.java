@@ -21,7 +21,6 @@ import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
-import android.widget.FrameLayout;
 
 import java.net.URLEncoder;
 
@@ -49,16 +48,25 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // Hardware Device ID (Persistent across app re-installs)
-        hardwareDeviceId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
-
-        // WakeLock Setup
-        PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        if (powerManager != null) {
-            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UpFollow:AutomationWakeLock");
+        // Hardware Device ID (Persistent across app installs)
+        try {
+            hardwareDeviceId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+        } catch (Exception e) {
+            hardwareDeviceId = "DEV_FALLBACK";
         }
 
+        // WakeLock Setup (Screen & CPU keep awake)
+        try {
+            PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (powerManager != null) {
+                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UpFollow:WakeLock");
+            }
+        } catch (Exception ignored) {}
+
+        // Notification Channel
         createNotificationChannel();
+
+        // Android 13+ Notification Permission Check
         if (Build.VERSION.SDK_INT >= 33) {
             if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 101);
@@ -68,16 +76,18 @@ public class MainActivity extends Activity {
         mainWebView = findViewById(R.id.webView);
         setupWebView(mainWebView);
 
-        // Worker WebView
+        // Worker WebView (1px Off-screen safe layout)
         workerWebView = new WebView(this);
         setupWebView(workerWebView);
         
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(1, 1);
+        ViewGroup.LayoutParams params = new ViewGroup.LayoutParams(1, 1);
         workerWebView.setLayoutParams(params);
         workerWebView.setAlpha(0.01f);
         
         ViewGroup rootView = (ViewGroup) findViewById(android.R.id.content);
-        rootView.addView(workerWebView);
+        if (rootView != null) {
+            rootView.addView(workerWebView);
+        }
 
         mainWebView.addJavascriptInterface(new MainAppInterface(), "Android");
         workerWebView.addJavascriptInterface(new WorkerAppInterface(), "WorkerBridge");
@@ -126,7 +136,7 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Pass Hardware ID on App Launch
+        // Launch Check
         String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
         if (cookies != null && cookies.contains("sessionid")) {
             mainWebView.loadUrl(HOSTING_DASHBOARD + "?hw_id=" + hardwareDeviceId);
@@ -148,7 +158,6 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
-    // Follow Script
     private void injectFollowScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
@@ -183,17 +192,14 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(js, null);
     }
 
-    // Fixed Reel & Post Like Script
     private void injectLikeAndReelsScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
-            "       // 1. Check if already liked" +
             "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"]') || document.querySelector('svg[aria-label=\"पसंद रद्द करें\"]');" +
             "       if (unlike) {" +
             "           window.WorkerBridge.onTaskResult(true, 'Success');" +
             "           return;" +
             "       }" +
-            "       // 2. Direct Like SVG (Reels sidebar, Post heart icon)" +
             "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"]') || document.querySelector('svg[aria-label=\"पसंद करें\"]');" +
             "       if (likeSvg) {" +
             "           var btn = likeSvg.closest('button') || likeSvg.closest('div[role=\"button\"]') || likeSvg.parentElement;" +
@@ -205,7 +211,6 @@ public class MainActivity extends Activity {
             "           }, 1000);" +
             "           return;" +
             "       }" +
-            "       // 3. Reels Video Container Double-Tap Fallback" +
             "       var videoEl = document.querySelector('video');" +
             "       if (videoEl) {" +
             "           var dblClick = new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window });" +
@@ -215,7 +220,6 @@ public class MainActivity extends Activity {
             "           }, 1000);" +
             "           return;" +
             "       }" +
-            "       // 4. Profile page fallback (Open first post)" +
             "       var firstPost = document.querySelector('article a[href*=\"/p/\"]') || document.querySelector('article a[href*=\"/reel/\"]');" +
             "       if (firstPost) {" +
             "           firstPost.click();" +
@@ -268,6 +272,7 @@ public class MainActivity extends Activity {
             builder = new Notification.Builder(this);
         }
 
+        // System built-in sync icon (Zero custom file dependency)
         builder.setContentTitle("UpFollow Running")
                .setContentText("Accounts: " + accounts + " Active  |  Tasks: " + tasks + "  |  Coins: +" + coins)
                .setSmallIcon(android.R.drawable.stat_notify_sync)
@@ -282,7 +287,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // App Bridges
     public class MainAppInterface {
         @JavascriptInterface
         public void executeBrowserAction(String target, String taskType, String mediaId) {
@@ -295,7 +299,6 @@ public class MainActivity extends Activity {
                         if (mediaId.startsWith("http")) {
                             workerWebView.loadUrl(mediaId);
                         } else if (mediaId.length() <= 12) {
-                            // Instagram Shortcode (Reel / Post)
                             workerWebView.loadUrl("https://www.instagram.com/reel/" + mediaId + "/");
                         } else {
                             workerWebView.loadUrl("https://www.instagram.com/p/" + mediaId + "/");
@@ -309,14 +312,13 @@ public class MainActivity extends Activity {
             });
         }
 
-        // Screen Keep-On & WakeLock Toggle
         @JavascriptInterface
         public void setKeepScreenOn(boolean keepOn) {
             new Handler(Looper.getMainLooper()).post(() -> {
                 if (keepOn) {
                     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                     if (wakeLock != null && !wakeLock.isHeld()) {
-                        wakeLock.acquire(12 * 60 * 60 * 1000L); // 12 hours max
+                        wakeLock.acquire(12 * 60 * 60 * 1000L);
                     }
                 } else {
                     getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -340,13 +342,6 @@ public class MainActivity extends Activity {
                 clearAutomationNotification();
             });
         }
-
-        @JavascriptInterface
-        public void openInstagramLogin() {
-            new Handler(Looper.getMainLooper()).post(() -> {
-                mainWebView.loadUrl(IG_LOGIN_URL);
-            });
-        }
     }
 
     public class WorkerAppInterface {
@@ -361,7 +356,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        // Do NOT pause webview timers so background tasking keeps running
     }
 
     @Override
