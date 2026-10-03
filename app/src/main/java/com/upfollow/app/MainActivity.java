@@ -690,9 +690,8 @@ public class MainActivity extends Activity {
                     }
                     debugInfo += " | CSRF:" + (csrf.isEmpty() ? "NO" : "YES");
 
-                    // GraphQL API — 429 nahi deta web_profile_info ki tarah
-                    String variables = URLEncoder.encode("{\"username\":\"" + cleanUser + "\",\"include_reel\":false}", "UTF-8");
-                    String urlStr = "https://www.instagram.com/graphql/query/?query_hash=c9100bf9110dd6361671f113dd02e7d&variables=" + variables;
+                    // Instagram public JSON endpoint
+                    String urlStr = "https://www.instagram.com/" + URLEncoder.encode(cleanUser, "UTF-8") + "/?__a=1&__d=dis";
                     URL url = new URL(urlStr);
                     HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                     conn.setRequestMethod("GET");
@@ -704,9 +703,9 @@ public class MainActivity extends Activity {
                     conn.setRequestProperty("User-Agent", USER_AGENT);
                     conn.setRequestProperty("X-CSRFToken", csrf);
                     conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
-                    conn.setRequestProperty("Accept", "*/*");
+                    conn.setRequestProperty("Accept", "application/json, text/plain, */*");
                     conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
-                    conn.setRequestProperty("Referer", "https://www.instagram.com/" + cleanUser + "/");
+                    conn.setRequestProperty("Referer", "https://www.instagram.com/");
 
                     int code = conn.getResponseCode();
                     debugInfo += " | HTTP:" + code;
@@ -731,12 +730,18 @@ public class MainActivity extends Activity {
                     String parsedJson;
                     if (code == 200 && responseBody.contains("\"username\"")) {
                         try {
-                            // GraphQL: data.user.username, id, edge_followed_by.count, profile_pic_url
+                            // __a=1 endpoint: graphql.user.username / edge_followed_by.count / id
                             String username = extractJson(responseBody, "\"username\"");
                             String fullName = extractJson(responseBody, "\"full_name\"");
                             String numericId = extractJson(responseBody, "\"id\"");
-                            // follower count GraphQL mein edge_followed_by > count ke andar hai
-                            String followerCountStr = extractJson(responseBody, "\"count\"");
+                            // followers: edge_followed_by > count
+                            String followerCountStr = "";
+                            int efbIdx = responseBody.indexOf("\"edge_followed_by\"");
+                            if (efbIdx >= 0) {
+                                String sub = responseBody.substring(efbIdx);
+                                followerCountStr = extractJson(sub, "\"count\"");
+                            }
+                            if (followerCountStr.isEmpty()) followerCountStr = extractJson(responseBody, "\"count\"");
                             long followerCount = 0;
                             try { followerCount = Long.parseLong(followerCountStr); } catch (Exception ignored) {}
                             String followersFormatted = formatCount(followerCount);
@@ -758,7 +763,7 @@ public class MainActivity extends Activity {
                             parsedJson = "{\"success\":false,\"message\":\"Parse error: " + escJ(pe.getMessage()) + "\"}";
                         }
                     } else {
-                        parsedJson = "{\"success\":false,\"message\":\"HTTP " + code + " — Account not found\"}";
+                        parsedJson = "{\"success\":false,\"message\":\"HTTP " + code + " — " + responseBody.substring(0, Math.min(100, responseBody.length())) + "\"}";
                     }
 
                     final String finalJson = parsedJson;
