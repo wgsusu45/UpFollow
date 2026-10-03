@@ -25,21 +25,19 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
-import android.widget.Toast;
 
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import org.json.JSONObject;
+
+
 import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 
 public class MainActivity extends Activity {
 
     private WebView mainWebView;
     private WebView workerWebView;
+    private WebView searchWebView;
+    private String pendingSearchUser = null;
 
     private static final String HOSTING_BASE = "https://follow2follow.shop/";
     private static final String HOSTING_DASHBOARD = HOSTING_BASE + "index.php";
@@ -66,6 +64,7 @@ public class MainActivity extends Activity {
     private boolean addMode = false;
     private String captureNonce = "";
     private String captureCookies = "";
+
 
     private final Runnable taskTimeout = new Runnable() {
         @Override
@@ -109,6 +108,25 @@ public class MainActivity extends Activity {
         if (rootView != null) {
             rootView.addView(workerWebView, 0);
         }
+
+        // Search WebView (target profile search ke liye, worker se alag)
+        searchWebView = new WebView(this);
+        setupWebView(searchWebView);
+        searchWebView.setLayoutParams(new FrameLayout.LayoutParams(1, 1));
+        searchWebView.setAlpha(0.01f);
+        if (rootView != null) {
+            rootView.addView(searchWebView, 0);
+        }
+        searchWebView.addJavascriptInterface(new SearchBridge(), "SearchBridge");
+        searchWebView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                if (pendingSearchUser != null && url != null && url.startsWith(IG_URL)) {
+                    runSearchJs(pendingSearchUser);
+                }
+            }
+        });
 
         // Bridges
         mainWebView.addJavascriptInterface(new MainAppInterface(), "Android");
@@ -234,6 +252,8 @@ public class MainActivity extends Activity {
                 public void run() {
                     addMode = true;
                     captureBusy = false;
+                    // Saare accounts ki cookies server par saved hain, isliye jar saaf karna safe hai.
+                    // Isse Instagram naya login form dikhata hai aur purana session nahi ghusta.
                     applyInstagramCookies("");
                     mainWebView.loadUrl(IG_LOGIN_URL);
                 }
@@ -281,6 +301,7 @@ public class MainActivity extends Activity {
             return;
         }
 
+        // Agar username fetch atak jaye to bina username ke aage badho
         uiHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -324,6 +345,7 @@ public class MainActivity extends Activity {
         return "";
     }
 
+    // cookieStr khali ho to sirf Instagram cookies clear hoti hain
     private void applyInstagramCookies(String cookieStr) {
         CookieManager cm = CookieManager.getInstance();
         String existing = cm.getCookie(IG_URL);
@@ -452,7 +474,7 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // LIKE SCRIPT
+    // LIKE SCRIPT: pehle DOM button, na mile to Instagram web API (fallback)
     // ------------------------------------------------------------------
     private void injectLikeScript(WebView view) {
         String script = JS_HEAD + js(
@@ -530,6 +552,141 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
+    // LIVE PROFILE SEARCH (followers.php target search)
+    // Alag hidden WebView use hota hai, taaki running task disturb na ho.
+    // Pehle Instagram API, fail ho to profile page ke meta tags se data nikalta hai.
+    // ------------------------------------------------------------------
+    private boolean searchRunning = false;
+
+    private final Runnable searchTimeout = new Runnable() {
+        @Override
+        public void run() {
+            deliverSearch("{\"success\":false,\"message\":\"Search timeout. Dobara try karo.\"}");
+        }
+    };
+
+    private void startSearch(String u) {
+        pendingSearchUser = u;
+        searchRunning = false;
+        uiHandler.removeCallbacks(searchTimeout);
+        uiHandler.postDelayed(searchTimeout, 20000);
+        String cur = searchWebView.getUrl();
+        if (cur != null && cur.startsWith(IG_URL)) {
+            runSearchJs(u);
+        } else {
+            searchWebView.loadUrl(IG_URL + "/");
+        }
+    }
+
+    private void runSearchJs(String u) {
+        if (searchRunning) return;
+        searchRunning = true;
+        searchWebView.evaluateJavascript(buildSearchJs(u), null);
+    }
+
+    private void deliverSearch(String json) {
+        if (pendingSearchUser == null) return;
+        pendingSearchUser = null;
+        searchRunning = false;
+        uiHandler.removeCallbacks(searchTimeout);
+        mainWebView.evaluateJavascript(
+                "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, "
+                        + JSONObject.quote(json) + ");", null);
+    }
+
+    private static String buildSearchJs(String u) {
+        return js(
+            "(function() {",
+            "  var U = '" + u + "';",
+            "  var done = false;",
+            "  var H = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'Accept': '*/*' };",
+            "  function out(o) { if (done) return; done = true; SearchBridge.onResult(JSON.stringify(o)); }",
+            "  function fmt(n) {",
+            "    n = Number(n) || 0;",
+            "    if (n >= 1000000) return (n / 1000000).toFixed(1).split('.0').join('') + 'M';",
+            "    if (n >= 1000) return (n / 1000).toFixed(1).split('.0').join('') + 'K';",
+            "    return '' + n;",
+            "  }",
+            "  function good(r) {",
+            "    out({ success: true, username: r.username || U, full_name: r.full_name || '', numeric_id: '' + (r.pk || ''),",
+            "          follower_count: r.fc, followers_formatted: fmt(r.fc) + ' followers', is_verified: !!r.verified, profile_pic: r.pic || '' });",
+            "  }",
+            // ---- Strategy 1: web_profile_info API (kisi bhi 2xx status ko accept karta hai) ----
+            "  function tryApi() {",
+            "    return fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: H })",
+            "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
+            "    .then(function(x) {",
+            "      try {",
+            "        var d = JSON.parse(x.t);",
+            "        var u = (d.data && d.data.user) ? d.data.user : (d.user || null);",
+            "        if (u && u.username) {",
+            "          var fc = (u.edge_followed_by && u.edge_followed_by.count !== undefined) ? u.edge_followed_by.count : (u.follower_count || 0);",
+            "          return { username: u.username, full_name: u.full_name, pk: u.id || u.pk, fc: fc, verified: u.is_verified, pic: u.profile_pic_url_hd || u.profile_pic_url };",
+            "        }",
+            "        if (d && (d.message === 'login_required' || d.require_login)) return { err: 'login' };",
+            "      } catch (e) {}",
+            "      return null;",
+            "    }).catch(function() { return null; });",
+            "  }",
+            // ---- Strategy 2: profile page ke meta tags (og:description me followers) ----
+            "  function tryHtml() {",
+            "    return fetch('/' + encodeURIComponent(U) + '/', { credentials: 'include', headers: { 'Accept': 'text/html' } })",
+            "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
+            "    .then(function(x) {",
+            "      var low = x.t.toLowerCase();",
+            "      if (x.s === 404 || (low.indexOf('page isn') > -1 && low.indexOf('available') > -1 && low.indexOf('og:title') < 0)) return { notfound: true };",
+            "      var doc = new DOMParser().parseFromString(x.t, 'text/html');",
+            "      function meta(p) {",
+            "        var m = Array.prototype.slice.call(doc.querySelectorAll('meta')).filter(function(e) { return e.getAttribute('property') === p || e.getAttribute('name') === p; });",
+            "        return m.length ? (m[0].getAttribute('content') || '') : '';",
+            "      }",
+            "      var desc = meta('og:description') || meta('description');",
+            "      var i = desc.toLowerCase().indexOf(' followers');",
+            "      if (i < 0) return null;",
+            "      var tok = desc.substring(0, i).trim().split(' ').pop().split(',').join('');",
+            "      var mult = 1, last = tok.charAt(tok.length - 1).toUpperCase();",
+            "      if (last === 'K') { mult = 1000; tok = tok.slice(0, -1); }",
+            "      else if (last === 'M') { mult = 1000000; tok = tok.slice(0, -1); }",
+            "      else if (last === 'B') { mult = 1000000000; tok = tok.slice(0, -1); }",
+            "      var fc = Math.round(parseFloat(tok) * mult);",
+            "      if (isNaN(fc)) return null;",
+            "      var title = meta('og:title');",
+            "      var fn = title.indexOf(' (@') > -1 ? title.split(' (@')[0] : '';",
+            "      var pk = '', keys = ['\"profile_id\":\"', '\"target_id\":\"', '\"user_id\":\"'];",
+            "      for (var j = 0; j < keys.length && !pk; j++) {",
+            "        var k = x.t.indexOf(keys[j]);",
+            "        if (k > -1) { var e = x.t.indexOf('\"', k + keys[j].length); pk = x.t.substring(k + keys[j].length, e); if (isNaN(Number(pk))) pk = ''; }",
+            "      }",
+            "      return { username: U, full_name: fn, pk: pk, fc: fc, verified: x.t.indexOf('\"is_verified\":true') > -1, pic: meta('og:image') };",
+            "    }).catch(function() { return null; });",
+            "  }",
+            "  tryApi().then(function(a) {",
+            "    if (a && a.username) return a;",
+            "    return tryHtml().then(function(h) { return (h && (h.username || h.notfound)) ? h : (a || h); });",
+            "  }).then(function(r) {",
+            "    if (r && r.username) { good(r); }",
+            "    else if (r && r.notfound) { out({ success: false, message: 'Account not found on Instagram' }); }",
+            "    else if (r && r.err === 'login') { out({ success: false, message: 'Instagram login expire. Account re-login karo.' }); }",
+            "    else { out({ success: false, message: 'Instagram ne response nahi diya. Thodi der baad try karo.' }); }",
+            "  }).catch(function(e) { out({ success: false, message: 'Search error: ' + e.message }); });",
+            "})();"
+        );
+    }
+
+    // Search WebView se result lene ke liye
+    public class SearchBridge {
+        @JavascriptInterface
+        public void onResult(final String json) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    deliverSearch(json);
+                }
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Notification
     // ------------------------------------------------------------------
     private void createNotificationChannel() {
@@ -571,6 +728,7 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------
     public class MainAppInterface {
 
+        // Naya: account ki cookies ke saath task chalao (har account apna session use karta hai)
         @JavascriptInterface
         public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
             if (!trusted()) return;
@@ -604,6 +762,7 @@ public class MainActivity extends Activity {
             });
         }
 
+        // Purana method (compatibility)
         @JavascriptInterface
         public void executeBrowserAction(String target, String taskType, String mediaId) {
             runTask(target, taskType, mediaId, "");
@@ -612,6 +771,36 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void executeBrowserFollow(String target) {
             runTask(target, "follow", "", "");
+        }
+
+        // Primary account ki cookie server par sync karne ke liye
+        // Jar me koi Instagram session na ho to dashboard primary ka session laga deta hai
+        @JavascriptInterface
+        public void applySession(final String cookieStr) {
+            if (!trusted() || cookieStr == null || cookieStr.isEmpty()) return;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    applyInstagramCookies(cookieStr);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void searchInstagramProfileLive(final String queryUsername) {
+            if (!trusted()) return;
+            final String u = queryUsername == null ? "" : queryUsername.replace("@", "").replaceAll("[^A-Za-z0-9._]", "");
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (u.isEmpty()) {
+                        pendingSearchUser = "_";
+                        deliverSearch("{\"success\":false,\"message\":\"Invalid username\"}");
+                    } else {
+                        startSearch(u);
+                    }
+                }
+            });
         }
 
         @JavascriptInterface
@@ -663,136 +852,6 @@ public class MainActivity extends Activity {
                 }
             });
         }
-
-        // REAL-TIME LIVE SEARCH — WebView JS fetch (session cookies automatic milti hain)
-        @JavascriptInterface
-        public void searchInstagramProfileLive(final String queryUsername) {
-            uiHandler.post(() -> {
-                String cleanUser = queryUsername.replace("@", "").trim();
-                // workerWebView se fetch karo — iske paas Instagram session cookies hain
-                String js = "(function() {"
-                    + "  var u = '" + cleanUser.replace("'", "\\'") + "';"
-                    + "  fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(u), {"
-                    + "    method: 'GET',"
-                    + "    credentials: 'include',"
-                    + "    headers: {"
-                    + "      'X-IG-App-ID': '936619743392459',"
-                    + "      'X-Requested-With': 'XMLHttpRequest',"
-                    + "      'Accept': '*/*'"
-                    + "    }"
-                    + "  })"
-                    + "  .then(function(r) { return r.text().then(function(t) { return {s: r.status, b: t}; }); })"
-                    + "  .then(function(x) {"
-                    + "    try {"
-                    + "      var d = JSON.parse(x.b);"
-                    + "      var user = (d.data && d.data.user) ? d.data.user : (d.user ? d.user : null);"
-                    + "      if (x.s === 200 && user && user.username) {"
-                    + "        var fc = 0;"
-                    + "        if (user.edge_followed_by && user.edge_followed_by.count !== undefined) fc = user.edge_followed_by.count;"
-                    + "        else if (user.follower_count !== undefined) fc = user.follower_count;"
-                    + "        var ff = fc >= 1000000 ? (fc/1000000).toFixed(1).replace(/\\.0$/,'') + 'M' : fc >= 1000 ? (fc/1000).toFixed(1).replace(/\\.0$/,'') + 'K' : '' + fc;"
-                    + "        var pic = user.profile_pic_url_hd || user.profile_pic_url || '';"
-                    + "        var nid = user.pk || user.id || '';"
-                    + "        var result = JSON.stringify({success:true, username:user.username, full_name:user.full_name||'', numeric_id:''+nid, follower_count:fc, followers_formatted:ff+' followers', is_verified:!!user.is_verified, profile_pic:pic});"
-                    + "        WorkerBridge.onSearchResult(result);"
-                    + "      } else {"
-                    + "        WorkerBridge.onSearchResult(JSON.stringify({success:false, message:'HTTP ' + x.s}));"
-                    + "      }"
-                    + "    } catch(e) {"
-                    + "      WorkerBridge.onSearchResult(JSON.stringify({success:false, message:'Parse: ' + e.message}));"
-                    + "    }"
-                    + "  })"
-                    + "  .catch(function(e) { WorkerBridge.onSearchResult(JSON.stringify({success:false, message:'Fetch: ' + e.message})); });"
-                    + "})();";
-                workerWebView.loadUrl("https://www.instagram.com/");
-                // Instagram load hone ke baad fetch chalao
-                workerWebView.setWebViewClient(new WebViewClient() {
-                    @Override
-                    public void onPageFinished(WebView view, String url) {
-                        if (url != null && url.contains("instagram.com")) {
-                            view.evaluateJavascript(js, null);
-                            // Worker client wapas original pe set karo
-                            uiHandler.postDelayed(() -> setupWorkerClient(), 15000);
-                        }
-                    }
-                });
-            });
-        }
-
-        private void setupWorkerClient() {
-            workerWebView.setWebViewClient(new WebViewClient() {
-                @Override
-                public void onPageFinished(final WebView view, String url) {
-                    super.onPageFinished(view, url);
-                    if (!taskActive || url == null) return;
-                    String path = "";
-                    try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
-                    if (path.startsWith("/accounts/suspended")) { deliverResult(false, "Suspended: Instagram suspended this account"); return; }
-                    if (path.startsWith("/accounts/disabled")) { deliverResult(false, "Disabled: Instagram disabled this account"); return; }
-                    if (path.startsWith("/challenge") || path.startsWith("/checkpoint") || path.startsWith("/auth_platform")) { deliverResult(false, "Blocked: Challenge / Checkpoint"); return; }
-                    if (path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")) { deliverResult(false, "Session expired"); return; }
-                    uiHandler.postDelayed(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (!taskActive) return;
-                            if ("like".equalsIgnoreCase(currentTaskType)) { injectLikeScript(view); } else { injectFollowScript(view); }
-                        }
-                    }, 1200);
-                }
-                @Override
-                public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                    super.onReceivedError(view, request, error);
-                    if (request != null && request.isForMainFrame()) deliverResult(false, "Page error");
-                }
-            });
-        }
-
-        private String extractJson(String json, String key) {
-            try {
-                int ki = json.indexOf(key);
-                if (ki < 0) return "";
-                int colon = json.indexOf(':', ki + key.length());
-                if (colon < 0) return "";
-                int start = colon + 1;
-                while (start < json.length() && (json.charAt(start) == ' ' || json.charAt(start) == '\t')) start++;
-                if (start >= json.length()) return "";
-                char first = json.charAt(start);
-                if (first == '"') {
-                    int end = start + 1;
-                    while (end < json.length()) {
-                        if (json.charAt(end) == '"' && json.charAt(end - 1) != '\\') break;
-                        end++;
-                    }
-                    return json.substring(start + 1, end);
-                } else {
-                    int end = start;
-                    while (end < json.length()) {
-                        char c = json.charAt(end);
-                        if (c == ',' || c == '}' || c == ']' || c == '\n' || c == '\r') break;
-                        end++;
-                    }
-                    return json.substring(start, end).trim();
-                }
-            } catch (Exception e) {
-                return "";
-            }
-        }
-
-        private String formatCount(long count) {
-            if (count >= 1_000_000) {
-                double m = count / 1_000_000.0;
-                return (m == (long) m ? String.valueOf((long) m) : String.format("%.1f", m)) + "M";
-            } else if (count >= 1_000) {
-                double k = count / 1_000.0;
-                return (k == (long) k ? String.valueOf((long) k) : String.format("%.1f", k)) + "K";
-            }
-            return String.valueOf(count);
-        }
-
-        private String escJ(String s) {
-            if (s == null) return "";
-            return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "").replace("\r", "");
-        }
     }
 
     // Instagram page se sirf username lene ke liye (nonce ke bina kaam nahi karta)
@@ -818,17 +877,6 @@ public class MainActivity extends Activity {
                 public void run() {
                     deliverResult(success, message);
                 }
-            });
-        }
-
-        @JavascriptInterface
-        public void onSearchResult(final String jsonResult) {
-            uiHandler.post(() -> {
-                String safe = jsonResult.replace("\\", "\\\\").replace("'", "\\'");
-                mainWebView.evaluateJavascript(
-                    "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, '" + safe + "');", null);
-                // Worker client wapas original pe restore karo
-                new MainAppInterface().setupWorkerClient();
             });
         }
     }
