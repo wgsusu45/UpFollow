@@ -664,126 +664,87 @@ public class MainActivity extends Activity {
             });
         }
 
-        // REAL-TIME LIVE SEARCH — DEBUG VERSION (screen par toast dikhayega)
+        // REAL-TIME LIVE SEARCH — WebView JS fetch (session cookies automatic milti hain)
         @JavascriptInterface
-        public void searchInstagramProfileLive(String queryUsername) {
-            new Thread(() -> {
-                String debugInfo = "";
-                try {
-                    String cleanUser = queryUsername.replace("@", "").trim();
-                    debugInfo = "User:" + cleanUser;
-
-                    // Cookie check
-                    String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
-                    boolean hasCookie = cookies != null && cookies.contains("sessionid");
-                    debugInfo += " | Cookie:" + (hasCookie ? "YES" : "NO");
-
-                    String csrf = "";
-                    if (cookies != null) {
-                        for (String piece : cookies.split(";")) {
-                            String[] pair = piece.trim().split("=", 2);
-                            if (pair.length == 2 && "csrftoken".equalsIgnoreCase(pair[0].trim())) {
-                                csrf = pair[1].trim();
-                                break;
-                            }
+        public void searchInstagramProfileLive(final String queryUsername) {
+            uiHandler.post(() -> {
+                String cleanUser = queryUsername.replace("@", "").trim();
+                // workerWebView se fetch karo — iske paas Instagram session cookies hain
+                String js = "(function() {"
+                    + "  var u = '" + cleanUser.replace("'", "\\'") + "';"
+                    + "  fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(u), {"
+                    + "    method: 'GET',"
+                    + "    credentials: 'include',"
+                    + "    headers: {"
+                    + "      'X-IG-App-ID': '936619743392459',"
+                    + "      'X-Requested-With': 'XMLHttpRequest',"
+                    + "      'Accept': '*/*'"
+                    + "    }"
+                    + "  })"
+                    + "  .then(function(r) { return r.text().then(function(t) { return {s: r.status, b: t}; }); })"
+                    + "  .then(function(x) {"
+                    + "    try {"
+                    + "      var d = JSON.parse(x.b);"
+                    + "      var user = (d.data && d.data.user) ? d.data.user : (d.user ? d.user : null);"
+                    + "      if (x.s === 200 && user && user.username) {"
+                    + "        var fc = 0;"
+                    + "        if (user.edge_followed_by && user.edge_followed_by.count !== undefined) fc = user.edge_followed_by.count;"
+                    + "        else if (user.follower_count !== undefined) fc = user.follower_count;"
+                    + "        var ff = fc >= 1000000 ? (fc/1000000).toFixed(1).replace(/\\.0$/,'') + 'M' : fc >= 1000 ? (fc/1000).toFixed(1).replace(/\\.0$/,'') + 'K' : '' + fc;"
+                    + "        var pic = user.profile_pic_url_hd || user.profile_pic_url || '';"
+                    + "        var nid = user.pk || user.id || '';"
+                    + "        var result = JSON.stringify({success:true, username:user.username, full_name:user.full_name||'', numeric_id:''+nid, follower_count:fc, followers_formatted:ff+' followers', is_verified:!!user.is_verified, profile_pic:pic});"
+                    + "        WorkerBridge.onSearchResult(result);"
+                    + "      } else {"
+                    + "        WorkerBridge.onSearchResult(JSON.stringify({success:false, message:'HTTP ' + x.s}));"
+                    + "      }"
+                    + "    } catch(e) {"
+                    + "      WorkerBridge.onSearchResult(JSON.stringify({success:false, message:'Parse: ' + e.message}));"
+                    + "    }"
+                    + "  })"
+                    + "  .catch(function(e) { WorkerBridge.onSearchResult(JSON.stringify({success:false, message:'Fetch: ' + e.message})); });"
+                    + "})();";
+                workerWebView.loadUrl("https://www.instagram.com/");
+                // Instagram load hone ke baad fetch chalao
+                workerWebView.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public void onPageFinished(WebView view, String url) {
+                        if (url != null && url.contains("instagram.com")) {
+                            view.evaluateJavascript(js, null);
+                            // Worker client wapas original pe set karo
+                            uiHandler.postDelayed(() -> setupWorkerClient(), 15000);
                         }
                     }
-                    debugInfo += " | CSRF:" + (csrf.isEmpty() ? "NO" : "YES");
+                });
+            });
+        }
 
-                    // Instagram public JSON endpoint
-                    String urlStr = "https://www.instagram.com/" + URLEncoder.encode(cleanUser, "UTF-8") + "/?__a=1&__d=dis";
-                    URL url = new URL(urlStr);
-                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("GET");
-                    conn.setConnectTimeout(10000);
-                    conn.setReadTimeout(12000);
-                    conn.setInstanceFollowRedirects(true);
-
-                    if (cookies != null) conn.setRequestProperty("Cookie", cookies);
-                    conn.setRequestProperty("User-Agent", USER_AGENT);
-                    conn.setRequestProperty("X-CSRFToken", csrf);
-                    conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
-                    conn.setRequestProperty("Accept", "application/json, text/plain, */*");
-                    conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
-                    conn.setRequestProperty("Referer", "https://www.instagram.com/");
-
-                    int code = conn.getResponseCode();
-                    debugInfo += " | HTTP:" + code;
-
-                    InputStream is = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
-                    StringBuilder sb = new StringBuilder();
-                    String line;
-                    while ((line = reader.readLine()) != null) sb.append(line);
-                    reader.close();
-                    String responseBody = sb.toString();
-
-                    // First 200 chars of response for debug
-                    String preview = responseBody.length() > 200 ? responseBody.substring(0, 200) : responseBody;
-                    debugInfo += " | RESP:" + preview;
-
-                    final String finalDebug = debugInfo;
-                    // DEBUG TOAST — screen par dikhayega
-                    uiHandler.post(() -> Toast.makeText(MainActivity.this, finalDebug, Toast.LENGTH_LONG).show());
-
-                    // Parse karo
-                    String parsedJson;
-                    if (code == 200 && responseBody.contains("\"username\"")) {
-                        try {
-                            // __a=1 endpoint: graphql.user.username / edge_followed_by.count / id
-                            String username = extractJson(responseBody, "\"username\"");
-                            String fullName = extractJson(responseBody, "\"full_name\"");
-                            String numericId = extractJson(responseBody, "\"id\"");
-                            // followers: edge_followed_by > count
-                            String followerCountStr = "";
-                            int efbIdx = responseBody.indexOf("\"edge_followed_by\"");
-                            if (efbIdx >= 0) {
-                                String sub = responseBody.substring(efbIdx);
-                                followerCountStr = extractJson(sub, "\"count\"");
-                            }
-                            if (followerCountStr.isEmpty()) followerCountStr = extractJson(responseBody, "\"count\"");
-                            long followerCount = 0;
-                            try { followerCount = Long.parseLong(followerCountStr); } catch (Exception ignored) {}
-                            String followersFormatted = formatCount(followerCount);
-                            boolean isVerified = responseBody.contains("\"is_verified\":true")
-                                    || responseBody.contains("\"is_verified\": true");
-                            String profilePic = extractJson(responseBody, "\"profile_pic_url_hd\"");
-                            if (profilePic.isEmpty()) profilePic = extractJson(responseBody, "\"profile_pic_url\"");
-
-                            parsedJson = "{\"success\":true"
-                                    + ",\"username\":\"" + escJ(username) + "\""
-                                    + ",\"full_name\":\"" + escJ(fullName) + "\""
-                                    + ",\"numeric_id\":\"" + escJ(numericId) + "\""
-                                    + ",\"follower_count\":" + followerCount
-                                    + ",\"followers_formatted\":\"" + escJ(followersFormatted) + "\""
-                                    + ",\"is_verified\":" + isVerified
-                                    + ",\"profile_pic\":\"" + escJ(profilePic) + "\""
-                                    + "}";
-                        } catch (Exception pe) {
-                            parsedJson = "{\"success\":false,\"message\":\"Parse error: " + escJ(pe.getMessage()) + "\"}";
+        private void setupWorkerClient() {
+            workerWebView.setWebViewClient(new WebViewClient() {
+                @Override
+                public void onPageFinished(final WebView view, String url) {
+                    super.onPageFinished(view, url);
+                    if (!taskActive || url == null) return;
+                    String path = "";
+                    try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
+                    if (path.startsWith("/accounts/suspended")) { deliverResult(false, "Suspended: Instagram suspended this account"); return; }
+                    if (path.startsWith("/accounts/disabled")) { deliverResult(false, "Disabled: Instagram disabled this account"); return; }
+                    if (path.startsWith("/challenge") || path.startsWith("/checkpoint") || path.startsWith("/auth_platform")) { deliverResult(false, "Blocked: Challenge / Checkpoint"); return; }
+                    if (path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")) { deliverResult(false, "Session expired"); return; }
+                    uiHandler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (!taskActive) return;
+                            if ("like".equalsIgnoreCase(currentTaskType)) { injectLikeScript(view); } else { injectFollowScript(view); }
                         }
-                    } else {
-                        parsedJson = "{\"success\":false,\"message\":\"HTTP " + code + " — " + responseBody.substring(0, Math.min(100, responseBody.length())) + "\"}";
-                    }
-
-                    final String finalJson = parsedJson;
-                    uiHandler.post(() -> {
-                        String safe = finalJson.replace("\\", "\\\\").replace("'", "\\'");
-                        mainWebView.evaluateJavascript(
-                            "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, '" + safe + "');", null);
-                    });
-
-                } catch (Exception e) {
-                    final String errMsg = debugInfo + " | EX:" + e.getMessage();
-                    uiHandler.post(() -> {
-                        Toast.makeText(MainActivity.this, errMsg, Toast.LENGTH_LONG).show();
-                        String errJson = "{\"success\":false,\"message\":\"" + escJ(errMsg) + "\"}";
-                        String safe = errJson.replace("'", "\\'");
-                        mainWebView.evaluateJavascript(
-                            "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, '" + safe + "');", null);
-                    });
+                    }, 1200);
                 }
-            }).start();
+                @Override
+                public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                    super.onReceivedError(view, request, error);
+                    if (request != null && request.isForMainFrame()) deliverResult(false, "Page error");
+                }
+            });
         }
 
         private String extractJson(String json, String key) {
@@ -857,6 +818,17 @@ public class MainActivity extends Activity {
                 public void run() {
                     deliverResult(success, message);
                 }
+            });
+        }
+
+        @JavascriptInterface
+        public void onSearchResult(final String jsonResult) {
+            uiHandler.post(() -> {
+                String safe = jsonResult.replace("\\", "\\\\").replace("'", "\\'");
+                mainWebView.evaluateJavascript(
+                    "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, '" + safe + "');", null);
+                // Worker client wapas original pe restore karo
+                new MainAppInterface().setupWorkerClient();
             });
         }
     }
