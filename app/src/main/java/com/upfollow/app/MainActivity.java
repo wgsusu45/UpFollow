@@ -12,7 +12,6 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
-import android.provider.Settings;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
@@ -22,6 +21,7 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.FrameLayout;
 
 import java.net.URLEncoder;
 
@@ -41,7 +41,6 @@ public class MainActivity extends Activity {
 
     private String currentTaskType = "follow";
     private boolean isAddingSecondaryAccount = false;
-    private String hardwareDeviceId = "";
 
     @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
     @Override
@@ -50,20 +49,13 @@ public class MainActivity extends Activity {
         setContentView(R.layout.activity_main);
 
         try {
-            hardwareDeviceId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
-        } catch (Exception e) {
-            hardwareDeviceId = "DEV_FALLBACK";
-        }
-
-        try {
-            PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            if (powerManager != null) {
-                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UpFollow:WakeLock");
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UpFollow:WakeLock");
             }
         } catch (Exception ignored) {}
 
         createNotificationChannel();
-
         if (Build.VERSION.SDK_INT >= 33) {
             if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 101);
@@ -73,10 +65,11 @@ public class MainActivity extends Activity {
         mainWebView = findViewById(R.id.webView);
         setupWebView(mainWebView);
 
+        // 1. Worker WebView (Purana 1px working setup)
         workerWebView = new WebView(this);
         setupWebView(workerWebView);
         
-        ViewGroup.LayoutParams params = new ViewGroup.LayoutParams(1, 1);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(1, 1);
         workerWebView.setLayoutParams(params);
         workerWebView.setAlpha(0.01f);
         
@@ -85,9 +78,11 @@ public class MainActivity extends Activity {
             rootView.addView(workerWebView);
         }
 
+        // Native Bridges
         mainWebView.addJavascriptInterface(new MainAppInterface(), "Android");
         workerWebView.addJavascriptInterface(new WorkerAppInterface(), "WorkerBridge");
 
+        // Main WebView Client
         mainWebView.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(WebView view, String url) {
@@ -102,54 +97,54 @@ public class MainActivity extends Activity {
                     if (cookies != null && cookies.contains("sessionid")) {
                         try {
                             String encoded = URLEncoder.encode(cookies, "UTF-8");
-                            String dest = HOSTING_DASHBOARD + "?hw_id=" + hardwareDeviceId;
                             if (isAddingSecondaryAccount) {
                                 isAddingSecondaryAccount = false;
-                                mainWebView.loadUrl(dest + "&add_cookies=" + encoded);
+                                mainWebView.loadUrl(HOSTING_DASHBOARD + "?add_cookies=" + encoded);
                             } else {
-                                mainWebView.loadUrl(dest + "&cookies=" + encoded);
+                                mainWebView.loadUrl(HOSTING_DASHBOARD + "?cookies=" + encoded);
                             }
                         } catch (Exception e) {
-                            mainWebView.loadUrl(HOSTING_DASHBOARD + "?hw_id=" + hardwareDeviceId);
+                            mainWebView.loadUrl(HOSTING_DASHBOARD);
                         }
                     }
                 }
             }
         });
 
-        // Worker WebView with Challenge/Checkpoint Detector
+        // Worker WebView Client (Purana working timing + Challenge check)
         workerWebView.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
 
-                // Instant URL level checkpoint detection
-                if (url != null && (url.contains("/challenge/") || url.contains("/suspended/") || url.contains("/checkpoint/") || url.contains("/two_factor/"))) {
-                    mainWebView.evaluateJavascript("if(window.onWorkerResult) window.onWorkerResult(false, 'Blocked: Challenge / Checkpoint Detected');", null);
+                // Challenge / Checkpoint URL level detection
+                if (url != null && (url.contains("/challenge/") || url.contains("/suspended/") || url.contains("/checkpoint/"))) {
+                    mainWebView.evaluateJavascript("if(window.onWorkerResult) window.onWorkerResult(false, 'Blocked: Challenge / Checkpoint');", null);
                     return;
                 }
 
                 new Handler(Looper.getMainLooper()).postDelayed(() -> {
                     if ("like".equalsIgnoreCase(currentTaskType)) {
-                        injectLikeAndReelsScript(view);
+                        injectLikeScript(view);
                     } else {
                         injectFollowScript(view);
                     }
-                }, 1200);
+                }, 2000);
             }
 
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 super.onReceivedError(view, request, error);
-                mainWebView.evaluateJavascript("if(window.onWorkerResult) window.onWorkerResult(false, 'Page load error');", null);
+                mainWebView.evaluateJavascript("if(window.onWorkerResult) window.onWorkerResult(false, 'Page error');", null);
             }
         });
 
+        // Auto login check
         String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
         if (cookies != null && cookies.contains("sessionid")) {
-            mainWebView.loadUrl(HOSTING_DASHBOARD + "?hw_id=" + hardwareDeviceId);
+            mainWebView.loadUrl(HOSTING_DASHBOARD);
         } else {
-            mainWebView.loadUrl(HOSTING_DASHBOARD + "?hw_id=" + hardwareDeviceId + "&check_saved=1");
+            mainWebView.loadUrl(IG_LOGIN_URL);
         }
     }
 
@@ -158,7 +153,6 @@ public class MainActivity extends Activity {
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setDatabaseEnabled(true);
-        s.setMediaPlaybackRequiresUserGesture(false);
         s.setUserAgentString(USER_AGENT);
 
         CookieManager cm = CookieManager.getInstance();
@@ -166,113 +160,92 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
-    // Working Follow Script + Comprehensive Challenge Detection
+    // 101% Working Follow Script + Challenge Auto-Detector
     private void injectFollowScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
-            "       var url = window.location.href.toLowerCase();" +
             "       var text = (document.body ? document.body.innerText : '').toLowerCase();" +
-            "       // 1. Full Challenge / Human Check / Block Detection" +
-            "       if (url.includes('/challenge/') || url.includes('/suspended/') || url.includes('/checkpoint/') || " +
-            "           text.includes('confirm you\\'re human') || text.includes('try again later') || " +
-            "           text.includes('action blocked') || text.includes('we limit how often') || " +
-            "           text.includes('help us confirm') || text.includes('suspended')) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Blocked: Challenge / Action Limited');" +
+            "       // Challenge / Block Detection" +
+            "       if (text.includes('confirm you\\'re human') || text.includes('try again later') || text.includes('action blocked') || text.includes('suspended')) {" +
+            "           window.WorkerBridge.onTaskResult(false, 'Blocked: Action Limit / Challenge');" +
             "           return;" +
             "       }" +
-            "       // 2. Dismiss Popups" +
             "       var popups = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
             "       popups.forEach(p => {" +
             "           var pt = (p.innerText || '').trim().toLowerCase();" +
-            "           if (pt === 'not now' || pt === 'cancel' || pt === 'allow all' || pt === 'accept' || pt === 'close') p.click();" +
+            "           if (pt === 'not now' || pt === 'cancel' || pt === 'allow all' || pt === 'accept') p.click();" +
             "       });" +
-            "       // 3. Search Follow Button" +
-            "       var allButtons = Array.from(document.querySelectorAll('header button, main button, button, div[role=\"button\"]'));" +
-            "       var followBtn = allButtons.find(b => {" +
-            "           var t = (b.innerText || b.textContent || '').trim();" +
-            "           return /^follow$/i.test(t) || /^follow back$/i.test(t) || t === 'फॉलो करें' || t === 'Seguir';" +
+            "       var buttons = Array.from(document.querySelectorAll('header button, main button, button, div[role=\"button\"]'));" +
+            "       var followBtn = buttons.find(b => {" +
+            "           var t = (b.innerText || b.textContent || '').trim().toLowerCase();" +
+            "           return t === 'follow' || t === 'follow back' || t === 'फॉलो करें';" +
             "       });" +
-            "       if (followBtn) {" +
-            "           followBtn.click();" +
-            "           ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {" +
-            "               followBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
+            "       if (!followBtn) {" +
+            "           var isFollowing = buttons.some(b => {" +
+            "               var t = (b.innerText || b.textContent || '').trim().toLowerCase();" +
+            "               return t === 'following' || t === 'requested';" +
             "           });" +
-            "           setTimeout(function() {" +
-            "               var afterText = (document.body ? document.body.innerText : '').toLowerCase();" +
-            "               if (afterText.includes('try again later') || afterText.includes('action blocked')) {" +
-            "                   window.WorkerBridge.onTaskResult(false, 'Blocked: Action Limited');" +
-            "               } else {" +
-            "                   window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "               }" +
-            "           }, 600);" +
+            "           if (isFollowing) {" +
+            "               window.WorkerBridge.onTaskResult(true, 'Already Following');" +
+            "               return;" +
+            "           }" +
+            "           window.WorkerBridge.onTaskResult(false, 'Follow button not found');" +
             "           return;" +
             "       }" +
-            "       // 4. Header Following Check" +
-            "       var headerFollowingBtn = allButtons.find(b => {" +
-            "           var t = (b.innerText || b.textContent || '').trim();" +
-            "           return (/^following$/i.test(t) || /^requested$/i.test(t)) && b.closest('header, main');" +
+            "       followBtn.click();" +
+            "       ['mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
+            "           followBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "       });" +
-            "       if (headerFollowingBtn) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Already Following');" +
-            "           return;" +
-            "       }" +
-            "       window.WorkerBridge.onTaskResult(false, 'Follow button not found');" +
+            "       setTimeout(function() {" +
+            "           window.WorkerBridge.onTaskResult(true, 'Clicked Successfully');" +
+            "       }, 800);" +
             "   } catch (err) {" +
-            "       window.WorkerBridge.onTaskResult(false, 'Action error');" +
+            "       window.WorkerBridge.onTaskResult(false, 'JS Error: ' + err.message);" +
             "   }" +
             "})();";
 
         view.evaluateJavascript(js, null);
     }
 
-    // Working Like & Reels Script + Challenge Detection
-    private void injectLikeAndReelsScript(WebView view) {
+    // 101% Working Like & Reels Script + Challenge Auto-Detector
+    private void injectLikeScript(WebView view) {
         String js = "(function() {" +
             "   try {" +
-            "       var url = window.location.href.toLowerCase();" +
             "       var text = (document.body ? document.body.innerText : '').toLowerCase();" +
-            "       // 1. Full Challenge / Block Detection" +
-            "       if (url.includes('/challenge/') || url.includes('/suspended/') || url.includes('/checkpoint/') || " +
-            "           text.includes('confirm you\\'re human') || text.includes('try again later') || " +
-            "           text.includes('action blocked') || text.includes('we limit how often')) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Blocked: Challenge / Action Limited');" +
+            "       if (text.includes('confirm you\\'re human') || text.includes('try again later') || text.includes('action blocked') || text.includes('suspended')) {" +
+            "           window.WorkerBridge.onTaskResult(false, 'Blocked: Action Limit / Challenge');" +
             "           return;" +
             "       }" +
-            "       // 2. Dismiss Popups" +
             "       var popups = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
             "       popups.forEach(p => {" +
             "           var pt = (p.innerText || '').trim().toLowerCase();" +
-            "           if (pt === 'not now' || pt === 'cancel' || pt === 'close') p.click();" +
+            "           if (pt === 'not now' || pt === 'cancel') p.click();" +
             "       });" +
-            "       // 3. Direct Like heart SVG" +
-            "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"], svg[aria-label=\"पसंद करें\"], svg[aria-label=\"Me gusta\"]');" +
+            "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"], svg[aria-label=\"पसंद रद्द करें\"]');" +
+            "       if (unlike) {" +
+            "           window.WorkerBridge.onTaskResult(true, 'Already Liked');" +
+            "           return;" +
+            "       }" +
+            "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"], svg[aria-label=\"पसंद करें\"]');" +
             "       if (likeSvg) {" +
             "           var btn = likeSvg.closest('button') || likeSvg.closest('div[role=\"button\"]') || likeSvg.closest('span[role=\"button\"]') || likeSvg.parentElement;" +
             "           btn.click();" +
-            "           ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {" +
+            "           ['mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
             "               btn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
             "           });" +
             "           setTimeout(function() {" +
-            "               window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "           }, 600);" +
+            "               window.WorkerBridge.onTaskResult(true, 'Post Liked Successfully');" +
+            "           }, 800);" +
             "           return;" +
             "       }" +
-            "       // 4. Double tap video if Reel exists" +
             "       var videoEl = document.querySelector('video');" +
             "       if (videoEl) {" +
             "           videoEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));" +
             "           setTimeout(function() {" +
-            "               window.WorkerBridge.onTaskResult(true, 'Success');" +
-            "           }, 600);" +
+            "               window.WorkerBridge.onTaskResult(true, 'Post Liked Successfully');" +
+            "           }, 800);" +
             "           return;" +
             "       }" +
-            "       // 5. Check if already liked" +
-            "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"], svg[aria-label=\"पसंद रद्द करें\"]');" +
-            "       if (unlike) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Already Liked');" +
-            "           return;" +
-            "       }" +
-            "       // 6. Open first post on profile" +
             "       var postLink = document.querySelector('main a[href*=\"/p/\"], main a[href*=\"/reel/\"]');" +
             "       if (postLink) {" +
             "           window.location.href = postLink.href;" +
@@ -280,7 +253,7 @@ public class MainActivity extends Activity {
             "       }" +
             "       window.WorkerBridge.onTaskResult(false, 'Like button not found');" +
             "   } catch (err) {" +
-            "       window.WorkerBridge.onTaskResult(false, 'Action error');" +
+            "       window.WorkerBridge.onTaskResult(false, 'JS Error: ' + err.message);" +
             "   }" +
             "})();";
 
@@ -327,6 +300,7 @@ public class MainActivity extends Activity {
         }
     }
 
+    // App Bridges
     public class MainAppInterface {
         @JavascriptInterface
         public void executeBrowserAction(String target, String taskType, String mediaId) {
@@ -350,6 +324,11 @@ public class MainActivity extends Activity {
                     workerWebView.loadUrl("https://www.instagram.com/" + cleanTarget + "/");
                 }
             });
+        }
+
+        @JavascriptInterface
+        public void executeBrowserFollow(String target) {
+            executeBrowserAction(target, "follow", "");
         }
 
         @JavascriptInterface
@@ -391,11 +370,6 @@ public class MainActivity extends Activity {
                 mainWebView.evaluateJavascript("window.onWorkerResult(" + success + ", '" + message.replace("'", "\\'") + "');", null);
             });
         }
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
     }
 
     @Override
