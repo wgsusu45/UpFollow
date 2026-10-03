@@ -26,7 +26,13 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 
 public class MainActivity extends Activity {
@@ -662,6 +668,67 @@ public class MainActivity extends Activity {
                     clearAutomationNotification();
                 }
             });
+        }
+
+        // REAL-TIME LIVE SEARCH FROM LOGGED-IN PHONE INSTAGRAM SESSION
+        @JavascriptInterface
+        public void searchInstagramProfileLive(String queryUsername) {
+            new Thread(() -> {
+                try {
+                    String cleanUser = queryUsername.replace("@", "").trim();
+                    String urlStr = "https://www.instagram.com/api/v1/users/web_profile_info/?username=" + URLEncoder.encode(cleanUser, "UTF-8");
+
+                    URL url = new URL(urlStr);
+                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                    conn.setRequestMethod("GET");
+                    conn.setConnectTimeout(8000);
+                    conn.setReadTimeout(10000);
+
+                    // Phone ke CookieManager se live Instagram cookies lena
+                    String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
+                    String csrf = "";
+                    if (cookies != null) {
+                        conn.setRequestProperty("Cookie", cookies);
+                        for (String piece : cookies.split(";")) {
+                            String[] pair = piece.trim().split("=");
+                            if (pair.length == 2 && "csrftoken".equalsIgnoreCase(pair[0])) {
+                                csrf = pair[1];
+                                break;
+                            }
+                        }
+                    }
+
+                    conn.setRequestProperty("User-Agent", USER_AGENT);
+                    conn.setRequestProperty("X-IG-App-ID", "936619743392459");
+                    conn.setRequestProperty("X-ASBD-ID", "129477");
+                    conn.setRequestProperty("X-CSRFToken", csrf);
+                    conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
+                    conn.setRequestProperty("Origin", "https://www.instagram.com");
+                    conn.setRequestProperty("Referer", "https://www.instagram.com/" + cleanUser + "/");
+
+                    int code = conn.getResponseCode();
+                    InputStream is = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        sb.append(line);
+                    }
+                    reader.close();
+                    String responseBody = sb.toString();
+
+                    // Result web page ko wapas bhejna
+                    new Handler(Looper.getMainLooper()).post(() -> {
+                        String safeJson = responseBody.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "").replace("\r", "");
+                        mainWebView.evaluateJavascript("if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(" + (code == 200) + ", '" + safeJson + "');", null);
+                    });
+
+                } catch (Exception e) {
+                    new Handler(Looper.getMainLooper()).post(() -> {
+                        mainWebView.evaluateJavascript("if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(false, 'Search Error: " + e.getMessage() + "');", null);
+                    });
+                }
+            }).start();
         }
     }
 
