@@ -684,7 +684,6 @@ public class MainActivity extends Activity {
                     conn.setConnectTimeout(8000);
                     conn.setReadTimeout(10000);
 
-                    // Phone ke CookieManager se live Instagram cookies lena
                     String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
                     String csrf = "";
                     if (cookies != null) {
@@ -717,18 +716,112 @@ public class MainActivity extends Activity {
                     reader.close();
                     String responseBody = sb.toString();
 
-                    // Result web page ko wapas bhejna
+                    // Parse Instagram API response and build proper JSON for JS callback
+                    String parsedJson;
+                    if (code == 200 && responseBody.contains("\"username\"")) {
+                        try {
+                            // username
+                            String username = extractJson(responseBody, "\"username\"");
+                            // full_name
+                            String fullName = extractJson(responseBody, "\"full_name\"");
+                            // pk / id (numeric)
+                            String numericId = extractJson(responseBody, "\"pk\"");
+                            if (numericId.isEmpty()) numericId = extractJson(responseBody, "\"id\"");
+                            // follower count
+                            String followerCountStr = extractJson(responseBody, "\"follower_count\"");
+                            long followerCount = 0;
+                            try { followerCount = Long.parseLong(followerCountStr); } catch (Exception ignored) {}
+                            String followersFormatted = formatCount(followerCount);
+                            // verified
+                            boolean isVerified = responseBody.contains("\"is_verified\":true");
+                            // profile pic
+                            String profilePic = extractJson(responseBody, "\"profile_pic_url_hd\"");
+                            if (profilePic.isEmpty()) profilePic = extractJson(responseBody, "\"profile_pic_url\"");
+
+                            parsedJson = "{\"success\":true"
+                                    + ",\"username\":\"" + escJ(username) + "\""
+                                    + ",\"full_name\":\"" + escJ(fullName) + "\""
+                                    + ",\"numeric_id\":\"" + escJ(numericId) + "\""
+                                    + ",\"follower_count\":" + followerCount
+                                    + ",\"followers_formatted\":\"" + escJ(followersFormatted) + "\""
+                                    + ",\"is_verified\":" + isVerified
+                                    + ",\"profile_pic\":\"" + escJ(profilePic) + "\""
+                                    + "}";
+                        } catch (Exception pe) {
+                            parsedJson = "{\"success\":false,\"message\":\"Parse error\"}";
+                        }
+                    } else {
+                        parsedJson = "{\"success\":false,\"message\":\"Account not found\"}";
+                    }
+
+                    final String finalJson = parsedJson;
                     new Handler(Looper.getMainLooper()).post(() -> {
-                        String safeJson = responseBody.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "").replace("\r", "");
-                        mainWebView.evaluateJavascript("if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(" + (code == 200) + ", '" + safeJson + "');", null);
+                        String safe = finalJson.replace("\\", "\\\\").replace("'", "\\'");
+                        mainWebView.evaluateJavascript(
+                            "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, '" + safe + "');", null);
                     });
 
                 } catch (Exception e) {
                     new Handler(Looper.getMainLooper()).post(() -> {
-                        mainWebView.evaluateJavascript("if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(false, 'Search Error: " + e.getMessage() + "');", null);
+                        String errJson = "{\"success\":false,\"message\":\"Search Error: " + escJ(e.getMessage()) + "\"}";
+                        String safe = errJson.replace("'", "\\'");
+                        mainWebView.evaluateJavascript(
+                            "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, '" + safe + "');", null);
                     });
                 }
             }).start();
+        }
+
+        // JSON field extractor (lightweight, no external lib needed)
+        private String extractJson(String json, String key) {
+            try {
+                int ki = json.indexOf(key);
+                if (ki < 0) return "";
+                int colon = json.indexOf(':', ki + key.length());
+                if (colon < 0) return "";
+                int start = colon + 1;
+                while (start < json.length() && (json.charAt(start) == ' ' || json.charAt(start) == '\t')) start++;
+                if (start >= json.length()) return "";
+                char first = json.charAt(start);
+                if (first == '"') {
+                    // string value
+                    int end = start + 1;
+                    while (end < json.length()) {
+                        if (json.charAt(end) == '"' && json.charAt(end - 1) != '\\') break;
+                        end++;
+                    }
+                    return json.substring(start + 1, end);
+                } else {
+                    // number / bool / null
+                    int end = start;
+                    while (end < json.length()) {
+                        char c = json.charAt(end);
+                        if (c == ',' || c == '}' || c == ']' || c == '\n' || c == '\r') break;
+                        end++;
+                    }
+                    return json.substring(start, end).trim();
+                }
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
+        // Format follower count: 1200 -> 1.2K, 1500000 -> 1.5M
+        private String formatCount(long count) {
+            if (count >= 1_000_000) {
+                double m = count / 1_000_000.0;
+                return (m == (long) m ? String.valueOf((long) m) : String.format("%.1f", m)) + "M";
+            } else if (count >= 1_000) {
+                double k = count / 1_000.0;
+                return (k == (long) k ? String.valueOf((long) k) : String.format("%.1f", k)) + "K";
+            }
+            return String.valueOf(count);
+        }
+
+        // Escape for JSON string
+        private String escJ(String s) {
+            if (s == null) return "";
+            return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "").replace("\r", "");
         }
     }
 
