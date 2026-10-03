@@ -25,6 +25,7 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+import android.widget.Toast;
 
 import java.io.BufferedReader;
 import java.io.InputStream;
@@ -233,8 +234,6 @@ public class MainActivity extends Activity {
                 public void run() {
                     addMode = true;
                     captureBusy = false;
-                    // Saare accounts ki cookies server par saved hain, isliye jar saaf karna safe hai.
-                    // Isse Instagram naya login form dikhata hai aur purana session nahi ghusta.
                     applyInstagramCookies("");
                     mainWebView.loadUrl(IG_LOGIN_URL);
                 }
@@ -282,7 +281,6 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // Agar username fetch atak jaye to bina username ke aage badho
         uiHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -326,7 +324,6 @@ public class MainActivity extends Activity {
         return "";
     }
 
-    // cookieStr khali ho to sirf Instagram cookies clear hoti hain
     private void applyInstagramCookies(String cookieStr) {
         CookieManager cm = CookieManager.getInstance();
         String existing = cm.getCookie(IG_URL);
@@ -455,7 +452,7 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // LIKE SCRIPT: pehle DOM button, na mile to Instagram web API (fallback)
+    // LIKE SCRIPT
     // ------------------------------------------------------------------
     private void injectLikeScript(WebView view) {
         String script = JS_HEAD + js(
@@ -574,7 +571,6 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------
     public class MainAppInterface {
 
-        // Naya: account ki cookies ke saath task chalao (har account apna session use karta hai)
         @JavascriptInterface
         public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
             if (!trusted()) return;
@@ -608,7 +604,6 @@ public class MainActivity extends Activity {
             });
         }
 
-        // Purana method (compatibility)
         @JavascriptInterface
         public void executeBrowserAction(String target, String taskType, String mediaId) {
             runTask(target, taskType, mediaId, "");
@@ -619,7 +614,6 @@ public class MainActivity extends Activity {
             runTask(target, "follow", "", "");
         }
 
-        // Primary account ki cookie server par sync karne ke liye
         @JavascriptInterface
         public String getIgCookies() {
             if (!trusted()) return "";
@@ -670,71 +664,83 @@ public class MainActivity extends Activity {
             });
         }
 
-        // REAL-TIME LIVE SEARCH FROM LOGGED-IN PHONE INSTAGRAM SESSION
+        // REAL-TIME LIVE SEARCH — DEBUG VERSION (screen par toast dikhayega)
         @JavascriptInterface
         public void searchInstagramProfileLive(String queryUsername) {
             new Thread(() -> {
+                String debugInfo = "";
                 try {
                     String cleanUser = queryUsername.replace("@", "").trim();
-                    String urlStr = "https://www.instagram.com/api/v1/users/web_profile_info/?username=" + URLEncoder.encode(cleanUser, "UTF-8");
+                    debugInfo = "User:" + cleanUser;
 
-                    URL url = new URL(urlStr);
-                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("GET");
-                    conn.setConnectTimeout(8000);
-                    conn.setReadTimeout(10000);
-
+                    // Cookie check
                     String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
+                    boolean hasCookie = cookies != null && cookies.contains("sessionid");
+                    debugInfo += " | Cookie:" + (hasCookie ? "YES" : "NO");
+
                     String csrf = "";
                     if (cookies != null) {
-                        conn.setRequestProperty("Cookie", cookies);
                         for (String piece : cookies.split(";")) {
-                            String[] pair = piece.trim().split("=");
-                            if (pair.length == 2 && "csrftoken".equalsIgnoreCase(pair[0])) {
-                                csrf = pair[1];
+                            String[] pair = piece.trim().split("=", 2);
+                            if (pair.length == 2 && "csrftoken".equalsIgnoreCase(pair[0].trim())) {
+                                csrf = pair[1].trim();
                                 break;
                             }
                         }
                     }
+                    debugInfo += " | CSRF:" + (csrf.isEmpty() ? "NO" : "YES");
 
+                    String urlStr = "https://www.instagram.com/api/v1/users/web_profile_info/?username=" + URLEncoder.encode(cleanUser, "UTF-8");
+                    URL url = new URL(urlStr);
+                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                    conn.setRequestMethod("GET");
+                    conn.setConnectTimeout(10000);
+                    conn.setReadTimeout(12000);
+                    conn.setInstanceFollowRedirects(true);
+
+                    if (cookies != null) conn.setRequestProperty("Cookie", cookies);
                     conn.setRequestProperty("User-Agent", USER_AGENT);
                     conn.setRequestProperty("X-IG-App-ID", "936619743392459");
                     conn.setRequestProperty("X-ASBD-ID", "129477");
                     conn.setRequestProperty("X-CSRFToken", csrf);
                     conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
+                    conn.setRequestProperty("Accept", "*/*");
+                    conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
                     conn.setRequestProperty("Origin", "https://www.instagram.com");
                     conn.setRequestProperty("Referer", "https://www.instagram.com/" + cleanUser + "/");
 
                     int code = conn.getResponseCode();
+                    debugInfo += " | HTTP:" + code;
+
                     InputStream is = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
                     BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
                     StringBuilder sb = new StringBuilder();
                     String line;
-                    while ((line = reader.readLine()) != null) {
-                        sb.append(line);
-                    }
+                    while ((line = reader.readLine()) != null) sb.append(line);
                     reader.close();
                     String responseBody = sb.toString();
 
-                    // Parse Instagram API response and build proper JSON for JS callback
+                    // First 200 chars of response for debug
+                    String preview = responseBody.length() > 200 ? responseBody.substring(0, 200) : responseBody;
+                    debugInfo += " | RESP:" + preview;
+
+                    final String finalDebug = debugInfo;
+                    // DEBUG TOAST — screen par dikhayega
+                    uiHandler.post(() -> Toast.makeText(MainActivity.this, finalDebug, Toast.LENGTH_LONG).show());
+
+                    // Parse karo
                     String parsedJson;
                     if (code == 200 && responseBody.contains("\"username\"")) {
                         try {
-                            // username
                             String username = extractJson(responseBody, "\"username\"");
-                            // full_name
                             String fullName = extractJson(responseBody, "\"full_name\"");
-                            // pk / id (numeric)
                             String numericId = extractJson(responseBody, "\"pk\"");
                             if (numericId.isEmpty()) numericId = extractJson(responseBody, "\"id\"");
-                            // follower count
                             String followerCountStr = extractJson(responseBody, "\"follower_count\"");
                             long followerCount = 0;
                             try { followerCount = Long.parseLong(followerCountStr); } catch (Exception ignored) {}
                             String followersFormatted = formatCount(followerCount);
-                            // verified
                             boolean isVerified = responseBody.contains("\"is_verified\":true");
-                            // profile pic
                             String profilePic = extractJson(responseBody, "\"profile_pic_url_hd\"");
                             if (profilePic.isEmpty()) profilePic = extractJson(responseBody, "\"profile_pic_url\"");
 
@@ -748,22 +754,24 @@ public class MainActivity extends Activity {
                                     + ",\"profile_pic\":\"" + escJ(profilePic) + "\""
                                     + "}";
                         } catch (Exception pe) {
-                            parsedJson = "{\"success\":false,\"message\":\"Parse error\"}";
+                            parsedJson = "{\"success\":false,\"message\":\"Parse error: " + escJ(pe.getMessage()) + "\"}";
                         }
                     } else {
-                        parsedJson = "{\"success\":false,\"message\":\"Account not found\"}";
+                        parsedJson = "{\"success\":false,\"message\":\"HTTP " + code + " — Account not found\"}";
                     }
 
                     final String finalJson = parsedJson;
-                    new Handler(Looper.getMainLooper()).post(() -> {
+                    uiHandler.post(() -> {
                         String safe = finalJson.replace("\\", "\\\\").replace("'", "\\'");
                         mainWebView.evaluateJavascript(
                             "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, '" + safe + "');", null);
                     });
 
                 } catch (Exception e) {
-                    new Handler(Looper.getMainLooper()).post(() -> {
-                        String errJson = "{\"success\":false,\"message\":\"Search Error: " + escJ(e.getMessage()) + "\"}";
+                    final String errMsg = debugInfo + " | EX:" + e.getMessage();
+                    uiHandler.post(() -> {
+                        Toast.makeText(MainActivity.this, errMsg, Toast.LENGTH_LONG).show();
+                        String errJson = "{\"success\":false,\"message\":\"" + escJ(errMsg) + "\"}";
                         String safe = errJson.replace("'", "\\'");
                         mainWebView.evaluateJavascript(
                             "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, '" + safe + "');", null);
@@ -772,7 +780,6 @@ public class MainActivity extends Activity {
             }).start();
         }
 
-        // JSON field extractor (lightweight, no external lib needed)
         private String extractJson(String json, String key) {
             try {
                 int ki = json.indexOf(key);
@@ -784,7 +791,6 @@ public class MainActivity extends Activity {
                 if (start >= json.length()) return "";
                 char first = json.charAt(start);
                 if (first == '"') {
-                    // string value
                     int end = start + 1;
                     while (end < json.length()) {
                         if (json.charAt(end) == '"' && json.charAt(end - 1) != '\\') break;
@@ -792,7 +798,6 @@ public class MainActivity extends Activity {
                     }
                     return json.substring(start + 1, end);
                 } else {
-                    // number / bool / null
                     int end = start;
                     while (end < json.length()) {
                         char c = json.charAt(end);
@@ -806,7 +811,6 @@ public class MainActivity extends Activity {
             }
         }
 
-        // Format follower count: 1200 -> 1.2K, 1500000 -> 1.5M
         private String formatCount(long count) {
             if (count >= 1_000_000) {
                 double m = count / 1_000_000.0;
@@ -818,7 +822,6 @@ public class MainActivity extends Activity {
             return String.valueOf(count);
         }
 
-        // Escape for JSON string
         private String escJ(String s) {
             if (s == null) return "";
             return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "").replace("\r", "");
