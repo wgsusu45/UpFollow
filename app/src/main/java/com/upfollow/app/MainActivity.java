@@ -690,7 +690,9 @@ public class MainActivity extends Activity {
                     }
                     debugInfo += " | CSRF:" + (csrf.isEmpty() ? "NO" : "YES");
 
-                    String urlStr = "https://www.instagram.com/api/v1/users/web_profile_info/?username=" + URLEncoder.encode(cleanUser, "UTF-8");
+                    // GraphQL API — 429 nahi deta web_profile_info ki tarah
+                    String variables = URLEncoder.encode("{\"username\":\"" + cleanUser + "\",\"include_reel\":false}", "UTF-8");
+                    String urlStr = "https://www.instagram.com/graphql/query/?query_hash=c9100bf9110dd6361671f113dd02e7d&variables=" + variables;
                     URL url = new URL(urlStr);
                     HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                     conn.setRequestMethod("GET");
@@ -700,13 +702,10 @@ public class MainActivity extends Activity {
 
                     if (cookies != null) conn.setRequestProperty("Cookie", cookies);
                     conn.setRequestProperty("User-Agent", USER_AGENT);
-                    conn.setRequestProperty("X-IG-App-ID", "936619743392459");
-                    conn.setRequestProperty("X-ASBD-ID", "129477");
                     conn.setRequestProperty("X-CSRFToken", csrf);
                     conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
                     conn.setRequestProperty("Accept", "*/*");
                     conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
-                    conn.setRequestProperty("Origin", "https://www.instagram.com");
                     conn.setRequestProperty("Referer", "https://www.instagram.com/" + cleanUser + "/");
 
                     int code = conn.getResponseCode();
@@ -732,15 +731,17 @@ public class MainActivity extends Activity {
                     String parsedJson;
                     if (code == 200 && responseBody.contains("\"username\"")) {
                         try {
+                            // GraphQL: data.user.username, id, edge_followed_by.count, profile_pic_url
                             String username = extractJson(responseBody, "\"username\"");
                             String fullName = extractJson(responseBody, "\"full_name\"");
-                            String numericId = extractJson(responseBody, "\"pk\"");
-                            if (numericId.isEmpty()) numericId = extractJson(responseBody, "\"id\"");
-                            String followerCountStr = extractJson(responseBody, "\"follower_count\"");
+                            String numericId = extractJson(responseBody, "\"id\"");
+                            // follower count GraphQL mein edge_followed_by > count ke andar hai
+                            String followerCountStr = extractJson(responseBody, "\"count\"");
                             long followerCount = 0;
                             try { followerCount = Long.parseLong(followerCountStr); } catch (Exception ignored) {}
                             String followersFormatted = formatCount(followerCount);
-                            boolean isVerified = responseBody.contains("\"is_verified\":true");
+                            boolean isVerified = responseBody.contains("\"is_verified\":true")
+                                    || responseBody.contains("\"is_verified\": true");
                             String profilePic = extractJson(responseBody, "\"profile_pic_url_hd\"");
                             if (profilePic.isEmpty()) profilePic = extractJson(responseBody, "\"profile_pic_url\"");
 
