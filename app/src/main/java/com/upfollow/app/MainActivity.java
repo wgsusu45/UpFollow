@@ -32,15 +32,30 @@ public class MainActivity extends Activity {
 
     private static final String HOSTING_DASHBOARD = "https://follow2follow.shop/index.php";
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
-    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
+    // FIX: purana Chrome/124 UA Instagram ko outdated lag sakta hai. Time-time pe update karte raho.
+    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36";
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
     private static final int NOTIFICATION_ID = 1001;
+    private static final long TASK_TIMEOUT_MS = 40000L;
+
     private NotificationManager notificationManager;
     private PowerManager.WakeLock wakeLock;
 
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+
     private String currentTaskType = "follow";
     private boolean isAddingSecondaryAccount = false;
+
+    // FIX: sirf ek result per task jaye (duplicate onPageFinished se double result nahi aayega)
+    private boolean taskActive = false;
+
+    private final Runnable taskTimeout = new Runnable() {
+        @Override
+        public void run() {
+            deliverResult(false, "Timeout");
+        }
+    };
 
     @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
     @Override
@@ -65,17 +80,21 @@ public class MainActivity extends Activity {
         mainWebView = findViewById(R.id.webView);
         setupWebView(mainWebView);
 
-        // 1. Worker WebView (Purana 1px working setup)
+        // FIX: Worker WebView ab full-size hai (1x1 par Instagram ka mobile layout/React render
+        // sahi nahi hota, isliye Follow button DOM me aata hi nahi tha). Ye main WebView ke
+        // NEECHE (index 0) add hota hai, to touch block nahi karta aur user ko dikhta nahi.
         workerWebView = new WebView(this);
         setupWebView(workerWebView);
-        
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(1, 1);
+
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT);
         workerWebView.setLayoutParams(params);
         workerWebView.setAlpha(0.01f);
-        
+
         ViewGroup rootView = (ViewGroup) findViewById(android.R.id.content);
         if (rootView != null) {
-            rootView.addView(workerWebView);
+            rootView.addView(workerWebView, 0);
         }
 
         // Native Bridges
@@ -93,6 +112,7 @@ public class MainActivity extends Activity {
                 }
 
                 if (url != null && (url.contains("instagram.com/?") || url.equals("https://www.instagram.com/"))) {
+                    CookieManager.getInstance().flush();
                     String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
                     if (cookies != null && cookies.contains("sessionid")) {
                         try {
@@ -111,31 +131,46 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Worker WebView Client (Purana working timing + Challenge check)
+        // Worker WebView Client
         workerWebView.setWebViewClient(new WebViewClient() {
             @Override
-            public void onPageFinished(WebView view, String url) {
+            public void onPageFinished(final WebView view, String url) {
                 super.onPageFinished(view, url);
+                if (!taskActive) return;
 
-                // Challenge / Checkpoint URL level detection
                 if (url != null && (url.contains("/challenge/") || url.contains("/suspended/") || url.contains("/checkpoint/"))) {
-                    mainWebView.evaluateJavascript("if(window.onWorkerResult) window.onWorkerResult(false, 'Blocked: Challenge / Checkpoint');", null);
+                    deliverResult(false, "Blocked: Challenge / Checkpoint");
                     return;
                 }
 
-                new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                    if ("like".equalsIgnoreCase(currentTaskType)) {
-                        injectLikeScript(view);
-                    } else {
-                        injectFollowScript(view);
+                // FIX: login page par redirect = session valid nahi
+                if (url != null && url.contains("/accounts/login")) {
+                    deliverResult(false, "Not logged in");
+                    return;
+                }
+
+                // Script ab khud polling karti hai (React render hone ka wait), isliye delay chhota
+                uiHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!taskActive) return;
+                        if ("like".equalsIgnoreCase(currentTaskType)) {
+                            injectLikeScript(view);
+                        } else {
+                            injectFollowScript(view);
+                        }
                     }
-                }, 2000);
+                }, 1500);
             }
 
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 super.onReceivedError(view, request, error);
-                mainWebView.evaluateJavascript("if(window.onWorkerResult) window.onWorkerResult(false, 'Page error');", null);
+                // FIX: pehle har chhota resource error (image/script) bhi "Page error" bana deta tha.
+                // Ab sirf main page ka error count hoga.
+                if (request != null && request.isForMainFrame()) {
+                    deliverResult(false, "Page error");
+                }
             }
         });
 
@@ -160,104 +195,139 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
-    // 101% Working Follow Script + Challenge Auto-Detector
-    private void injectFollowScript(WebView view) {
-        String js = "(function() {" +
-            "   try {" +
-            "       var text = (document.body ? document.body.innerText : '').toLowerCase();" +
-            "       // Challenge / Block Detection" +
-            "       if (text.includes('confirm you\\'re human') || text.includes('try again later') || text.includes('action blocked') || text.includes('suspended')) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Blocked: Action Limit / Challenge');" +
-            "           return;" +
-            "       }" +
-            "       var popups = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
-            "       popups.forEach(p => {" +
-            "           var pt = (p.innerText || '').trim().toLowerCase();" +
-            "           if (pt === 'not now' || pt === 'cancel' || pt === 'allow all' || pt === 'accept') p.click();" +
-            "       });" +
-            "       var buttons = Array.from(document.querySelectorAll('header button, main button, button, div[role=\"button\"]'));" +
-            "       var followBtn = buttons.find(b => {" +
-            "           var t = (b.innerText || b.textContent || '').trim().toLowerCase();" +
-            "           return t === 'follow' || t === 'follow back' || t === 'फॉलो करें';" +
-            "       });" +
-            "       if (!followBtn) {" +
-            "           var isFollowing = buttons.some(b => {" +
-            "               var t = (b.innerText || b.textContent || '').trim().toLowerCase();" +
-            "               return t === 'following' || t === 'requested';" +
-            "           });" +
-            "           if (isFollowing) {" +
-            "               window.WorkerBridge.onTaskResult(true, 'Already Following');" +
-            "               return;" +
-            "           }" +
-            "           window.WorkerBridge.onTaskResult(false, 'Follow button not found');" +
-            "           return;" +
-            "       }" +
-            "       followBtn.click();" +
-            "       ['mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
-            "           followBtn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
-            "       });" +
-            "       setTimeout(function() {" +
-            "           window.WorkerBridge.onTaskResult(true, 'Clicked Successfully');" +
-            "       }, 800);" +
-            "   } catch (err) {" +
-            "       window.WorkerBridge.onTaskResult(false, 'JS Error: ' + err.message);" +
-            "   }" +
-            "})();";
-
-        view.evaluateJavascript(js, null);
+    private static String js(String... lines) {
+        StringBuilder sb = new StringBuilder();
+        for (String l : lines) sb.append(l).append('\n');
+        return sb.toString();
     }
 
-    // 101% Working Like & Reels Script + Challenge Auto-Detector
-    private void injectLikeScript(WebView view) {
-        String js = "(function() {" +
-            "   try {" +
-            "       var text = (document.body ? document.body.innerText : '').toLowerCase();" +
-            "       if (text.includes('confirm you\\'re human') || text.includes('try again later') || text.includes('action blocked') || text.includes('suspended')) {" +
-            "           window.WorkerBridge.onTaskResult(false, 'Blocked: Action Limit / Challenge');" +
-            "           return;" +
-            "       }" +
-            "       var popups = Array.from(document.querySelectorAll('button, div[role=\"button\"]'));" +
-            "       popups.forEach(p => {" +
-            "           var pt = (p.innerText || '').trim().toLowerCase();" +
-            "           if (pt === 'not now' || pt === 'cancel') p.click();" +
-            "       });" +
-            "       var unlike = document.querySelector('svg[aria-label=\"Unlike\"], svg[aria-label=\"पसंद रद्द करें\"]');" +
-            "       if (unlike) {" +
-            "           window.WorkerBridge.onTaskResult(true, 'Already Liked');" +
-            "           return;" +
-            "       }" +
-            "       var likeSvg = document.querySelector('svg[aria-label=\"Like\"], svg[aria-label=\"पसंद करें\"]');" +
-            "       if (likeSvg) {" +
-            "           var btn = likeSvg.closest('button') || likeSvg.closest('div[role=\"button\"]') || likeSvg.closest('span[role=\"button\"]') || likeSvg.parentElement;" +
-            "           btn.click();" +
-            "           ['mousedown', 'mouseup', 'click'].forEach(function(evt) {" +
-            "               btn.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));" +
-            "           });" +
-            "           setTimeout(function() {" +
-            "               window.WorkerBridge.onTaskResult(true, 'Post Liked Successfully');" +
-            "           }, 800);" +
-            "           return;" +
-            "       }" +
-            "       var videoEl = document.querySelector('video');" +
-            "       if (videoEl) {" +
-            "           videoEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));" +
-            "           setTimeout(function() {" +
-            "               window.WorkerBridge.onTaskResult(true, 'Post Liked Successfully');" +
-            "           }, 800);" +
-            "           return;" +
-            "       }" +
-            "       var postLink = document.querySelector('main a[href*=\"/p/\"], main a[href*=\"/reel/\"]');" +
-            "       if (postLink) {" +
-            "           window.location.href = postLink.href;" +
-            "           return;" +
-            "       }" +
-            "       window.WorkerBridge.onTaskResult(false, 'Like button not found');" +
-            "   } catch (err) {" +
-            "       window.WorkerBridge.onTaskResult(false, 'JS Error: ' + err.message);" +
-            "   }" +
-            "})();";
+    // Result ko ek hi baar main WebView tak bhejta hai
+    private void deliverResult(boolean success, String message) {
+        if (!taskActive) return;
+        taskActive = false;
+        uiHandler.removeCallbacks(taskTimeout);
+        String safe = message == null ? "" : message.replace("\\", "\\\\").replace("'", "\\'");
+        mainWebView.evaluateJavascript(
+                "if(window.onWorkerResult) window.onWorkerResult(" + success + ", '" + safe + "');", null);
+    }
 
-        view.evaluateJavascript(js, null);
+    // ---------------- FOLLOW SCRIPT ----------------
+    // Fixes:
+    //  1. Polling: button aane tak 14 sec tak wait (pehle sirf 1 baar check hota tha)
+    //  2. Double click hata diya (click() + dispatchEvent = 2 click => follow ke baad unfollow ho sakta tha)
+    //  3. Click ke baad verify: "Following"/"Requested" dikhe tabhi success
+    //  4. 'suspended' wala false-positive hata diya (bio me ye word ho to block lag jata tha)
+    //  5. Pehle header ke andar button dhundta hai (suggested accounts ke Follow button se bachne ke liye)
+    private void injectFollowScript(WebView view) {
+        String script = js(
+            "(function() {",
+            "  if (window.__ufRunning) return;",
+            "  window.__ufRunning = true;",
+            "  var finished = false, tries = 0, clicked = false, clickedAt = 0, timer = null;",
+            "  var FOLLOW = ['follow', 'follow back', '\u092b\u0949\u0932\u094b \u0915\u0930\u0947\u0902'];",
+            "  var DONE = ['following', 'requested'];",
+            "  function finish(ok, msg) {",
+            "    if (finished) return;",
+            "    finished = true; window.__ufRunning = false;",
+            "    if (timer) clearInterval(timer);",
+            "    window.WorkerBridge.onTaskResult(ok, msg);",
+            "  }",
+            "  function txt(e) { return ((e.innerText || e.textContent) || '').trim().toLowerCase(); }",
+            "  function btns(root) { return Array.prototype.slice.call((root || document).querySelectorAll('button, div[role=button]')); }",
+            "  function find(list, words) {",
+            "    for (var i = 0; i < list.length; i++) { if (words.indexOf(txt(list[i])) > -1) return list[i]; }",
+            "    return null;",
+            "  }",
+            "  function tick() {",
+            "    try {",
+            "      tries++;",
+            "      var body = (document.body ? document.body.innerText : '').toLowerCase();",
+            "      if (body.indexOf('action blocked') > -1 || body.indexOf('confirm you') > -1 || body.indexOf('try again later') > -1) {",
+            "        finish(false, 'Blocked: Action Limit / Challenge'); return;",
+            "      }",
+            "      if (document.querySelector('input[name=username]')) { finish(false, 'Not logged in'); return; }",
+            "      btns().forEach(function(p) {",
+            "        var pt = txt(p);",
+            "        if (pt === 'not now' || pt === 'allow all' || pt === 'allow all cookies' || pt === 'accept') p.click();",
+            "      });",
+            "      var scope = (tries > 8) ? document : (document.querySelector('header') || document.querySelector('main') || document);",
+            "      var list = btns(scope);",
+            "      if (clicked) {",
+            "        if (find(list, DONE)) { finish(true, 'Followed Successfully'); return; }",
+            "        if (Date.now() - clickedAt > 5000) { finish(false, 'Click did not register'); }",
+            "        return;",
+            "      }",
+            "      if (find(list, DONE)) { finish(true, 'Already Following'); return; }",
+            "      var fb = find(list, FOLLOW);",
+            "      if (fb) { fb.click(); clicked = true; clickedAt = Date.now(); return; }",
+            "      if (tries >= 20) { finish(false, 'Follow button not found'); }",
+            "    } catch (err) {",
+            "      finish(false, 'JS Error: ' + err.message);",
+            "    }",
+            "  }",
+            "  timer = setInterval(tick, 700);",
+            "  tick();",
+            "})();"
+        );
+        view.evaluateJavascript(script, null);
+    }
+
+    // ---------------- LIKE SCRIPT ----------------
+    private void injectLikeScript(WebView view) {
+        String script = js(
+            "(function() {",
+            "  if (window.__ufRunning) return;",
+            "  window.__ufRunning = true;",
+            "  var finished = false, tries = 0, clicked = false, clickedAt = 0, timer = null;",
+            "  function finish(ok, msg) {",
+            "    if (finished) return;",
+            "    finished = true; window.__ufRunning = false;",
+            "    if (timer) clearInterval(timer);",
+            "    window.WorkerBridge.onTaskResult(ok, msg);",
+            "  }",
+            "  function txt(e) { return ((e.innerText || e.textContent) || '').trim().toLowerCase(); }",
+            "  function tick() {",
+            "    try {",
+            "      tries++;",
+            "      var body = (document.body ? document.body.innerText : '').toLowerCase();",
+            "      if (body.indexOf('action blocked') > -1 || body.indexOf('confirm you') > -1 || body.indexOf('try again later') > -1) {",
+            "        finish(false, 'Blocked: Action Limit / Challenge'); return;",
+            "      }",
+            "      if (document.querySelector('input[name=username]')) { finish(false, 'Not logged in'); return; }",
+            "      Array.prototype.slice.call(document.querySelectorAll('button, div[role=button]')).forEach(function(p) {",
+            "        var pt = txt(p);",
+            "        if (pt === 'not now') p.click();",
+            "      });",
+            "      var unlike = document.querySelector('svg[aria-label=Unlike], svg[aria-label=\"\u092a\u0938\u0902\u0926 \u0930\u0926\u094d\u0926 \u0915\u0930\u0947\u0902\"]');",
+            "      if (unlike) { finish(true, clicked ? 'Post Liked Successfully' : 'Already Liked'); return; }",
+            "      if (clicked) {",
+            "        if (Date.now() - clickedAt > 5000) { finish(false, 'Like did not register'); }",
+            "        return;",
+            "      }",
+            "      var likeSvg = document.querySelector('svg[aria-label=Like], svg[aria-label=\"\u092a\u0938\u0902\u0926 \u0915\u0930\u0947\u0902\"]');",
+            "      if (likeSvg) {",
+            "        var btn = likeSvg.closest('button') || likeSvg.closest('div[role=button]') || likeSvg.closest('span[role=button]') || likeSvg.parentElement;",
+            "        btn.click(); clicked = true; clickedAt = Date.now(); return;",
+            "      }",
+            "      if (tries === 8) {",
+            "        var videoEl = document.querySelector('video');",
+            "        if (videoEl) {",
+            "          videoEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));",
+            "          clicked = true; clickedAt = Date.now(); return;",
+            "        }",
+            "        var postLink = document.querySelector('main a[href*=\"/p/\"], main a[href*=\"/reel/\"]');",
+            "        if (postLink) { window.__ufRunning = false; if (timer) clearInterval(timer); window.location.href = postLink.href; return; }",
+            "      }",
+            "      if (tries >= 20) { finish(false, 'Like button not found'); }",
+            "    } catch (err) {",
+            "      finish(false, 'JS Error: ' + err.message);",
+            "    }",
+            "  }",
+            "  timer = setInterval(tick, 700);",
+            "  tick();",
+            "})();"
+        );
+        view.evaluateJavascript(script, null);
     }
 
     private void createNotificationChannel() {
@@ -303,25 +373,32 @@ public class MainActivity extends Activity {
     // App Bridges
     public class MainAppInterface {
         @JavascriptInterface
-        public void executeBrowserAction(String target, String taskType, String mediaId) {
-            new Handler(Looper.getMainLooper()).post(() -> {
-                currentTaskType = taskType;
-                String cleanTarget = target.replace("@", "").trim();
+        public void executeBrowserAction(final String target, final String taskType, final String mediaId) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    currentTaskType = taskType;
+                    taskActive = true;
+                    uiHandler.removeCallbacks(taskTimeout);
+                    uiHandler.postDelayed(taskTimeout, TASK_TIMEOUT_MS);
 
-                if ("like".equalsIgnoreCase(taskType)) {
-                    if (mediaId != null && !mediaId.isEmpty() && !mediaId.equals("25025320")) {
-                        if (mediaId.startsWith("http")) {
-                            workerWebView.loadUrl(mediaId);
-                        } else if (mediaId.length() <= 12) {
-                            workerWebView.loadUrl("https://www.instagram.com/reel/" + mediaId + "/");
+                    String cleanTarget = target.replace("@", "").trim();
+
+                    if ("like".equalsIgnoreCase(taskType)) {
+                        if (mediaId != null && !mediaId.isEmpty() && !mediaId.equals("25025320")) {
+                            if (mediaId.startsWith("http")) {
+                                workerWebView.loadUrl(mediaId);
+                            } else if (mediaId.length() <= 12) {
+                                workerWebView.loadUrl("https://www.instagram.com/reel/" + mediaId + "/");
+                            } else {
+                                workerWebView.loadUrl("https://www.instagram.com/p/" + mediaId + "/");
+                            }
                         } else {
-                            workerWebView.loadUrl("https://www.instagram.com/p/" + mediaId + "/");
+                            workerWebView.loadUrl("https://www.instagram.com/" + cleanTarget + "/");
                         }
                     } else {
                         workerWebView.loadUrl("https://www.instagram.com/" + cleanTarget + "/");
                     }
-                } else {
-                    workerWebView.loadUrl("https://www.instagram.com/" + cleanTarget + "/");
                 }
             });
         }
@@ -332,42 +409,54 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public void setKeepScreenOn(boolean keepOn) {
-            new Handler(Looper.getMainLooper()).post(() -> {
-                if (keepOn) {
-                    getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    if (wakeLock != null && !wakeLock.isHeld()) {
-                        wakeLock.acquire(12 * 60 * 60 * 1000L);
-                    }
-                } else {
-                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    if (wakeLock != null && wakeLock.isHeld()) {
-                        wakeLock.release();
+        public void setKeepScreenOn(final boolean keepOn) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (keepOn) {
+                        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        if (wakeLock != null && !wakeLock.isHeld()) {
+                            wakeLock.acquire(12 * 60 * 60 * 1000L);
+                        }
+                    } else {
+                        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        if (wakeLock != null && wakeLock.isHeld()) {
+                            wakeLock.release();
+                        }
                     }
                 }
             });
         }
 
         @JavascriptInterface
-        public void updateNotification(int accounts, int tasks, int coins) {
-            new Handler(Looper.getMainLooper()).post(() -> {
-                showOrUpdateNotification(accounts, tasks, coins);
+        public void updateNotification(final int accounts, final int tasks, final int coins) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    showOrUpdateNotification(accounts, tasks, coins);
+                }
             });
         }
 
         @JavascriptInterface
         public void stopNotification() {
-            new Handler(Looper.getMainLooper()).post(() -> {
-                clearAutomationNotification();
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    clearAutomationNotification();
+                }
             });
         }
     }
 
     public class WorkerAppInterface {
         @JavascriptInterface
-        public void onTaskResult(boolean success, String message) {
-            new Handler(Looper.getMainLooper()).post(() -> {
-                mainWebView.evaluateJavascript("window.onWorkerResult(" + success + ", '" + message.replace("'", "\\'") + "');", null);
+        public void onTaskResult(final boolean success, final String message) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    deliverResult(success, message);
+                }
             });
         }
     }
@@ -383,6 +472,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        uiHandler.removeCallbacksAndMessages(null);
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
         }
