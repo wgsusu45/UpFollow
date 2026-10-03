@@ -112,7 +112,8 @@ public class MainActivity extends Activity {
         // Search WebView (target profile search ke liye, worker se alag)
         searchWebView = new WebView(this);
         setupWebView(searchWebView);
-        searchWebView.setLayoutParams(new FrameLayout.LayoutParams(1, 1));
+        searchWebView.setLayoutParams(new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         searchWebView.setAlpha(0.01f);
         if (rootView != null) {
             rootView.addView(searchWebView, 0);
@@ -126,7 +127,13 @@ public class MainActivity extends Activity {
                     runSearchJs(pendingSearchUser);
                 }
                 if (pendingPostsUser != null && url != null && url.startsWith(IG_URL)) {
-                    runPostsJs(pendingPostsUser);
+                    String pp = "";
+                    try { pp = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
+                    if (pp.startsWith("/accounts/login")) {
+                        deliverPosts("{\"success\":false,\"message\":\"Instagram session expired. Please log in again.\"}");
+                    } else if (pp.startsWith("/" + pendingPostsUser.toLowerCase())) {
+                        runPostsJs(pendingPostsUser);
+                    }
                 }
             }
         });
@@ -700,13 +707,8 @@ public class MainActivity extends Activity {
         pendingPostsUser = u;
         postsRunning = false;
         uiHandler.removeCallbacks(postsTimeout);
-        uiHandler.postDelayed(postsTimeout, 25000);
-        String cur = searchWebView.getUrl();
-        if (cur != null && cur.startsWith(IG_URL)) {
-            runPostsJs(u);
-        } else {
-            searchWebView.loadUrl(IG_URL + "/");
-        }
+        uiHandler.postDelayed(postsTimeout, 40000);
+        searchWebView.loadUrl(IG_URL + "/" + u + "/");
     }
 
     private void runPostsJs(String u) {
@@ -729,29 +731,31 @@ public class MainActivity extends Activity {
         return js(
             "(function() {",
             "  var U = '" + u + "';",
-            "  var done = false, loginErr = false;",
+            "  var done = false, loginErr = false, missing = false;",
             "  var H = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'Accept': '*/*' };",
             "  function out(o) { if (done) return; done = true; SearchBridge.onPosts(JSON.stringify(o)); }",
-            "  function cut(s) { s = (s || '').split('\\n').join(' '); return s.length > 80 ? s.substring(0, 80) + '...' : s; }",
             "  function cookie(name) {",
             "    var c = (document.cookie || '').split(';');",
             "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(name + '=') === 0) return p.substring(name.length + 1); }",
             "    return '';",
             "  }",
+            "  function numAfter(t, key) {",
+            "    var k = t.indexOf(key);",
+            "    if (k < 0) return 0;",
+            "    var s = k + key.length, e = s;",
+            "    while (e < t.length && t.charAt(e) >= '0' && t.charAt(e) <= '9') e++;",
+            "    return Number(t.substring(s, e)) || 0;",
+            "  }",
             "  function fromNode(n) {",
-            "    var cap = ''; try { cap = n.edge_media_to_caption.edges[0].node.text; } catch (e) {}",
-            "    return { code: n.shortcode, thumb: n.thumbnail_src || n.display_url || '', likes: (n.edge_liked_by && n.edge_liked_by.count) || 0,",
-            "             video: !!n.is_video, reel: n.product_type === 'clips', ts: n.taken_at_timestamp || 0, caption: cut(cap) };",
+            "    return { code: n.shortcode, thumb: n.thumbnail_src || n.display_url || '', likes: (n.edge_liked_by && n.edge_liked_by.count) || 0, video: !!n.is_video, reel: n.product_type === 'clips', ts: n.taken_at_timestamp || 0 };",
             "  }",
             "  function fromItem(i) {",
             "    var th = '';",
             "    try { th = i.image_versions2.candidates[0].url; } catch (e) {}",
             "    if (!th) { try { th = i.carousel_media[0].image_versions2.candidates[0].url; } catch (e) {} }",
-            "    var cap = ''; try { cap = i.caption.text; } catch (e) {}",
-            "    return { code: i.code, thumb: th, likes: i.like_count || 0, video: i.media_type === 2, reel: i.product_type === 'clips', ts: i.taken_at || 0, caption: cut(cap) };",
+            "    return { code: i.code, thumb: th, likes: i.like_count || 0, video: i.media_type === 2, reel: i.product_type === 'clips', ts: i.taken_at || 0 };",
             "  }",
-            // ---- Profile: id + LIVE followers + first posts ----
-            "  function viaProfile() {",
+            "  function apiProfile() {",
             "    return fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: H })",
             "    .then(function(r) { return r.text(); })",
             "    .then(function(t) {",
@@ -767,7 +771,39 @@ public class MainActivity extends Activity {
             "      } catch (e) { return null; }",
             "    }).catch(function() { return null; });",
             "  }",
-            // ---- Feed (posts + some reels) ----
+            "  function htmlInfo() {",
+            "    return fetch('/' + encodeURIComponent(U) + '/', { credentials: 'include', headers: { 'Accept': 'text/html' } })",
+            "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
+            "    .then(function(x) {",
+            "      var low = x.t.toLowerCase();",
+            "      if (x.s === 404 || (low.indexOf('page isn') > -1 && low.indexOf('available') > -1 && low.indexOf('og:title') < 0)) { missing = true; return null; }",
+            "      var doc = new DOMParser().parseFromString(x.t, 'text/html');",
+            "      function meta(p) {",
+            "        var m = Array.prototype.slice.call(doc.querySelectorAll('meta')).filter(function(e) { return e.getAttribute('property') === p || e.getAttribute('name') === p; });",
+            "        return m.length ? (m[0].getAttribute('content') || '') : '';",
+            "      }",
+            "      var desc = meta('og:description') || meta('description');",
+            "      var i = desc.toLowerCase().indexOf(' followers');",
+            "      if (i < 0) return null;",
+            "      var tok = desc.substring(0, i).trim().split(' ').pop().split(',').join('');",
+            "      var mult = 1, last = tok.charAt(tok.length - 1).toUpperCase();",
+            "      if (last === 'K') { mult = 1000; tok = tok.slice(0, -1); }",
+            "      else if (last === 'M') { mult = 1000000; tok = tok.slice(0, -1); }",
+            "      else if (last === 'B') { mult = 1000000000; tok = tok.slice(0, -1); }",
+            "      var fc = Math.round(parseFloat(tok) * mult);",
+            "      if (isNaN(fc)) return null;",
+            "      var exact = numAfter(x.t, '\"edge_followed_by\":{\"count\":') || numAfter(x.t, '\"follower_count\":');",
+            "      if (exact > 0 && Math.abs(exact - fc) <= Math.max(fc * 0.1, 1)) fc = exact;",
+            "      var title = meta('og:title');",
+            "      var fn = title.indexOf(' (@') > -1 ? title.split(' (@')[0] : '';",
+            "      var pk = '', keys = ['\"profile_id\":\"', '\"target_id\":\"', '\"user_id\":\"'];",
+            "      for (var j = 0; j < keys.length && !pk; j++) {",
+            "        var k = x.t.indexOf(keys[j]);",
+            "        if (k > -1) { var e = x.t.indexOf('\"', k + keys[j].length); pk = x.t.substring(k + keys[j].length, e); if (isNaN(Number(pk))) pk = ''; }",
+            "      }",
+            "      return { id: pk, fc: fc, pic: meta('og:image'), name: fn, posts: [] };",
+            "    }).catch(function() { return null; });",
+            "  }",
             "  function viaFeed() {",
             "    return fetch('/api/v1/feed/user/' + encodeURIComponent(U) + '/username/?count=18', { credentials: 'include', headers: H })",
             "    .then(function(r) { return r.text(); })",
@@ -780,7 +816,6 @@ public class MainActivity extends Activity {
             "      return [];",
             "    }).catch(function() { return []; });",
             "  }",
-            // ---- Reels tab (clips) ----
             "  function viaClips(id) {",
             "    var h = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'x-csrftoken': cookie('csrftoken'), 'content-type': 'application/x-www-form-urlencoded' };",
             "    return fetch('/api/v1/clips/user/', { method: 'POST', credentials: 'include', headers: h,",
@@ -794,29 +829,86 @@ public class MainActivity extends Activity {
             "      return [];",
             "    }).catch(function() { return []; });",
             "  }",
-            "  viaProfile().then(function(p) {",
-            "    if (p && p.priv) { out({ success: true, username: U, is_private: true, follower_count: p.fc, profile_pic: p.pic, full_name: p.name, posts: [] }); return; }",
-            "    var jobs = [viaFeed(), p && p.id ? viaClips(p.id) : Promise.resolve([])];",
-            "    return Promise.all(jobs).then(function(res) {",
-            "      var all = (p ? p.posts : []).concat(res[0] || []).concat(res[1] || []);",
-            "      var m = {};",
-            "      all.forEach(function(x) {",
-            "        if (!x.code) return;",
-            "        var o = m[x.code];",
-            "        if (!o) { m[x.code] = x; return; }",
-            "        if (x.reel) o.reel = true;",
-            "        if (!o.thumb) o.thumb = x.thumb;",
-            "        if (x.likes > o.likes) o.likes = x.likes;",
-            "        if (!o.ts) o.ts = x.ts;",
-            "      });",
-            "      var list = Object.keys(m).map(function(k) { return m[k]; }).sort(function(a, b) { return (b.ts || 0) - (a.ts || 0); }).slice(0, 30);",
-            "      if (!list.length && !p) {",
-            "        out({ success: false, message: loginErr ? 'Instagram session expired. Please log in again.' : 'Could not load posts. Please try again later.' });",
-            "        return;",
+            "  function merge(all) {",
+            "    var m = {};",
+            "    all.forEach(function(x) {",
+            "      if (!x.code) return;",
+            "      var o = m[x.code];",
+            "      if (!o) { m[x.code] = x; return; }",
+            "      if (x.reel) o.reel = true;",
+            "      if (!o.thumb) o.thumb = x.thumb;",
+            "      if (x.likes > o.likes) o.likes = x.likes;",
+            "      if (!o.ts) o.ts = x.ts;",
+            "    });",
+            "    return Object.keys(m).map(function(k) { return m[k]; }).sort(function(a, b) { return (b.ts || 0) - (a.ts || 0); });",
+            "  }",
+            "  function scrape() {",
+            "    var root = document.querySelector('main') || document;",
+            "    var as = root.querySelectorAll('a[href*=\"/p/\"], a[href*=\"/reel/\"]');",
+            "    var map = {}, list = [];",
+            "    for (var i = 0; i < as.length; i++) {",
+            "      var a = as[i];",
+            "      var m = (a.getAttribute('href') || '').match(/\\/(p|reel)\\/([A-Za-z0-9_-]+)/);",
+            "      if (!m) continue;",
+            "      var clip = !!a.querySelector('svg[aria-label=\"Clip\"], svg[aria-label=\"Reel\"]');",
+            "      var o = map[m[2]];",
+            "      if (o) { if (m[1] === 'reel' || clip) o.reel = true; continue; }",
+            "      var img = a.querySelector('img');",
+            "      o = { code: m[2], thumb: img ? (img.currentSrc || img.src || '') : '', likes: 0, video: (m[1] === 'reel' || clip || !!a.querySelector('svg[aria-label=\"Video\"]')), reel: (m[1] === 'reel' || clip), ts: 0 };",
+            "      map[m[2]] = o; list.push(o);",
+            "    }",
+            "    return list;",
+            "  }",
+            "  function domPosts() {",
+            "    return new Promise(function(resolve) {",
+            "      var t0 = Date.now(), last = -1, stable = 0;",
+            "      function poll() {",
+            "        var body = (document.body ? document.body.innerText : '').toLowerCase();",
+            "        var list = scrape();",
+            "        if (!list.length && body.indexOf('this account is private') > -1) { resolve({ list: [], priv: true }); return; }",
+            "        if (!list.length && body.indexOf('page isn') > -1 && body.indexOf('available') > -1) { resolve({ list: [], missing: true }); return; }",
+            "        if (list.length > 0 && list.length === last) stable++; else stable = 0;",
+            "        last = list.length;",
+            "        if ((list.length > 0 && stable >= 2) || Date.now() - t0 > 15000) { resolve({ list: list }); return; }",
+            "        try { window.scrollTo(0, document.body.scrollHeight); } catch (e) {}",
+            "        setTimeout(poll, 700);",
             "      }",
-            "      var o = { success: true, username: U, is_private: false, posts: list };",
-            "      if (p && p.fc !== null) { o.follower_count = p.fc; o.profile_pic = p.pic; o.full_name = p.name; }",
-            "      out(o);",
+            "      poll();",
+            "    });",
+            "  }",
+            "  function domFollowers() {",
+            "    try {",
+            "      var as = document.querySelectorAll('a[href*=\"/followers\"]');",
+            "      for (var i = 0; i < as.length; i++) {",
+            "        var sp = as[i].querySelector('span[title]');",
+            "        var s = sp ? sp.getAttribute('title') : '';",
+            "        var n = Number((s || '').split(',').join(''));",
+            "        if (s && !isNaN(n)) return n;",
+            "      }",
+            "    } catch (e) {}",
+            "    return null;",
+            "  }",
+            "  function finish(info, list, priv, miss) {",
+            "    var fc = (info && info.fc !== undefined && info.fc !== null) ? info.fc : domFollowers();",
+            "    if (!list.length && !priv && miss && fc === null) { out({ success: false, message: 'Account not found on Instagram.' }); return; }",
+            "    if (!list.length && !priv && loginErr && fc === null) { out({ success: false, message: 'Instagram session expired. Please log in again.' }); return; }",
+            "    var o = { success: true, username: U, is_private: !!priv, posts: list.slice(0, 30) };",
+            "    if (fc !== null) o.follower_count = fc;",
+            "    if (info && info.pic) o.profile_pic = info.pic;",
+            "    if (info && info.name) o.full_name = info.name;",
+            "    out(o);",
+            "  }",
+            "  if ((location.pathname || '').indexOf('/accounts/login') === 0) { out({ success: false, message: 'Instagram session expired. Please log in again.' }); return; }",
+            "  apiProfile().then(function(p) {",
+            "    return (p ? Promise.resolve(null) : htmlInfo()).then(function(h) {",
+            "      var info = p || h || null;",
+            "      var id = (info && info.id) ? info.id : '';",
+            "      return Promise.all([viaFeed(), id ? viaClips(id) : Promise.resolve([])]).then(function(res) {",
+            "        if (p && p.priv) { finish(info, [], true, false); return; }",
+            "        var list = merge((p ? p.posts : []).concat(res[0] || []).concat(res[1] || []));",
+            "        if (list.length) { finish(info, list, false, false); return; }",
+            "        return domPosts().then(function(dl) { finish(info, dl.list || [], !!dl.priv, !!dl.missing || missing); });",
+            "      });",
             "    });",
             "  }).catch(function(e) { out({ success: false, message: 'Posts error: ' + e.message }); });",
             "})();"
