@@ -125,6 +125,9 @@ public class MainActivity extends Activity {
                 if (pendingSearchUser != null && url != null && url.startsWith(IG_URL)) {
                     runSearchJs(pendingSearchUser);
                 }
+                if (pendingPostsUser != null && url != null && url.startsWith(IG_URL)) {
+                    runPostsJs(pendingPostsUser);
+                }
             }
         });
 
@@ -594,103 +597,232 @@ public class MainActivity extends Activity {
                         + JSONObject.quote(json) + ");", null);
     }
 
-    private static String buildPostsJs(String u) {
-    return js(
-        "(function() {",
-        "  var U = '" + u + "';",
-        "  var done = false, loginErr = false;",
-        "  var H = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'Accept': '*/*' };",
-        "  function out(o) { if (done) return; done = true; SearchBridge.onPosts(JSON.stringify(o)); }",
-        "  function cut(s) { s = (s || '').split('\\n').join(' '); return s.length > 80 ? s.substring(0, 80) + '...' : s; }",
-        "  function cookie(name) {",
-        "    var c = (document.cookie || '').split(';');",
-        "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(name + '=') === 0) return p.substring(name.length + 1); }",
-        "    return '';",
-        "  }",
-        "  function fromNode(n) {",
-        "    var cap = ''; try { cap = n.edge_media_to_caption.edges[0].node.text; } catch (e) {}",
-        "    return { code: n.shortcode, thumb: n.thumbnail_src || n.display_url || '', likes: (n.edge_liked_by && n.edge_liked_by.count) || 0,",
-        "             video: !!n.is_video, reel: n.product_type === 'clips', ts: n.taken_at_timestamp || 0, caption: cut(cap) };",
-        "  }",
-        "  function fromItem(i) {",
-        "    var th = '';",
-        "    try { th = i.image_versions2.candidates[0].url; } catch (e) {}",
-        "    if (!th) { try { th = i.carousel_media[0].image_versions2.candidates[0].url; } catch (e) {} }",
-        "    var cap = ''; try { cap = i.caption.text; } catch (e) {}",
-        "    return { code: i.code, thumb: th, likes: i.like_count || 0, video: i.media_type === 2, reel: i.product_type === 'clips', ts: i.taken_at || 0, caption: cut(cap) };",
-        "  }",
-        // ---- Profile: id + LIVE followers + first posts ----
-        "  function viaProfile() {",
-        "    return fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: H })",
-        "    .then(function(r) { return r.text(); })",
-        "    .then(function(t) {",
-        "      try {",
-        "        var d = JSON.parse(t);",
-        "        if (d && (d.message === 'login_required' || d.require_login)) { loginErr = true; return null; }",
-        "        var u = d.data && d.data.user;",
-        "        if (!u) return null;",
-        "        var edges = (u.edge_owner_to_timeline_media && u.edge_owner_to_timeline_media.edges) || [];",
-        "        return { id: u.id, fc: (u.edge_followed_by && u.edge_followed_by.count !== undefined) ? u.edge_followed_by.count : null,",
-        "                 pic: u.profile_pic_url_hd || u.profile_pic_url || '', name: u.full_name || '',",
-        "                 priv: !!(u.is_private && !u.followed_by_viewer), posts: edges.map(function(e) { return fromNode(e.node); }) };",
-        "      } catch (e) { return null; }",
-        "    }).catch(function() { return null; });",
-        "  }",
-        // ---- Feed (posts + some reels) ----
-        "  function viaFeed() {",
-        "    return fetch('/api/v1/feed/user/' + encodeURIComponent(U) + '/username/?count=18', { credentials: 'include', headers: H })",
-        "    .then(function(r) { return r.text(); })",
-        "    .then(function(t) {",
-        "      try {",
-        "        var d = JSON.parse(t);",
-        "        if (d && d.items) return d.items.map(fromItem);",
-        "        if (d && (d.message === 'login_required' || d.require_login)) loginErr = true;",
-        "      } catch (e) {}",
-        "      return [];",
-        "    }).catch(function() { return []; });",
-        "  }",
-        // ---- Reels tab (clips) ----
-        "  function viaClips(id) {",
-        "    var h = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'x-csrftoken': cookie('csrftoken'), 'content-type': 'application/x-www-form-urlencoded' };",
-        "    return fetch('/api/v1/clips/user/', { method: 'POST', credentials: 'include', headers: h,",
-        "      body: 'target_user_id=' + encodeURIComponent(id) + '&page_size=18&include_feed_video=true' })",
-        "    .then(function(r) { return r.text(); })",
-        "    .then(function(t) {",
-        "      try {",
-        "        var d = JSON.parse(t);",
-        "        if (d && d.items) return d.items.map(function(x) { var m = fromItem(x.media || x); m.reel = true; return m; });",
-        "      } catch (e) {}",
-        "      return [];",
-        "    }).catch(function() { return []; });",
-        "  }",
-        "  viaProfile().then(function(p) {",
-        "    if (p && p.priv) { out({ success: true, username: U, is_private: true, follower_count: p.fc, profile_pic: p.pic, full_name: p.name, posts: [] }); return; }",
-        "    var jobs = [viaFeed(), p && p.id ? viaClips(p.id) : Promise.resolve([])];",
-        "    return Promise.all(jobs).then(function(res) {",
-        "      var all = (p ? p.posts : []).concat(res[0] || []).concat(res[1] || []);",
-        "      var m = {};",
-        "      all.forEach(function(x) {",
-        "        if (!x.code) return;",
-        "        var o = m[x.code];",
-        "        if (!o) { m[x.code] = x; return; }",
-        "        if (x.reel) o.reel = true;",
-        "        if (!o.thumb) o.thumb = x.thumb;",
-        "        if (x.likes > o.likes) o.likes = x.likes;",
-        "        if (!o.ts) o.ts = x.ts;",
-        "      });",
-        "      var list = Object.keys(m).map(function(k) { return m[k]; }).sort(function(a, b) { return (b.ts || 0) - (a.ts || 0); }).slice(0, 30);",
-        "      if (!list.length && !p) {",
-        "        out({ success: false, message: loginErr ? 'Instagram session expired. Please log in again.' : 'Could not load posts. Please try again later.' });",
-        "        return;",
-        "      }",
-        "      var o = { success: true, username: U, is_private: false, posts: list };",
-        "      if (p && p.fc !== null) { o.follower_count = p.fc; o.profile_pic = p.pic; o.full_name = p.name; }",
-        "      out(o);",
-        "    });",
-        "  }).catch(function(e) { out({ success: false, message: 'Posts error: ' + e.message }); });",
-        "})();"
-    );
+    private static String buildSearchJs(String u) {
+        return js(
+            "(function() {",
+            "  var U = '" + u + "';",
+            "  var done = false;",
+            "  var H = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'Accept': '*/*' };",
+            "  function out(o) { if (done) return; done = true; SearchBridge.onResult(JSON.stringify(o)); }",
+            "  function fmt(n) {",
+            "    n = Number(n) || 0;",
+            "    return n.toLocaleString('en-US');",
+            "  }",
+            "  function numAfter(t, key) {",
+            "    var k = t.indexOf(key);",
+            "    if (k < 0) return 0;",
+            "    var s = k + key.length, e = s;",
+            "    while (e < t.length && t.charAt(e) >= '0' && t.charAt(e) <= '9') e++;",
+            "    return Number(t.substring(s, e)) || 0;",
+            "  }",
+            "  function good(r) {",
+            "    out({ success: true, username: r.username || U, full_name: r.full_name || '', numeric_id: '' + (r.pk || ''),",
+            "          follower_count: r.fc, followers_formatted: fmt(r.fc) + ' followers', is_verified: !!r.verified, profile_pic: r.pic || '' });",
+            "  }",
+            // ---- Strategy 1: web_profile_info API (kisi bhi 2xx status ko accept karta hai) ----
+            "  function tryApi() {",
+            "    return fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: H })",
+            "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
+            "    .then(function(x) {",
+            "      try {",
+            "        var d = JSON.parse(x.t);",
+            "        var u = (d.data && d.data.user) ? d.data.user : (d.user || null);",
+            "        if (u && u.username) {",
+            "          var fc = (u.edge_followed_by && u.edge_followed_by.count !== undefined) ? u.edge_followed_by.count : (u.follower_count || 0);",
+            "          return { username: u.username, full_name: u.full_name, pk: u.id || u.pk, fc: fc, verified: u.is_verified, pic: u.profile_pic_url_hd || u.profile_pic_url };",
+            "        }",
+            "        if (d && (d.message === 'login_required' || d.require_login)) return { err: 'login' };",
+            "      } catch (e) {}",
+            "      return null;",
+            "    }).catch(function() { return null; });",
+            "  }",
+            // ---- Strategy 2: profile page ke meta tags (og:description me followers) ----
+            "  function tryHtml() {",
+            "    return fetch('/' + encodeURIComponent(U) + '/', { credentials: 'include', headers: { 'Accept': 'text/html' } })",
+            "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
+            "    .then(function(x) {",
+            "      var low = x.t.toLowerCase();",
+            "      if (x.s === 404 || (low.indexOf('page isn') > -1 && low.indexOf('available') > -1 && low.indexOf('og:title') < 0)) return { notfound: true };",
+            "      var doc = new DOMParser().parseFromString(x.t, 'text/html');",
+            "      function meta(p) {",
+            "        var m = Array.prototype.slice.call(doc.querySelectorAll('meta')).filter(function(e) { return e.getAttribute('property') === p || e.getAttribute('name') === p; });",
+            "        return m.length ? (m[0].getAttribute('content') || '') : '';",
+            "      }",
+            "      var desc = meta('og:description') || meta('description');",
+            "      var i = desc.toLowerCase().indexOf(' followers');",
+            "      if (i < 0) return null;",
+            "      var tok = desc.substring(0, i).trim().split(' ').pop().split(',').join('');",
+            "      var mult = 1, last = tok.charAt(tok.length - 1).toUpperCase();",
+            "      if (last === 'K') { mult = 1000; tok = tok.slice(0, -1); }",
+            "      else if (last === 'M') { mult = 1000000; tok = tok.slice(0, -1); }",
+            "      else if (last === 'B') { mult = 1000000000; tok = tok.slice(0, -1); }",
+            "      var fc = Math.round(parseFloat(tok) * mult);",
+            "      if (isNaN(fc)) return null;",
+            "      var exact = numAfter(x.t, '\"edge_followed_by\":{\"count\":') || numAfter(x.t, '\"follower_count\":');",
+            "      if (exact > 0 && Math.abs(exact - fc) <= Math.max(fc * 0.1, 1)) fc = exact;",
+            "      var title = meta('og:title');",
+            "      var fn = title.indexOf(' (@') > -1 ? title.split(' (@')[0] : '';",
+            "      var pk = '', keys = ['\"profile_id\":\"', '\"target_id\":\"', '\"user_id\":\"'];",
+            "      for (var j = 0; j < keys.length && !pk; j++) {",
+            "        var k = x.t.indexOf(keys[j]);",
+            "        if (k > -1) { var e = x.t.indexOf('\"', k + keys[j].length); pk = x.t.substring(k + keys[j].length, e); if (isNaN(Number(pk))) pk = ''; }",
+            "      }",
+            "      return { username: U, full_name: fn, pk: pk, fc: fc, verified: x.t.indexOf('\"is_verified\":true') > -1, pic: meta('og:image') };",
+            "    }).catch(function() { return null; });",
+            "  }",
+            "  tryApi().then(function(a) {",
+            "    if (a && a.username) return a;",
+            "    return tryHtml().then(function(h) { return (h && (h.username || h.notfound)) ? h : (a || h); });",
+            "  }).then(function(r) {",
+            "    if (r && r.username) { good(r); }",
+            "    else if (r && r.notfound) { out({ success: false, message: 'Account not found on Instagram' }); }",
+            "    else if (r && r.err === 'login') { out({ success: false, message: 'Instagram login expire. Account re-login karo.' }); }",
+            "    else { out({ success: false, message: 'Instagram ne response nahi diya. Thodi der baad try karo.' }); }",
+            "  }).catch(function(e) { out({ success: false, message: 'Search error: ' + e.message }); });",
+            "})();"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TARGET ACCOUNT KE POSTS + REELS (likes page ke liye)
+    // ------------------------------------------------------------------
+    private String pendingPostsUser = null;
+    private boolean postsRunning = false;
+
+    private final Runnable postsTimeout = new Runnable() {
+        @Override
+        public void run() {
+            deliverPosts("{\"success\":false,\"message\":\"Request timed out. Please try again.\"}");
         }
+    };
+
+    private void startPosts(String u) {
+        pendingPostsUser = u;
+        postsRunning = false;
+        uiHandler.removeCallbacks(postsTimeout);
+        uiHandler.postDelayed(postsTimeout, 25000);
+        String cur = searchWebView.getUrl();
+        if (cur != null && cur.startsWith(IG_URL)) {
+            runPostsJs(u);
+        } else {
+            searchWebView.loadUrl(IG_URL + "/");
+        }
+    }
+
+    private void runPostsJs(String u) {
+        if (postsRunning) return;
+        postsRunning = true;
+        searchWebView.evaluateJavascript(buildPostsJs(u), null);
+    }
+
+    private void deliverPosts(String json) {
+        if (pendingPostsUser == null) return;
+        pendingPostsUser = null;
+        postsRunning = false;
+        uiHandler.removeCallbacks(postsTimeout);
+        mainWebView.evaluateJavascript(
+                "if(window.onInstagramPostsResult) window.onInstagramPostsResult(true, "
+                        + JSONObject.quote(json) + ");", null);
+    }
+
+    private static String buildPostsJs(String u) {
+        return js(
+            "(function() {",
+            "  var U = '" + u + "';",
+            "  var done = false, loginErr = false;",
+            "  var H = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'Accept': '*/*' };",
+            "  function out(o) { if (done) return; done = true; SearchBridge.onPosts(JSON.stringify(o)); }",
+            "  function cut(s) { s = (s || '').split('\\n').join(' '); return s.length > 80 ? s.substring(0, 80) + '...' : s; }",
+            "  function cookie(name) {",
+            "    var c = (document.cookie || '').split(';');",
+            "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(name + '=') === 0) return p.substring(name.length + 1); }",
+            "    return '';",
+            "  }",
+            "  function fromNode(n) {",
+            "    var cap = ''; try { cap = n.edge_media_to_caption.edges[0].node.text; } catch (e) {}",
+            "    return { code: n.shortcode, thumb: n.thumbnail_src || n.display_url || '', likes: (n.edge_liked_by && n.edge_liked_by.count) || 0,",
+            "             video: !!n.is_video, reel: n.product_type === 'clips', ts: n.taken_at_timestamp || 0, caption: cut(cap) };",
+            "  }",
+            "  function fromItem(i) {",
+            "    var th = '';",
+            "    try { th = i.image_versions2.candidates[0].url; } catch (e) {}",
+            "    if (!th) { try { th = i.carousel_media[0].image_versions2.candidates[0].url; } catch (e) {} }",
+            "    var cap = ''; try { cap = i.caption.text; } catch (e) {}",
+            "    return { code: i.code, thumb: th, likes: i.like_count || 0, video: i.media_type === 2, reel: i.product_type === 'clips', ts: i.taken_at || 0, caption: cut(cap) };",
+            "  }",
+            // ---- Profile: id + LIVE followers + first posts ----
+            "  function viaProfile() {",
+            "    return fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: H })",
+            "    .then(function(r) { return r.text(); })",
+            "    .then(function(t) {",
+            "      try {",
+            "        var d = JSON.parse(t);",
+            "        if (d && (d.message === 'login_required' || d.require_login)) { loginErr = true; return null; }",
+            "        var u = d.data && d.data.user;",
+            "        if (!u) return null;",
+            "        var edges = (u.edge_owner_to_timeline_media && u.edge_owner_to_timeline_media.edges) || [];",
+            "        return { id: u.id, fc: (u.edge_followed_by && u.edge_followed_by.count !== undefined) ? u.edge_followed_by.count : null,",
+            "                 pic: u.profile_pic_url_hd || u.profile_pic_url || '', name: u.full_name || '',",
+            "                 priv: !!(u.is_private && !u.followed_by_viewer), posts: edges.map(function(e) { return fromNode(e.node); }) };",
+            "      } catch (e) { return null; }",
+            "    }).catch(function() { return null; });",
+            "  }",
+            // ---- Feed (posts + some reels) ----
+            "  function viaFeed() {",
+            "    return fetch('/api/v1/feed/user/' + encodeURIComponent(U) + '/username/?count=18', { credentials: 'include', headers: H })",
+            "    .then(function(r) { return r.text(); })",
+            "    .then(function(t) {",
+            "      try {",
+            "        var d = JSON.parse(t);",
+            "        if (d && d.items) return d.items.map(fromItem);",
+            "        if (d && (d.message === 'login_required' || d.require_login)) loginErr = true;",
+            "      } catch (e) {}",
+            "      return [];",
+            "    }).catch(function() { return []; });",
+            "  }",
+            // ---- Reels tab (clips) ----
+            "  function viaClips(id) {",
+            "    var h = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'x-csrftoken': cookie('csrftoken'), 'content-type': 'application/x-www-form-urlencoded' };",
+            "    return fetch('/api/v1/clips/user/', { method: 'POST', credentials: 'include', headers: h,",
+            "      body: 'target_user_id=' + encodeURIComponent(id) + '&page_size=18&include_feed_video=true' })",
+            "    .then(function(r) { return r.text(); })",
+            "    .then(function(t) {",
+            "      try {",
+            "        var d = JSON.parse(t);",
+            "        if (d && d.items) return d.items.map(function(x) { var m = fromItem(x.media || x); m.reel = true; return m; });",
+            "      } catch (e) {}",
+            "      return [];",
+            "    }).catch(function() { return []; });",
+            "  }",
+            "  viaProfile().then(function(p) {",
+            "    if (p && p.priv) { out({ success: true, username: U, is_private: true, follower_count: p.fc, profile_pic: p.pic, full_name: p.name, posts: [] }); return; }",
+            "    var jobs = [viaFeed(), p && p.id ? viaClips(p.id) : Promise.resolve([])];",
+            "    return Promise.all(jobs).then(function(res) {",
+            "      var all = (p ? p.posts : []).concat(res[0] || []).concat(res[1] || []);",
+            "      var m = {};",
+            "      all.forEach(function(x) {",
+            "        if (!x.code) return;",
+            "        var o = m[x.code];",
+            "        if (!o) { m[x.code] = x; return; }",
+            "        if (x.reel) o.reel = true;",
+            "        if (!o.thumb) o.thumb = x.thumb;",
+            "        if (x.likes > o.likes) o.likes = x.likes;",
+            "        if (!o.ts) o.ts = x.ts;",
+            "      });",
+            "      var list = Object.keys(m).map(function(k) { return m[k]; }).sort(function(a, b) { return (b.ts || 0) - (a.ts || 0); }).slice(0, 30);",
+            "      if (!list.length && !p) {",
+            "        out({ success: false, message: loginErr ? 'Instagram session expired. Please log in again.' : 'Could not load posts. Please try again later.' });",
+            "        return;",
+            "      }",
+            "      var o = { success: true, username: U, is_private: false, posts: list };",
+            "      if (p && p.fc !== null) { o.follower_count = p.fc; o.profile_pic = p.pic; o.full_name = p.name; }",
+            "      out(o);",
+            "    });",
+            "  }).catch(function(e) { out({ success: false, message: 'Posts error: ' + e.message }); });",
+            "})();"
+        );
+    }
+
     // Search WebView se result lene ke liye
     public class SearchBridge {
         @JavascriptInterface
@@ -699,6 +831,16 @@ public class MainActivity extends Activity {
                 @Override
                 public void run() {
                     deliverSearch(json);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onPosts(final String json) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    deliverPosts(json);
                 }
             });
         }
@@ -792,6 +934,24 @@ public class MainActivity extends Activity {
         }
 
         // Primary account ki cookie server par sync karne ke liye
+        // Likes page: target account ke posts + reels (thumbnail, likes, code)
+        @JavascriptInterface
+        public void fetchInstagramPostsLive(final String queryUsername) {
+            if (!trusted()) return;
+            final String u = queryUsername == null ? "" : queryUsername.replace("@", "").replaceAll("[^A-Za-z0-9._]", "");
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (u.isEmpty()) {
+                        pendingPostsUser = "_";
+                        deliverPosts("{\"success\":false,\"message\":\"Invalid username\"}");
+                    } else {
+                        startPosts(u);
+                    }
+                }
+            });
+        }
+
         // Jar me koi Instagram session na ho to dashboard primary ka session laga deta hai
         @JavascriptInterface
         public void applySession(final String cookieStr) {
