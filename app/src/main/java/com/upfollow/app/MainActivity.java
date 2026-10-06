@@ -28,16 +28,15 @@ import android.widget.FrameLayout;
 
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 
 public class MainActivity extends Activity {
+
+    // 1. Security Secret Key & Version Code (Purane APK block karne aur website hide karne ke liye)
+    private static final String APP_SECRET_KEY = "brohu2580";
+    private static final int APP_VERSION_CODE = 2;
+    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY + " v/" + APP_VERSION_CODE;
 
     private WebView mainWebView;
     private WebView workerWebView;
@@ -48,11 +47,6 @@ public class MainActivity extends Activity {
     private static final String HOSTING_DASHBOARD = HOSTING_BASE + "index.php";
     private static final String IG_URL = "https://www.instagram.com";
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
-
-    // Security Secret Key & Version Code Enforcer
-    private static final String APP_SECRET_KEY = "brohu2580";
-    private static final int APP_VERSION_CODE = 2; // Naya APK version code
-    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY + " v/" + APP_VERSION_CODE;
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
     private static final int NOTIFICATION_ID = 1001;
@@ -166,7 +160,7 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                super.onPageStarted(view, url);
+                super.onPageStarted(view, url, favicon);
                 mainUrl = url == null ? "" : url;
             }
 
@@ -634,12 +628,12 @@ public class MainActivity extends Activity {
             "    .then(function(x) {",
             "      try {",
             "        var d = JSON.parse(x.t);",
-            "        if (d && (d.message === 'login_required' || d.require_login)) return { err: 'login' };",
             "        var u = (d.data && d.data.user) ? d.data.user : (d.user || null);",
             "        if (u && u.username) {",
             "          var fc = (u.edge_followed_by && u.edge_followed_by.count !== undefined) ? u.edge_followed_by.count : (u.follower_count || 0);",
             "          return { username: u.username, full_name: u.full_name, pk: u.id || u.pk, fc: fc, verified: u.is_verified, pic: u.profile_pic_url_hd || u.profile_pic_url };",
             "        }",
+            "        if (d && (d.message === 'login_required' || d.require_login)) return { err: 'login' };",
             "      } catch (e) {}",
             "      return null;",
             "    }).catch(function() { return null; });",
@@ -1119,6 +1113,7 @@ public class MainActivity extends Activity {
         }
     }
 
+    // Instagram probe
     public class IgProbeInterface {
         @JavascriptInterface
         public void onIgInfo(final String nonce, final String username) {
@@ -1162,4 +1157,4 @@ public class MainActivity extends Activity {
         }
         super.onDestroy();
     }
-                                             }
+                                                    }
