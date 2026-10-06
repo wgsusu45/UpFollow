@@ -37,7 +37,8 @@ public class MainActivity extends Activity {
     // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
     private static final int APP_VERSION_CODE = 2;
     // Secret + version wala user agent: SIRF apni website ke liye
-    private static final String USER_AGENT_APP = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
+    // onCreate me phone ke asli WebView user agent se set hota hai
+    private String USER_AGENT_APP = "";
     private WebView mainWebView;
     private WebView workerWebView;
     private WebView searchWebView;
@@ -48,7 +49,8 @@ public class MainActivity extends Activity {
     private static final String IG_URL = "https://www.instagram.com";
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
     // Normal user agent (bina secret ke): Instagram wale pages ke liye
-    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36";
+    // onCreate me phone ke asli WebView user agent se set hota hai (nakli Pixel 8 string hata di)
+    private String USER_AGENT = "";
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
     private static final int NOTIFICATION_ID = 1001;
@@ -62,7 +64,7 @@ public class MainActivity extends Activity {
     private String deviceKey = "";
 
     // Main WebView ka abhi kaun sa user agent laga hai
-    private String currentMainUa = USER_AGENT_APP;
+    private String currentMainUa = "";
 
     private String currentTaskType = "follow";
     private boolean taskActive = false;
@@ -85,6 +87,16 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // Phone ka asli WebView user agent (Instagram ko mismatch na dikhe)
+        String baseUa = WebSettings.getDefaultUserAgent(this);
+        if (baseUa == null) baseUa = "";
+        // "wv" aur "Version/4.0" markers hata do, taaki normal Chrome jaisa dikhe
+        baseUa = baseUa.replace("; wv", "").replace(" Version/4.0", "");
+        USER_AGENT = baseUa;
+        USER_AGENT_APP = USER_AGENT + " " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
+        currentMainUa = USER_AGENT_APP;
+
         setContentView(R.layout.activity_main);
 
         deviceKey = computeDeviceKey();
