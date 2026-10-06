@@ -36,7 +36,7 @@ public class MainActivity extends Activity {
     private static final String APP_SECRET_KEY = "brohu2580";
     // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
     private static final int APP_VERSION_CODE = 2;
-    // Secret + version wala user agent: SIRF apni website (mainWebView) ke liye
+    // Secret + version wala user agent: SIRF apni website ke liye
     private static final String USER_AGENT_APP = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
     private WebView mainWebView;
     private WebView workerWebView;
@@ -47,7 +47,7 @@ public class MainActivity extends Activity {
     private static final String HOSTING_DASHBOARD = HOSTING_BASE + "index.php";
     private static final String IG_URL = "https://www.instagram.com";
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
-    // Normal user agent (bina secret ke): Instagram wale WebViews ke liye
+    // Normal user agent (bina secret ke): Instagram wale pages ke liye
     private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36";
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
@@ -60,6 +60,9 @@ public class MainActivity extends Activity {
 
     private volatile String mainUrl = "";
     private String deviceKey = "";
+
+    // Main WebView ka abhi kaun sa user agent laga hai
+    private String currentMainUa = USER_AGENT_APP;
 
     private String currentTaskType = "follow";
     private boolean taskActive = false;
@@ -101,7 +104,7 @@ public class MainActivity extends Activity {
         }
 
         mainWebView = findViewById(R.id.webView);
-        // Main WebView: secret key + version wala user agent (website security ke liye)
+        // Main WebView: shuru me secret key + version wala user agent (website ke liye)
         setupWebView(mainWebView, USER_AGENT_APP);
 
         // Worker WebView: full-size, main WebView ke neeche chhupa hua
@@ -172,6 +175,21 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 if (url != null) mainUrl = url;
+
+                // Safety net (back button / redirect ke baad user agent galat reh jaye to sahi karo)
+                if (url != null) {
+                    if (url.startsWith(IG_URL) && !USER_AGENT.equals(currentMainUa)) {
+                        setMainUa(USER_AGENT);
+                        view.reload();
+                        return;
+                    }
+                    if (url.startsWith(HOSTING_BASE) && !USER_AGENT_APP.equals(currentMainUa)) {
+                        setMainUa(USER_AGENT_APP);
+                        view.reload();
+                        return;
+                    }
+                }
+
                 checkInstagramLogin(url);
             }
         });
@@ -246,6 +264,12 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(wv, true);
     }
 
+    // Main WebView ka user agent badalne ke liye
+    private void setMainUa(String ua) {
+        currentMainUa = ua;
+        mainWebView.getSettings().setUserAgentString(ua);
+    }
+
     // ------------------------------------------------------------------
     // Device key (reinstall ke baad saved accounts pehchanne ke liye)
     // ------------------------------------------------------------------
@@ -264,7 +288,7 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // Navigation: "Add Account" link ko yaha pakadte hain
+    // Navigation: "Add Account" link + user agent switching
     // ------------------------------------------------------------------
     private boolean handleNav(final String url) {
         if (url != null && url.contains("force_authentication=1")) {
@@ -277,8 +301,32 @@ public class MainActivity extends Activity {
                     // Isse Instagram naya login form dikhata hai aur purana session nahi ghusta.
                     applyInstagramCookies("");
                     // Instagram ko secret key nahi dikhani: normal user agent lagao
-                    mainWebView.getSettings().setUserAgentString(USER_AGENT);
+                    setMainUa(USER_AGENT);
                     mainWebView.loadUrl(IG_LOGIN_URL);
+                }
+            });
+            return true;
+        }
+        // Instagram khul raha hai to normal user agent (secret key chhupi rahe)
+        if (url != null && url.startsWith(IG_URL) && !USER_AGENT.equals(currentMainUa)) {
+            final String target = url;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    setMainUa(USER_AGENT);
+                    mainWebView.loadUrl(target);
+                }
+            });
+            return true;
+        }
+        // Website par wapas aa rahe hain to secret key wala user agent
+        if (url != null && url.startsWith(HOSTING_BASE) && !USER_AGENT_APP.equals(currentMainUa)) {
+            final String target = url;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    setMainUa(USER_AGENT_APP);
+                    mainWebView.loadUrl(target);
                 }
             });
             return true;
@@ -340,7 +388,7 @@ public class MainActivity extends Activity {
         captureBusy = false;
         captureNonce = "";
         // Website par wapas jaane se pehle secret key + version wala user agent dobara lagao
-        mainWebView.getSettings().setUserAgentString(USER_AGENT_APP);
+        setMainUa(USER_AGENT_APP);
         try {
             String clean = username == null ? "" : username.replaceAll("[^A-Za-z0-9._]", "");
             String body = "ig_cookies=" + URLEncoder.encode(captureCookies, "UTF-8")
@@ -1189,4 +1237,4 @@ public class MainActivity extends Activity {
         }
         super.onDestroy();
     }
-    }
+}
