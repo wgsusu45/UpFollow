@@ -13,7 +13,7 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Light.NoTitleBar"
         android:usesCleartextTraffic="true">
-
+        android:icon="@drawable/app_logo"
         <activity
             android:name=".MainActivity"
             android:exported="true"
