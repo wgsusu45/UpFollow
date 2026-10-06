@@ -33,8 +33,11 @@ import java.net.URLEncoder;
 import java.security.MessageDigest;
 
 public class MainActivity extends Activity {
-private static final String APP_SECRET_KEY = "brohu2580";
-    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY;
+    private static final String APP_SECRET_KEY = "brohu2580";
+    // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
+    private static final int APP_VERSION_CODE = 2;
+    // Secret + version wala user agent: SIRF apni website (mainWebView) ke liye
+    private static final String USER_AGENT_APP = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
     private WebView mainWebView;
     private WebView workerWebView;
     private WebView searchWebView;
@@ -44,6 +47,7 @@ private static final String APP_SECRET_KEY = "brohu2580";
     private static final String HOSTING_DASHBOARD = HOSTING_BASE + "index.php";
     private static final String IG_URL = "https://www.instagram.com";
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
+    // Normal user agent (bina secret ke): Instagram wale WebViews ke liye
     private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36";
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
@@ -97,7 +101,8 @@ private static final String APP_SECRET_KEY = "brohu2580";
         }
 
         mainWebView = findViewById(R.id.webView);
-        setupWebView(mainWebView);
+        // Main WebView: secret key + version wala user agent (website security ke liye)
+        setupWebView(mainWebView, USER_AGENT_APP);
 
         // Worker WebView: full-size, main WebView ke neeche chhupa hua
         workerWebView = new WebView(this);
@@ -224,12 +229,17 @@ private static final String APP_SECRET_KEY = "brohu2580";
         mainWebView.loadUrl(HOSTING_DASHBOARD + "?dk=" + deviceKey);
     }
 
+    // Normal WebView (Instagram wale): bina secret key ke user agent
     private void setupWebView(WebView wv) {
+        setupWebView(wv, USER_AGENT);
+    }
+
+    private void setupWebView(WebView wv, String ua) {
         WebSettings s = wv.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setDatabaseEnabled(true);
-        s.setUserAgentString(USER_AGENT);
+        s.setUserAgentString(ua);
 
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
@@ -266,6 +276,8 @@ private static final String APP_SECRET_KEY = "brohu2580";
                     // Saare accounts ki cookies server par saved hain, isliye jar saaf karna safe hai.
                     // Isse Instagram naya login form dikhata hai aur purana session nahi ghusta.
                     applyInstagramCookies("");
+                    // Instagram ko secret key nahi dikhani: normal user agent lagao
+                    mainWebView.getSettings().setUserAgentString(USER_AGENT);
                     mainWebView.loadUrl(IG_LOGIN_URL);
                 }
             });
@@ -327,6 +339,8 @@ private static final String APP_SECRET_KEY = "brohu2580";
         if (!captureBusy) return;
         captureBusy = false;
         captureNonce = "";
+        // Website par wapas jaane se pehle secret key + version wala user agent dobara lagao
+        mainWebView.getSettings().setUserAgentString(USER_AGENT_APP);
         try {
             String clean = username == null ? "" : username.replaceAll("[^A-Za-z0-9._]", "");
             String body = "ig_cookies=" + URLEncoder.encode(captureCookies, "UTF-8")
@@ -1079,6 +1093,12 @@ private static final String APP_SECRET_KEY = "brohu2580";
             if (!trusted()) return "";
             String c = CookieManager.getInstance().getCookie(IG_URL);
             return c == null ? "" : c;
+        }
+
+        // Website ko app ka version batane ke liye (optional use)
+        @JavascriptInterface
+        public int getAppVersion() {
+            return APP_VERSION_CODE;
         }
 
         @JavascriptInterface
