@@ -33,7 +33,8 @@ import java.net.URLEncoder;
 import java.security.MessageDigest;
 
 public class MainActivity extends Activity {
-
+private static final String APP_SECRET_KEY = "brohu2580";
+    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY;
     private WebView mainWebView;
     private WebView workerWebView;
     private WebView searchWebView;
