@@ -34,8 +34,10 @@ import java.security.MessageDigest;
 
 public class MainActivity extends Activity {
     private static final String APP_SECRET_KEY = "brohu2580";
-    // Secret wala user agent: SIRF apni website (mainWebView) ke liye
-    private static final String USER_AGENT_APP = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY;
+    // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
+    private static final int APP_VERSION_CODE = 2;
+    // Secret + version wala user agent: SIRF apni website (mainWebView) ke liye
+    private static final String USER_AGENT_APP = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
     private WebView mainWebView;
     private WebView workerWebView;
     private WebView searchWebView;
@@ -99,7 +101,7 @@ public class MainActivity extends Activity {
         }
 
         mainWebView = findViewById(R.id.webView);
-        // Main WebView: secret key wala user agent (website security ke liye)
+        // Main WebView: secret key + version wala user agent (website security ke liye)
         setupWebView(mainWebView, USER_AGENT_APP);
 
         // Worker WebView: full-size, main WebView ke neeche chhupa hua
@@ -337,7 +339,7 @@ public class MainActivity extends Activity {
         if (!captureBusy) return;
         captureBusy = false;
         captureNonce = "";
-        // Website par wapas jaane se pehle secret key wala user agent dobara lagao
+        // Website par wapas jaane se pehle secret key + version wala user agent dobara lagao
         mainWebView.getSettings().setUserAgentString(USER_AGENT_APP);
         try {
             String clean = username == null ? "" : username.replaceAll("[^A-Za-z0-9._]", "");
@@ -1093,6 +1095,12 @@ public class MainActivity extends Activity {
             return c == null ? "" : c;
         }
 
+        // Website ko app ka version batane ke liye (optional use)
+        @JavascriptInterface
+        public int getAppVersion() {
+            return APP_VERSION_CODE;
+        }
+
         @JavascriptInterface
         public void setKeepScreenOn(final boolean keepOn) {
             if (!trusted()) return;
@@ -1181,4 +1189,4 @@ public class MainActivity extends Activity {
         }
         super.onDestroy();
     }
-}
+    }
