@@ -9,8 +9,6 @@
 
     <application
         android:allowBackup="true"
-        android:icon="@drawable/app_logo"
-        android:roundIcon="@drawable/app_logo"
         android:label="UpFollow"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Light.NoTitleBar"
