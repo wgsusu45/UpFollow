@@ -32,6 +32,14 @@ import org.json.JSONObject;
 
 import java.net.URLEncoder;
 import java.security.MessageDigest;
+import java.util.ArrayDeque;
+import java.util.HashMap;
+import java.util.Map;
+
+import androidx.webkit.Profile;
+import androidx.webkit.ProfileStore;
+import androidx.webkit.WebViewCompat;
+import androidx.webkit.WebViewFeature;
 
 public class MainActivity extends Activity {
     private static final String APP_SECRET_KEY = "brohu2580";
@@ -1015,6 +1023,11 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
             if (!trusted()) return;
+            // NAYA: multi-account parallel mode (WebView support na kare to neeche wala purana code chalega)
+            if (parallelEnabled(cookieStr)) {
+                parallelEnqueue(target, taskType, mediaId, cookieStr);
+                return;
+            }
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -1043,6 +1056,13 @@ public class MainActivity extends Activity {
                     workerWebView.loadUrl(url);
                 }
             });
+        }
+
+        // NAYA: accounts ke beech delay (seconds) set karne ke liye: Android.setAccountDelay(11)
+        @JavascriptInterface
+        public void setAccountDelay(final int seconds) {
+            if (!trusted()) return;
+            startGapMs = Math.max(0, Math.min(60, seconds)) * 1000L;
         }
 
         // Purana method (compatibility)
@@ -1158,6 +1178,283 @@ public class MainActivity extends Activity {
                     clearAutomationNotification();
                 }
             });
+        }
+    }
+
+    // ==================================================================
+    // PARALLEL ENGINE (naya): har account = alag WebView + alag cookie profile
+    // - Accounts ek ke baad ek start hote hain (beech me startGapMs ka gap)
+    // - Ek saath chalne wale accounts unlimited
+    // - Round-robin: ek account ka task khatam, agla task dusre account ka
+    // ==================================================================
+    private static final int MAX_PARALLEL = Integer.MAX_VALUE; // unlimited
+
+    private class Slot {
+        String uid = "";
+        WebView wv;
+        CookieManager cm;
+        boolean active = false;
+        String target = "";
+        String taskType = "follow";
+        Runnable timeout;
+    }
+
+    private class PTask {
+        String uid = "";
+        String target = "";
+        String taskType = "follow";
+        String mediaId = "";
+        String cookieStr = "";
+    }
+
+    private final Map<String, Slot> slots = new HashMap<String, Slot>();
+    private final ArrayDeque<PTask> pendingTasks = new ArrayDeque<PTask>();
+    private int activeSlots = 0;
+
+    // Anti-block: har naya account itne ms baad start hota hai (default 11 sec)
+    private volatile long startGapMs = 11000L;
+    private long lastStartAt = 0;
+    private String lastStartedUid = "";
+    private boolean pumpScheduled = false;
+    private final Runnable pumpRunnable = new Runnable() {
+        @Override
+        public void run() {
+            pumpScheduled = false;
+            pumpQueue();
+        }
+    };
+
+    private boolean parallelEnabled(String cookieStr) {
+        if (cookieStr == null || cookieStr.isEmpty()) return false;
+        if (cookieValue(cookieStr, "ds_user_id").isEmpty()) return false;
+        try {
+            return WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void parallelEnqueue(String target, String taskType, String mediaId, String cookieStr) {
+        final PTask t = new PTask();
+        t.target = target == null ? "" : target;
+        t.taskType = taskType == null ? "follow" : taskType;
+        t.mediaId = mediaId == null ? "" : mediaId;
+        t.cookieStr = cookieStr;
+        t.uid = cookieValue(cookieStr, "ds_user_id").replaceAll("[^A-Za-z0-9]", "");
+        uiHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                pendingTasks.add(t);
+                pumpQueue();
+            }
+        });
+    }
+
+    private void pumpQueue() {
+        if (pendingTasks.isEmpty() || activeSlots >= MAX_PARALLEL) return;
+
+        long wait = lastStartAt + startGapMs - System.currentTimeMillis();
+        if (wait > 0) {
+            if (!pumpScheduled) {
+                pumpScheduled = true;
+                uiHandler.postDelayed(pumpRunnable, wait);
+            }
+            return;
+        }
+
+        // Round-robin: pichhle account ke baad agla task DUSRE account ka uthao.
+        // Dusra account na ho to hi same account ka agla task chalega.
+        PTask pick = null;
+        for (PTask t : pendingTasks) {
+            Slot s = slots.get(t.uid);
+            if (s != null && s.active) continue; // is account ka task abhi chal raha hai
+            if (pick == null) pick = t;          // fallback: pehla free task
+            if (!t.uid.equals(lastStartedUid)) { pick = t; break; }
+        }
+        if (pick != null) {
+            pendingTasks.remove(pick);
+            lastStartAt = System.currentTimeMillis();
+            lastStartedUid = pick.uid;
+            startOnSlot(pick, slots.get(pick.uid));
+        }
+
+        if (!pendingTasks.isEmpty() && !pumpScheduled) {
+            pumpScheduled = true;
+            uiHandler.postDelayed(pumpRunnable, Math.max(startGapMs, 1000L));
+        }
+    }
+
+    private void startOnSlot(final PTask t, Slot existing) {
+        Slot s = existing;
+        try {
+            if (s == null) {
+                s = new Slot();
+                s.uid = t.uid;
+                WebView wv = new WebView(this);
+                String pname = "acc_" + t.uid;
+                Profile p = ProfileStore.getInstance().getOrCreateProfile(pname);
+                WebViewCompat.setProfile(wv, pname);
+                s.cm = p.getCookieManager();
+
+                WebSettings st = wv.getSettings();
+                st.setJavaScriptEnabled(true);
+                st.setDomStorageEnabled(true);
+                st.setDatabaseEnabled(true);
+                st.setUserAgentString(USER_AGENT); // normal UA: Instagram ko secret key nahi dikhani
+                s.cm.setAcceptCookie(true);
+                s.cm.setAcceptThirdPartyCookies(wv, true);
+
+                wv.setLayoutParams(new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                wv.setAlpha(0.01f);
+                ViewGroup root = (ViewGroup) findViewById(android.R.id.content);
+                if (root != null) root.addView(wv, 0);
+
+                wv.addJavascriptInterface(new SlotBridge(s), "WorkerBridge");
+                wv.setWebViewClient(new SlotClient(s));
+                s.wv = wv;
+                slots.put(t.uid, s);
+            }
+        } catch (Throwable e) {
+            sendParallelResult(t.uid, t.target, false, "Setup error: " + e.getMessage());
+            return;
+        }
+
+        final Slot fs = s;
+        applyCookiesTo(fs.cm, t.cookieStr);
+        fs.active = true;
+        fs.target = t.target.replaceAll("[^A-Za-z0-9._]", "");
+        fs.taskType = t.taskType;
+        activeSlots++;
+        fs.timeout = new Runnable() {
+            @Override
+            public void run() {
+                finishSlot(fs, false, "Timeout");
+            }
+        };
+        uiHandler.postDelayed(fs.timeout, TASK_TIMEOUT_MS);
+        fs.wv.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
+    }
+
+    private void finishSlot(final Slot s, boolean ok, String msg) {
+        if (s == null || !s.active) return;
+        s.active = false;
+        activeSlots--;
+        if (s.timeout != null) uiHandler.removeCallbacks(s.timeout);
+        sendParallelResult(s.uid, s.target, ok, msg);
+        slots.remove(s.uid);
+        // WebView band karke RAM free karo (callback ke andar nahi, thodi der baad)
+        uiHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    ViewGroup par = (ViewGroup) s.wv.getParent();
+                    if (par != null) par.removeView(s.wv);
+                    s.wv.stopLoading();
+                    s.wv.destroy();
+                } catch (Exception ignored) {}
+            }
+        });
+        pumpQueue();
+    }
+
+    // Result page ko jaata hai: onWorkerResult(success, msg, accountId, target)
+    // Pehle 2 arguments purane jaise hain, baaki 2 naye (account pehchanne ke liye)
+    private void sendParallelResult(String uid, String target, boolean ok, String msg) {
+        String safe = (msg == null ? "" : msg).replace("\\", "\\\\").replace("'", "\\'");
+        String safeT = (target == null ? "" : target).replace("\\", "\\\\").replace("'", "\\'");
+        mainWebView.evaluateJavascript(
+                "if(window.onWorkerResult) window.onWorkerResult(" + ok + ", '" + safe + "', '" + uid + "', '" + safeT + "');", null);
+    }
+
+    private String buildTaskUrl(String target, String taskType, String mediaId) {
+        String cleanTarget = target == null ? "" : target.replaceAll("[^A-Za-z0-9._]", "");
+        if ("like".equalsIgnoreCase(taskType)) {
+            if (mediaId != null && mediaId.startsWith("https://www.instagram.com/")) return mediaId;
+            if (mediaId != null && !mediaId.isEmpty() && mediaId.matches("[A-Za-z0-9_-]+") && !mediaId.equals("25025320")) {
+                return (mediaId.length() <= 12 ? "https://www.instagram.com/reel/" : "https://www.instagram.com/p/") + mediaId + "/";
+            }
+        }
+        return "https://www.instagram.com/" + cleanTarget + "/";
+    }
+
+    private void applyCookiesTo(CookieManager cm, String cookieStr) {
+        String existing = cm.getCookie(IG_URL);
+        if (existing != null) {
+            for (String part : existing.split(";")) {
+                String p = part.trim();
+                int i = p.indexOf('=');
+                String name = i > 0 ? p.substring(0, i) : p;
+                if (name.isEmpty()) continue;
+                cm.setCookie(IG_URL, name + "=; Max-Age=0; Path=/; Domain=.instagram.com");
+                cm.setCookie(IG_URL, name + "=; Max-Age=0; Path=/");
+            }
+        }
+        if (cookieStr != null && !cookieStr.isEmpty()) {
+            for (String part : cookieStr.split(";")) {
+                String p = part.trim();
+                int i = p.indexOf('=');
+                if (i <= 0) continue;
+                String name = p.substring(0, i);
+                String extra = "; Domain=.instagram.com; Path=/; Secure";
+                if ("sessionid".equals(name)) extra += "; HttpOnly";
+                cm.setCookie(IG_URL, p + extra);
+            }
+        }
+        cm.flush();
+    }
+
+    private class SlotBridge {
+        private final Slot s;
+        SlotBridge(Slot s) { this.s = s; }
+
+        @JavascriptInterface
+        public void onTaskResult(final boolean success, final String message) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    finishSlot(s, success, message);
+                }
+            });
+        }
+    }
+
+    private class SlotClient extends WebViewClient {
+        private final Slot s;
+        SlotClient(Slot s) { this.s = s; }
+
+        @Override
+        public void onPageFinished(final WebView view, String url) {
+            super.onPageFinished(view, url);
+            if (!s.active || url == null || url.startsWith("about:")) return;
+
+            String path = "";
+            try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
+
+            if (path.startsWith("/accounts/suspended")) { finishSlot(s, false, "Suspended: Instagram suspended this account"); return; }
+            if (path.startsWith("/accounts/disabled")) { finishSlot(s, false, "Disabled: Instagram disabled this account"); return; }
+            if (path.startsWith("/challenge") || path.startsWith("/checkpoint") || path.startsWith("/auth_platform")) { finishSlot(s, false, "Blocked: Challenge / Checkpoint"); return; }
+            if (path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")) { finishSlot(s, false, "Session expired"); return; }
+
+            uiHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (!s.active) return;
+                    if ("like".equalsIgnoreCase(s.taskType)) {
+                        injectLikeScript(view);
+                    } else {
+                        injectFollowScript(view);
+                    }
+                }
+            }, 1200);
+        }
+
+        @Override
+        public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+            super.onReceivedError(view, request, error);
+            if (s.active && request != null && request.isForMainFrame()) {
+                finishSlot(s, false, "Page error");
+            }
         }
     }
 
