@@ -1137,6 +1137,31 @@ public class MainActivity extends Activity {
             return APP_VERSION_CODE;
         }
 
+        // NAYA: page ko batata hai ki ye phone multi-account parallel support karta hai ya nahi
+        @JavascriptInterface
+        public boolean isParallelSupported() {
+            try {
+                return WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE);
+            } catch (Throwable t) {
+                return false;
+            }
+        }
+
+        // NAYA: Stop dabane par queue me ruke hue tasks cancel (jo chal rahe hain wo khatam honge)
+        @JavascriptInterface
+        public void clearPendingTasks() {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    PTask t;
+                    while ((t = pendingTasks.poll()) != null) {
+                        sendParallelResult(t.uid, t.target, false, "Cancelled");
+                    }
+                }
+            });
+        }
+
         @JavascriptInterface
         public void setKeepScreenOn(final boolean keepOn) {
             if (!trusted()) return;
@@ -1404,7 +1429,7 @@ public class MainActivity extends Activity {
         cm.flush();
     }
 
-    private class SlotBridge {
+    public class SlotBridge {
         private final Slot s;
         SlotBridge(Slot s) { this.s = s; }
 
