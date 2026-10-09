@@ -469,6 +469,7 @@ public class MainActivity extends Activity {
         "    if (p.indexOf('/accounts/disabled') === 0) return 'Disabled: Instagram disabled this account';",
         "    if (p.indexOf('/challenge') === 0 || p.indexOf('/checkpoint') === 0 || p.indexOf('/auth_platform') === 0) return 'Blocked: Challenge / Checkpoint';",
         "    if (p.indexOf('/accounts/login') === 0 || p.indexOf('/accounts/emailsignup') === 0) return 'Session expired';",
+        "    if (document.querySelector('input[name=password]')) return 'Session expired';",
         "    var t = bodyText();",
         "    if (t.indexOf('account has been disabled') > -1 || t.indexOf('account was disabled') > -1) return 'Disabled: Instagram disabled this account';",
         "    if (t.indexOf('account has been suspended') > -1 || t.indexOf('suspended your account') > -1 || t.indexOf('account is suspended') > -1) return 'Suspended: Instagram suspended this account';",
@@ -512,7 +513,7 @@ public class MainActivity extends Activity {
             "      if (find(list, DONE)) { finish(true, 'Already Following'); return; }",
             "      var fb = find(list, FOLLOW);",
             "      if (fb) { fb.click(); clicked = true; clickedAt = Date.now(); return; }",
-            "      if (tries >= 22) { finish(false, 'Follow button not found'); }",
+            "      if (tries >= 40) { finish(false, 'Follow button not found'); }",
             "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
             "  }",
             "  timer = setInterval(tick, 700);",
@@ -590,7 +591,7 @@ public class MainActivity extends Activity {
             "        b.click(); clicked = true; clickedAt = Date.now(); return;",
             "      }",
             "      if (!apiTried && tries >= 4) { callApi(); return; }",
-            "      if (tries >= 24) { finish(false, 'Like button not found'); }",
+            "      if (tries >= 40) { finish(false, 'Like button not found'); }",
             "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
             "  }",
             "  timer = setInterval(tick, 700);",
@@ -1212,13 +1213,17 @@ public class MainActivity extends Activity {
     // - Ek saath chalne wale accounts unlimited
     // - Round-robin: ek account ka task khatam, agla task dusre account ka
     // ==================================================================
-    private static final int MAX_PARALLEL = Integer.MAX_VALUE; // unlimited
+    // Ek saath max itne account chalenge (phone overload na ho, isse jyada slow = jyada 'button not found')
+    private static final int MAX_PARALLEL = 3;
+    // Parallel task ko poora samay (retry samet)
+    private static final long SLOT_TASK_TIMEOUT_MS = 80000L;
 
     private class Slot {
         String uid = "";
         WebView wv;
         CookieManager cm;
         boolean active = false;
+        int retries = 0;
         String target = "";
         String taskType = "follow";
         Runnable timeout;
@@ -1348,6 +1353,7 @@ public class MainActivity extends Activity {
         final Slot fs = s;
         applyCookiesTo(fs.cm, t.cookieStr);
         fs.active = true;
+        fs.retries = 0;
         fs.target = t.target.replaceAll("[^A-Za-z0-9._]", "");
         fs.taskType = t.taskType;
         activeSlots++;
@@ -1357,7 +1363,7 @@ public class MainActivity extends Activity {
                 finishSlot(fs, false, "Timeout");
             }
         };
-        uiHandler.postDelayed(fs.timeout, TASK_TIMEOUT_MS);
+        uiHandler.postDelayed(fs.timeout, SLOT_TASK_TIMEOUT_MS);
         fs.wv.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
     }
 
@@ -1429,6 +1435,27 @@ public class MainActivity extends Activity {
         cm.flush();
     }
 
+    // 'button not found' / page error par ek baar page reload karke dobara try
+    private boolean shouldRetry(Slot s, String msg) {
+        if (s == null || !s.active || s.retries >= 1) return false;
+        String m = msg == null ? "" : msg.toLowerCase();
+        return m.contains("not found") || m.contains("did not register")
+                || m.contains("page error") || m.contains("js error");
+    }
+
+    private void retrySlot(Slot s) {
+        s.retries++;
+        if (s.timeout != null) {
+            uiHandler.removeCallbacks(s.timeout);
+            uiHandler.postDelayed(s.timeout, SLOT_TASK_TIMEOUT_MS);
+        }
+        try {
+            s.wv.reload();
+        } catch (Exception e) {
+            finishSlot(s, false, "Page error");
+        }
+    }
+
     public class SlotBridge {
         private final Slot s;
         SlotBridge(Slot s) { this.s = s; }
@@ -1438,7 +1465,11 @@ public class MainActivity extends Activity {
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
-                    finishSlot(s, success, message);
+                    if (!success && shouldRetry(s, message)) {
+                        retrySlot(s);
+                    } else {
+                        finishSlot(s, success, message);
+                    }
                 }
             });
         }
@@ -1478,7 +1509,11 @@ public class MainActivity extends Activity {
         public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
             super.onReceivedError(view, request, error);
             if (s.active && request != null && request.isForMainFrame()) {
-                finishSlot(s, false, "Page error");
+                if (shouldRetry(s, "page error")) {
+                    retrySlot(s);
+                } else {
+                    finishSlot(s, false, "Page error");
+                }
             }
         }
     }
