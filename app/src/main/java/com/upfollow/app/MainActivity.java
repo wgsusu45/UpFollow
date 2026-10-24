@@ -41,6 +41,9 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.HashSet;
+import java.util.Random;
+import java.util.Set;
 
 import androidx.webkit.Profile;
 import androidx.webkit.ProfileStore;
@@ -118,6 +121,8 @@ public class MainActivity extends Activity {
 
         prefs = getSharedPreferences("upfollow_prefs", MODE_PRIVATE);
         deviceKey = computeDeviceKey();
+        loadMap("done_map", doneMap);
+        loadMap("dead_map", deadMap);
 
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -1270,6 +1275,52 @@ public class MainActivity extends Activity {
             maxParallel = Math.max(1, Math.min(3, n));
         }
 
+        // NAYA: Fast Mode ON/OFF (default ON). Android.setFastMode(false) se purana tarika
+        @JavascriptInterface
+        public void setFastMode(final boolean on) {
+            if (!trusted()) return;
+            fastModeOn = on;
+        }
+
+        @JavascriptInterface
+        public boolean isFastMode() {
+            return fastModeOn;
+        }
+
+        // NAYA: gap me random utar-chadhav (seconds, 0-10). Android.setGapJitter(2) => 9 sec me +-2
+        @JavascriptInterface
+        public void setGapJitter(final int seconds) {
+            if (!trusted()) return;
+            gapJitterMs = Math.max(0, Math.min(10, seconds)) * 1000L;
+        }
+
+        // NAYA: dead profiles ki list saaf (admin "Restore" ke liye)
+        @JavascriptInterface
+        public void clearDeadProfiles() {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    deadMap.clear();
+                    unavailVotes.clear();
+                    saveMap("dead_map", deadMap, DEAD_TTL_MS, 1500);
+                }
+            });
+        }
+
+        // NAYA: "pehle ho chuka" memory saaf
+        @JavascriptInterface
+        public void clearDoneCache() {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    doneMap.clear();
+                    saveMap("done_map", doneMap, DONE_TTL_MS, 1500);
+                }
+            });
+        }
+
         // Purana method (compatibility)
         @JavascriptInterface
         public void executeBrowserAction(String target, String taskType, String mediaId) {
@@ -1449,9 +1500,18 @@ public class MainActivity extends Activity {
         int retries = 0;
         String target = "";
         String taskType = "follow";
+        String mediaId = "";
+        String key = "";
         Runnable timeout;
         boolean acted = false;
         long startedAt = 0;
+        // FAST MODE state
+        String mode = "page";          // page | fast-wait | fast
+        boolean fastReady = false;     // WebView instagram.com par khula hai, session ready
+        boolean scriptDone = false;    // script ne khud result bheja (page clean hai)
+        int seq = 0;                   // har task ka number (purane watchdog ignore karne ke liye)
+        long prefetchUntil = 0;
+        long warmAt = 0;
     }
 
     private class PTask {
@@ -1460,15 +1520,39 @@ public class MainActivity extends Activity {
         String taskType = "follow";
         String mediaId = "";
         String cookieStr = "";
+        String key = "";
+    }
+
+    private class PInfo {
+        String st = "";
+        String id = "";
+        long at = 0;
     }
 
     private final Map<String, Slot> slots = new HashMap<String, Slot>();
     private final ArrayDeque<PTask> pendingTasks = new ArrayDeque<PTask>();
     private int activeSlots = 0;
 
-    // Anti-block: har naya account itne ms baad start hota hai (default 6 sec, Android.setAccountDelay(n) se badlo)
-    private volatile long startGapMs = 6000L;
+    // Prefetch cache: "uid|target" -> target ki info (user id / already following)
+    private final Map<String, PInfo> prefetchCache = new HashMap<String, PInfo>();
+    // Duplicate / dead profile memory (phone me save rehti hai)
+    private final Map<String, Long> doneMap = new HashMap<String, Long>();
+    private final Map<String, Long> deadMap = new HashMap<String, Long>();
+    private final Map<String, HashSet<String>> unavailVotes = new HashMap<String, HashSet<String>>();
+    private static final long DONE_TTL_MS = 30L * 24 * 60 * 60 * 1000L;
+    private static final long DEAD_TTL_MS = 7L * 24 * 60 * 60 * 1000L;
+    private static final long PREFETCH_TTL_MS = 10L * 60 * 1000L;
+
+    // Fast Mode ON/OFF (website se Android.setFastMode(false) karke band kar sakte ho)
+    private volatile boolean fastModeOn = true;
+
+    // Anti-block gap: ek task KHATAM hone ke baad itna ruk ke agla account (default 9 sec +- jitter)
+    private volatile long startGapMs = 9000L;
+    private volatile long gapJitterMs = 2000L;
+    private long curGapMs = 9000L;
     private long lastStartAt = 0;
+    private long lastEndAt = 0;
+    private final Random rnd = new Random();
     private String lastStartedUid = "";
     private boolean pumpScheduled = false;
     private final Runnable pumpRunnable = new Runnable() {
@@ -1478,6 +1562,13 @@ public class MainActivity extends Activity {
             pumpQueue();
         }
     };
+
+    private long nextGap() {
+        long j = gapJitterMs;
+        long g = startGapMs;
+        if (j > 0) g += (long) (rnd.nextDouble() * 2.0 * j) - j;
+        return Math.max(0L, g);
+    }
 
     private boolean parallelEnabled(String cookieStr) {
         if (cookieStr == null || cookieStr.isEmpty()) return false;
@@ -1489,6 +1580,39 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static String cleanName(String s) {
+        return s == null ? "" : s.replaceAll("[^A-Za-z0-9._]", "");
+    }
+
+    private static String taskKey(String type, String target, String media) {
+        if ("like".equalsIgnoreCase(type)) {
+            String m = media == null ? "" : media.trim();
+            if (!m.isEmpty()) return "like|" + m.toLowerCase();
+            return "like|" + cleanName(target).toLowerCase();
+        }
+        return "follow|" + cleanName(target).toLowerCase();
+    }
+
+    private boolean isDone(String k) {
+        Long t = doneMap.get(k);
+        return t != null && System.currentTimeMillis() - t < DONE_TTL_MS;
+    }
+
+    private boolean isDead(String k) {
+        Long t = deadMap.get(k);
+        return t != null && System.currentTimeMillis() - t < DEAD_TTL_MS;
+    }
+
+    private boolean isDuplicate(PTask t) {
+        for (PTask p : pendingTasks) {
+            if (p.uid.equals(t.uid) && p.key.equals(t.key)) return true;
+        }
+        for (Slot s : slots.values()) {
+            if (s.active && s.uid.equals(t.uid) && s.key.equals(t.key)) return true;
+        }
+        return false;
+    }
+
     private void parallelEnqueue(String target, String taskType, String mediaId, String cookieStr) {
         final PTask t = new PTask();
         t.target = target == null ? "" : target;
@@ -1496,26 +1620,70 @@ public class MainActivity extends Activity {
         t.mediaId = mediaId == null ? "" : mediaId;
         t.cookieStr = cookieStr;
         t.uid = cookieValue(cookieStr, "ds_user_id").replaceAll("[^A-Za-z0-9]", "");
+        t.key = taskKey(t.taskType, t.target, t.mediaId);
         uiHandler.post(new Runnable() {
             @Override
             public void run() {
+                boolean like = "like".equalsIgnoreCase(t.taskType);
+                // 1) Bekar (dead) profile: bina kuch kiye skip, website ko bhi bata do
+                if (isDead(t.key)) {
+                    reportDead(t.taskType, cleanName(t.target), "unavailable", t.mediaId);
+                    sendParallelResult(t.uid, t.target, false, "Skipped: dead profile");
+                    return;
+                }
+                // 2) Is account se ye kaam pehle ho chuka hai
+                if (isDone(t.uid + "|" + t.key)) {
+                    sendParallelResult(t.uid, t.target, true, like ? "Already Liked" : "Already Following");
+                    return;
+                }
+                // 3) Wahi task queue me ya abhi chal raha hai (double order)
+                if (isDuplicate(t)) {
+                    sendParallelResult(t.uid, t.target, false, "Duplicate task skipped");
+                    return;
+                }
                 pendingTasks.add(t);
                 pumpQueue();
+                prefetchNext();
             }
         });
     }
 
-    // FIX: activeSlots >= maxParallel hone par kabhi naya account start nahi hota.
-    // Jab tak current task poora na ho (success ya sach ka error), next account nahi khulta.
+    // Prefetch me pata chal gaya ki account ye profile pehle se follow kar chuka hai -> bina gap ke skip
+    private void skipPrefetchedDone() {
+        if (prefetchCache.isEmpty() || pendingTasks.isEmpty()) return;
+        for (PTask t : new ArrayList<PTask>(pendingTasks)) {
+            if ("like".equalsIgnoreCase(t.taskType)) continue;
+            String k = t.uid + "|" + cleanName(t.target).toLowerCase();
+            PInfo c = prefetchCache.get(k);
+            if (c != null && "already".equals(c.st) && fresh(c)) {
+                prefetchCache.remove(k);
+                pendingTasks.remove(t);
+                doneMap.put(t.uid + "|" + t.key, System.currentTimeMillis());
+                saveMap("done_map", doneMap, DONE_TTL_MS, 1500);
+                sendParallelResult(t.uid, t.target, true, "Already Following");
+            }
+        }
+    }
+
+    private boolean fresh(PInfo c) {
+        return c != null && System.currentTimeMillis() - c.at < PREFETCH_TTL_MS;
+    }
+
+    // Jab tak current task poora na ho (success ya sach ka error), activeSlots >= maxParallel
+    // rehta hai, isliye dusra account kabhi beech me nahi khulta.
     private void pumpQueue() {
+        skipPrefetchedDone();
         if (pendingTasks.isEmpty() || activeSlots >= maxParallel) return;
 
-        long wait = lastStartAt + startGapMs - System.currentTimeMillis();
+        long base = (maxParallel <= 1) ? lastEndAt : lastStartAt;
+        long wait = base + curGapMs - System.currentTimeMillis();
         if (wait > 0) {
             if (!pumpScheduled) {
                 pumpScheduled = true;
                 uiHandler.postDelayed(pumpRunnable, wait);
             }
+            // Gap ke khali samay me agle task ki taiyari (prefetch)
+            prefetchNext();
             return;
         }
 
@@ -1547,65 +1715,41 @@ public class MainActivity extends Activity {
             }
             lastStartAt = System.currentTimeMillis();
             lastStartedUid = pick.uid;
+            curGapMs = nextGap();
             startOnSlot(pick, slots.get(pick.uid));
         }
 
         if (!pendingTasks.isEmpty() && !pumpScheduled) {
             pumpScheduled = true;
-            uiHandler.postDelayed(pumpRunnable, Math.max(startGapMs, 1000L));
+            uiHandler.postDelayed(pumpRunnable, Math.max(curGapMs, 1000L));
         }
+        prefetchNext();
     }
 
     private void startOnSlot(final PTask t, Slot existing) {
         Slot s = existing;
         try {
-            if (s == null) {
-                s = new Slot();
-                s.uid = t.uid;
-                WebView wv = new WebView(this);
-                String pname = "acc_" + t.uid;
-                Profile p = ProfileStore.getInstance().getOrCreateProfile(pname);
-                WebViewCompat.setProfile(wv, pname);
-                s.cm = p.getCookieManager();
-
-                WebSettings st = wv.getSettings();
-                st.setJavaScriptEnabled(true);
-                st.setDomStorageEnabled(true);
-                st.setDatabaseEnabled(true);
-                st.setBlockNetworkImage(true); // photos load nahi honge -> tez
-                st.setUserAgentString(USER_AGENT); // normal UA: Instagram ko secret key nahi dikhani
-                s.cm.setAcceptCookie(true);
-                s.cm.setAcceptThirdPartyCookies(wv, true);
-
-                wv.setLayoutParams(new FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                wv.setAlpha(0.01f);
-                ViewGroup root = (ViewGroup) findViewById(android.R.id.content);
-                if (root != null) root.addView(wv, 0);
-
-                wv.addJavascriptInterface(new SlotBridge(s), "WorkerBridge");
-                wv.setWebViewClient(new SlotClient(s));
-                s.wv = wv;
-                slots.put(t.uid, s);
-            }
+            if (s == null) s = createSlot(t.uid);
         } catch (Throwable e) {
+            lastEndAt = System.currentTimeMillis();
             sendParallelResult(t.uid, t.target, false, "Setup error: " + e.getMessage());
             return;
         }
 
         final Slot fs = s;
         // Cookies sirf tab lagao jab zaroorat ho (naya WebView ya session badla). Garam WebView ki cookies mat chhedo.
-        String curCk = fs.cm.getCookie(IG_URL);
-        String curSid = cookieValue(curCk, "sessionid");
-        if (curSid.isEmpty() || !curSid.equals(cookieValue(t.cookieStr, "sessionid"))) {
-            applyCookiesTo(fs.cm, t.cookieStr);
-        }
+        ensureCookies(fs, t.cookieStr);
         fs.acted = false;
+        fs.scriptDone = false;
         fs.startedAt = System.currentTimeMillis();
         fs.active = true;
         fs.retries = 0;
-        fs.target = t.target.replaceAll("[^A-Za-z0-9._]", "");
+        fs.seq++;
+        fs.prefetchUntil = 0;
+        fs.target = cleanName(t.target);
         fs.taskType = t.taskType;
+        fs.mediaId = t.mediaId;
+        fs.key = t.key;
         activeSlots++;
         fs.timeout = new Runnable() {
             @Override
@@ -1614,7 +1758,22 @@ public class MainActivity extends Activity {
             }
         };
         uiHandler.postDelayed(fs.timeout, SLOT_TASK_TIMEOUT_MS);
-        fs.wv.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
+
+        boolean isFollow = !"like".equalsIgnoreCase(t.taskType);
+        if (fastModeOn && isFollow && !fs.target.isEmpty()) {
+            if (fs.fastReady) {
+                // WebView pehle se Instagram par khula hai: seedha API follow (2-3 sec)
+                fs.mode = "fast";
+                runFast(fs);
+            } else {
+                // Pehli baar: Instagram home ek baar kholo, phir fast follow
+                fs.mode = "fast-wait";
+                fs.wv.loadUrl(IG_URL + "/");
+            }
+        } else {
+            fs.mode = "page";
+            fs.wv.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
+        }
     }
 
     private void finishSlot(final Slot s, boolean ok, String msg) {
@@ -1622,15 +1781,29 @@ public class MainActivity extends Activity {
         s.active = false;
         activeSlots--;
         if (activeSlots < 0) activeSlots = 0;
+        lastEndAt = System.currentTimeMillis();
         if (s.timeout != null) uiHandler.removeCallbacks(s.timeout);
+        if (ok) {
+            doneMap.put(s.uid + "|" + s.key, lastEndAt);
+            saveMap("done_map", doneMap, DONE_TTL_MS, 1500);
+            unavailVotes.remove(s.key);
+        } else if (msg != null && msg.toLowerCase().contains("unavailable")) {
+            noteUnavailable(s);
+        }
         sendParallelResult(s.uid, s.target, ok, msg);
-        // WebView zinda rakho (agla task isi account ka ho to tez chalega), bas purana page/JS band karo
+        // WebView zinda rakho. Script ne khud result diya ho to page saaf hai, Instagram par hi rehne do
+        // (agla fast task seedha chalega). Warna (timeout/error) about:blank karke purana JS band karo.
         try {
             s.wv.stopLoading();
-            s.wv.loadUrl("about:blank");
+            if (!(s.scriptDone && s.fastReady)) {
+                s.fastReady = false;
+                s.wv.loadUrl("about:blank");
+            }
         } catch (Exception ignored) {}
+        s.mode = "page";
         scheduleIdleCleanup();
         pumpQueue();
+        prefetchNext();
     }
 
     // Ruka hua (idle) WebView band karke RAM free karo
@@ -1715,7 +1888,7 @@ public class MainActivity extends Activity {
         cm.flush();
     }
 
-    // FIX: 'not found' / 'unavailable' / page error par 2 baar page reload karke dobara try
+    // 'not found' / 'unavailable' / page error par 2 baar page reload karke dobara try
     private boolean shouldRetry(Slot s, String msg) {
         if (s == null || !s.active || s.retries >= 2) return false;
         if (System.currentTimeMillis() - s.startedAt > 80000) return false; // retry ke liye samay bacha ho
@@ -1725,7 +1898,7 @@ public class MainActivity extends Activity {
                 || m.contains("unavailable");
     }
 
-    // FIX: reload se pehle 3 sec ruko taaki Instagram ko saans mile
+    // reload se pehle 3 sec ruko taaki Instagram ko saans mile
     private void retrySlot(final Slot s) {
         s.retries++;
         uiHandler.postDelayed(new Runnable() {
@@ -1741,251 +1914,165 @@ public class MainActivity extends Activity {
         }, 3000);
     }
 
-    public class SlotBridge {
-        private final Slot s;
-        SlotBridge(Slot s) { this.s = s; }
+    // ==================================================================
+    // FAST MODE helpers
+    // ==================================================================
+    private Slot createSlot(String uid) {
+        Slot s = new Slot();
+        s.uid = uid;
+        WebView wv = new WebView(this);
+        String pname = "acc_" + uid;
+        Profile p = ProfileStore.getInstance().getOrCreateProfile(pname);
+        WebViewCompat.setProfile(wv, pname);
+        s.cm = p.getCookieManager();
 
-        // Script ne follow/like kar diya (API ya click)
-        @JavascriptInterface
-        public void onActed() {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (s.active) s.acted = true;
-                }
-            });
-        }
+        WebSettings st = wv.getSettings();
+        st.setJavaScriptEnabled(true);
+        st.setDomStorageEnabled(true);
+        st.setDatabaseEnabled(true);
+        st.setBlockNetworkImage(true); // photos load nahi honge -> tez
+        st.setUserAgentString(USER_AGENT); // normal UA: Instagram ko secret key nahi dikhani
+        s.cm.setAcceptCookie(true);
+        s.cm.setAcceptThirdPartyCookies(wv, true);
 
-        @JavascriptInterface
-        public void onTaskResult(final boolean success, final String message) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (!s.active) return; // purane/band task ka result ignore
-                    if (!success && shouldRetry(s, message)) {
-                        retrySlot(s);
-                        return;
-                    }
-                    String m2 = message;
-                    if (success && s.acted) {
-                        // Hamne khud follow/like kiya, to "Already" nahi "Successfully" bhejo (coin ke liye)
-                        if ("Already Following".equals(m2)) m2 = "Followed Successfully";
-                        else if ("Already Liked".equals(m2)) m2 = "Post Liked Successfully";
-                    }
-                    finishSlot(s, success, m2);
-                }
-            });
+        wv.setLayoutParams(new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        wv.setAlpha(0.01f);
+        ViewGroup root = (ViewGroup) findViewById(android.R.id.content);
+        if (root != null) root.addView(wv, 0);
+
+        wv.addJavascriptInterface(new SlotBridge(s), "WorkerBridge");
+        wv.setWebViewClient(new SlotClient(s));
+        s.wv = wv;
+        s.warmAt = System.currentTimeMillis();
+        slots.put(uid, s);
+        return s;
+    }
+
+    private void ensureCookies(Slot s, String cookieStr) {
+        String curSid = cookieValue(s.cm.getCookie(IG_URL), "sessionid");
+        if (curSid.isEmpty() || !curSid.equals(cookieValue(cookieStr, "sessionid"))) {
+            applyCookiesTo(s.cm, cookieStr);
+            s.fastReady = false; // session badla, page dobara kholna padega
         }
     }
 
-    private class SlotClient extends WebViewClient {
-        private final Slot s;
-        SlotClient(Slot s) { this.s = s; }
-
-        @Override
-        public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-            WebResourceResponse blocked = blockHeavy(request);
-            return blocked != null ? blocked : super.shouldInterceptRequest(view, request);
+    private void runFast(final Slot s) {
+        final int sq = s.seq;
+        String id = "";
+        String ck = s.uid + "|" + s.target.toLowerCase();
+        PInfo c = prefetchCache.remove(ck);
+        if (fresh(c) && "ok".equals(c.st) && c.id != null) id = c.id.replaceAll("[^0-9]", "");
+        s.prefetchUntil = 0;
+        try {
+            s.wv.evaluateJavascript(buildFastFollowJs(s.target, id), null);
+        } catch (Exception e) {
+            fallbackToPage(s);
+            return;
         }
-
-        @Override
-        public void onPageFinished(final WebView view, String url) {
-            super.onPageFinished(view, url);
-            if (!s.active || url == null || url.startsWith("about:")) return;
-
-            String path = "";
-            try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
-
-            if (path.startsWith("/accounts/suspended")) { finishSlot(s, false, "Suspended: Instagram suspended this account"); return; }
-            if (path.startsWith("/accounts/disabled")) { finishSlot(s, false, "Disabled: Instagram disabled this account"); return; }
-            if (path.startsWith("/challenge") || path.startsWith("/checkpoint") || path.startsWith("/auth_platform")) { finishSlot(s, false, "Blocked: Challenge / Checkpoint"); return; }
-            if (path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")) { finishSlot(s, false, "Session expired"); return; }
-
-            uiHandler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    if (!s.active) return;
-                    if ("like".equalsIgnoreCase(s.taskType)) {
-                        injectLikeScript(view);
-                    } else {
-                        injectFollowScript(view);
-                    }
-                }
-            }, 400);
-        }
-
-        @Override
-        public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-            super.onReceivedError(view, request, error);
-            if (s.active && request != null && request.isForMainFrame()) {
-                if (shouldRetry(s, "page error")) {
-                    retrySlot(s);
-                } else {
-                    finishSlot(s, false, "Page error");
-                }
+        // Fast raasta 20 sec me jawab na de to purana page-load wala tarika
+        uiHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (s.active && s.seq == sq && "fast".equals(s.mode)) fallbackToPage(s);
             }
+        }, 20000);
+    }
+
+    private void fallbackToPage(Slot s) {
+        s.mode = "page";
+        s.fastReady = false;
+        try {
+            s.wv.loadUrl(buildTaskUrl(s.target, s.taskType, s.mediaId));
+        } catch (Exception e) {
+            finishSlot(s, false, "Page error");
         }
     }
 
-    // ==================================================================
-    // SPEED: hidden browsers me photos / videos / fonts load nahi hote
-    // (follow/like ko sirf buttons chahiye) -> page 2-3 guna jaldi khulta hai
-    // ==================================================================
-    private WebResourceResponse blockHeavy(WebResourceRequest request) {
+    // Agle task ki taiyari: uske account ka WebView garam karo + target ki info pehle se nikalo
+    private void prefetchNext() {
+        if (!fastModeOn || pendingTasks.isEmpty()) return;
+        PTask nx = null;
+        for (PTask t : pendingTasks) {
+            if (!"like".equalsIgnoreCase(t.taskType)) { nx = t; break; }
+        }
+        if (nx == null) return;
+        String tname = cleanName(nx.target);
+        if (tname.isEmpty()) return;
+        String key = nx.uid + "|" + tname.toLowerCase();
+        if (fresh(prefetchCache.get(key))) return;
+        long now = System.currentTimeMillis();
         try {
-            if (request == null || request.getUrl() == null || request.isForMainFrame()) return null;
-            String p = String.valueOf(request.getUrl().getPath()).toLowerCase();
-            if (p.endsWith(".jpg") || p.endsWith(".jpeg") || p.endsWith(".png") || p.endsWith(".webp")
-                    || p.endsWith(".gif") || p.endsWith(".mp4") || p.endsWith(".m4s") || p.endsWith(".webm")
-                    || p.endsWith(".woff") || p.endsWith(".woff2") || p.endsWith(".ttf")) {
-                return new WebResourceResponse("text/plain", "UTF-8", new ByteArrayInputStream(new byte[0]));
+            Slot s = slots.get(nx.uid);
+            if (s == null) {
+                s = createSlot(nx.uid);
+                ensureCookies(s, nx.cookieStr);
+                s.wv.loadUrl(IG_URL + "/");
+                return;
             }
-        } catch (Exception ignored) {}
-        return null;
-    }
-
-    // ==================================================================
-    // BACKGROUND FIX: app background me jaaye tab bhi automation na ruke
-    // 1) Foreground service (notification ke saath) -> Android process ko kill/sula nahi karta
-    // 2) Heartbeat -> background me WebView ke JS timers slow ho jaate hain, isliye
-    //    native side se har 1.5 sec page ko "tick" bheja jaata hai
-    // 3) onPause me timers dobara resume
-    // ==================================================================
-    private boolean automationOn = false;
-    private static final String POKE_JS =
-            "(function(){try{if(window.__ufTick&&window.__ufRunning&&Date.now()-(window.__ufLast||0)>1200){window.__ufTick();}}catch(e){}})();";
-
-    private final Runnable heartbeat = new Runnable() {
-        @Override
-        public void run() {
-            if (!automationOn) return;
-            try {
-                mainWebView.resumeTimers();
-                // Website chahe to is function me apna loop dobara jaga sakti hai
-                mainWebView.evaluateJavascript("if(window.onNativeHeartbeat) window.onNativeHeartbeat();", null);
-                if (taskActive) workerWebView.evaluateJavascript(POKE_JS, null);
-                for (Slot sl : new ArrayList<Slot>(slots.values())) {
-                    if (sl.active && sl.wv != null) sl.wv.evaluateJavascript(POKE_JS, null);
+            if (s.active) return;
+            if (!s.fastReady) {
+                if (now - s.warmAt > 20000) {
+                    s.warmAt = now;
+                    ensureCookies(s, nx.cookieStr);
+                    s.wv.loadUrl(IG_URL + "/");
                 }
-            } catch (Exception ignored) {}
-            uiHandler.postDelayed(this, 1500);
-        }
-    };
-
-    private void startAutomationBackground() {
-        automationOn = true;
-        uiHandler.removeCallbacks(heartbeat);
-        uiHandler.postDelayed(heartbeat, 1500);
-        try {
-            Intent svc = new Intent(this, AutomationService.class);
-            if (Build.VERSION.SDK_INT >= 26) {
-                startForegroundService(svc);
-            } else {
-                startService(svc);
+                return;
             }
-        } catch (Exception ignored) {}
-        requestBatteryExemptionOnce();
+            if (s.prefetchUntil > now) return;
+            s.prefetchUntil = now + 15000;
+            s.wv.evaluateJavascript(buildPrefetchJs(tname), null);
+        } catch (Throwable ignored) {}
     }
 
-    private void stopAutomationBackground() {
-        automationOn = false;
-        uiHandler.removeCallbacks(heartbeat);
-        try {
-            stopService(new Intent(this, AutomationService.class));
-        } catch (Exception ignored) {}
+    // ==================================================================
+    // Bekar (dead) profile: 2 alag accounts se "unavailable" aaye to dead mano
+    // ==================================================================
+    private void noteUnavailable(Slot s) {
+        HashSet<String> v = unavailVotes.get(s.key);
+        if (v == null) {
+            v = new HashSet<String>();
+            unavailVotes.put(s.key, v);
+        }
+        v.add(s.uid);
+        if (v.size() >= 2) {
+            deadMap.put(s.key, System.currentTimeMillis());
+            saveMap("dead_map", deadMap, DEAD_TTL_MS, 1500);
+            reportDead(s.taskType, s.target, "unavailable", s.mediaId);
+            unavailVotes.remove(s.key);
+        }
     }
 
-    // Battery optimization se app ko bahar karne ka system popup (sirf ek baar poochta hai)
-    private void requestBatteryExemptionOnce() {
+    private static String jsq(String x) {
+        return x == null ? "" : x.replace("\\", "\\\\").replace("'", "\\'");
+    }
+
+    // Website ko batao: window.onProfileDead(target, type, reason, mediaId) -> server isse dead table me daale
+    private void reportDead(String type, String target, String reason, String mediaId) {
+        if (mainWebView == null) return;
+        mainWebView.evaluateJavascript(
+                "if(window.onProfileDead) window.onProfileDead('" + jsq(target) + "', '" + jsq(type)
+                        + "', '" + jsq(reason) + "', '" + jsq(mediaId) + "');", null);
+    }
+
+    // ==================================================================
+    // Phone me save hone wali chhoti memory (done / dead)
+    // ==================================================================
+    private void loadMap(String pref, Map<String, Long> m) {
         try {
-            if (Build.VERSION.SDK_INT < 23 || prefs == null) return;
-            if (prefs.getBoolean("battery_asked", false)) return;
-            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
-                prefs.edit().putBoolean("battery_asked", true).apply();
-                Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                i.setData(Uri.parse("package:" + getPackageName()));
-                startActivity(i);
+            Set<String> set = prefs.getStringSet(pref, null);
+            if (set == null) return;
+            for (String e : set) {
+                int i = e.lastIndexOf('\t');
+                if (i < 1) continue;
+                try { m.put(e.substring(0, i), Long.parseLong(e.substring(i + 1))); } catch (Exception ignored) {}
             }
         } catch (Exception ignored) {}
     }
 
-    // Instagram page se sirf username lene ke liye (nonce ke bina kaam nahi karta)
-    public class IgProbeInterface {
-        @JavascriptInterface
-        public void onIgInfo(final String nonce, final String username) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (captureBusy && nonce != null && nonce.equals(captureNonce)) {
-                        finishCapture(username);
-                    }
-                }
-            });
-        }
-    }
-
-    public class WorkerAppInterface {
-        // Script ne follow/like kar diya (API ya click), ye yaad rakhne ke liye
-        @JavascriptInterface
-        public void onActed() {
-            workerActed = true;
-        }
-
-        @JavascriptInterface
-        public void onTaskResult(final boolean success, final String message) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    // FIX: fail aaye to pehle retry, tabhi result bhejo jab retry khatam ho
-                    if (!success && workerShouldRetry(message)) {
-                        retryWorker();
-                        return;
-                    }
-                    String m2 = message;
-                    if (success && workerActed) {
-                        // Hamne khud follow/like kiya, to "Already" nahi "Successfully" bhejo (coin ke liye)
-                        if ("Already Following".equals(m2)) m2 = "Followed Successfully";
-                        else if ("Already Liked".equals(m2)) m2 = "Post Liked Successfully";
-                    }
-                    deliverResult(success, m2);
-                }
-            });
-        }
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        // Background me jaane par bhi WebView ke JS timers chalte rahein
-        if (automationOn) {
-            try { mainWebView.resumeTimers(); } catch (Exception ignored) {}
-        }
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        try { mainWebView.resumeTimers(); } catch (Exception ignored) {}
-    }
-
-    @Override
-    public void onBackPressed() {
-        if (mainWebView.canGoBack()) {
-            mainWebView.goBack();
-        } else {
-            super.onBackPressed();
-        }
-    }
-
-    @Override
-    protected void onDestroy() {
-        automationOn = false;
-        try { stopService(new Intent(this, AutomationService.class)); } catch (Exception ignored) {}
-        uiHandler.removeCallbacksAndMessages(null);
-        if (wakeLock != null && wakeLock.isHeld()) {
-            wakeLock.release();
-        }
-        super.onDestroy();
-    }
-}
+    private void saveMap(String pref, Map<String, Long> m, long ttl, int cap) {
+        try {
+            long now = System.currentTimeMillis();
+            java.util.Iterator<Map.Entry<String, Long>> it = m.entrySet().iterator();
+            while (it.hasNext()) {
+                if (now - it.next().getValue() > ttl) it
