@@ -2075,4 +2075,410 @@ public class MainActivity extends Activity {
             long now = System.currentTimeMillis();
             java.util.Iterator<Map.Entry<String, Long>> it = m.entrySet().iterator();
             while (it.hasNext()) {
-                if (now - it.next().getValue() > ttl) it
+                if (now - it.next().getValue() > ttl) it.remove();
+            }
+            while (m.size() > cap) {
+                String oldest = null;
+                long ot = Long.MAX_VALUE;
+                for (Map.Entry<String, Long> e : m.entrySet()) {
+                    if (e.getValue() < ot) { ot = e.getValue(); oldest = e.getKey(); }
+                }
+                if (oldest == null) break;
+                m.remove(oldest);
+            }
+            Set<String> out = new HashSet<String>();
+            for (Map.Entry<String, Long> e : m.entrySet()) out.add(e.getKey() + "\t" + e.getValue());
+            prefs.edit().putStringSet(pref, out).apply();
+        } catch (Exception ignored) {}
+    }
+
+    // ==================================================================
+    // FAST FOLLOW JS: profile page ke bina seedha API (info -> follow)
+    // Kuch bhi ajeeb ho to 'FASTFALLBACK' bhejta hai, Java purana page-load tarika chalata hai
+    // ==================================================================
+    private static String buildFastFollowJs(String name, String knownId) {
+        return js(
+            "(function() {",
+            "  var U = '" + name + "', KID = '" + knownId + "';",
+            "  if (window.__ufFastBusy && Date.now() - window.__ufFastBusy < 25000) return;",
+            "  window.__ufFastBusy = Date.now();",
+            "  var fin = false;",
+            "  function done(ok, msg) { if (fin) return; fin = true; window.__ufFastBusy = 0; try { window.WorkerBridge.onTaskResult(ok, msg); } catch (e) {} }",
+            "  function cookie(n) {",
+            "    var c = (document.cookie || '').split(';');",
+            "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(n + '=') === 0) return p.substring(n.length + 1); }",
+            "    return '';",
+            "  }",
+            "  var csrf = cookie('csrftoken');",
+            "  if (!csrf || !U) { done(false, 'FASTFALLBACK'); return; }",
+            "  var H = { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest' };",
+            "  function low(t) { return (t || '').toLowerCase().split(' ').join(''); }",
+            // profile info response (bio me 'challenge' jaisa word ho sakta hai, isliye sirf pakke signals)
+            "  function badInfo(x) {",
+            "    var l = low(x.t);",
+            "    if (x.s === 401 || l.indexOf('login_required') > -1 || l.indexOf('require_login') > -1) return 'Session expired';",
+            "    if (l.indexOf('checkpoint_required') > -1) return 'Blocked: Challenge / Checkpoint';",
+            "    if (x.s === 429) return 'Blocked: Action Limit / Challenge';",
+            "    return null;",
+            "  }",
+            // follow API response
+            "  function badAct(x) {",
+            "    var l = low(x.t);",
+            "    if (x.s === 401 || l.indexOf('login_required') > -1) return 'Session expired';",
+            "    if (l.indexOf('checkpoint') > -1 || l.indexOf('challenge') > -1) return 'Blocked: Challenge / Checkpoint';",
+            "    if (l.indexOf('feedback_required') > -1 || x.s === 429 || l.indexOf('\"spam\":true') > -1 || l.indexOf('trylater') > -1) return 'Blocked: Action Limit / Challenge';",
+            "    return null;",
+            "  }",
+            "  function req(url, opt) { return fetch(url, opt).then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); }); }",
+            "  function doFollow(id) {",
+            "    try { window.WorkerBridge.onActed(); } catch (e) {}",
+            "    var h2 = { 'x-csrftoken': csrf, 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'content-type': 'application/x-www-form-urlencoded' };",
+            "    return req('/api/v1/friendships/create/' + id + '/', { method: 'POST', credentials: 'include', headers: h2, body: '' })",
+            "    .then(function(x) {",
+            "      var b = badAct(x); if (b) { done(false, b); return; }",
+            "      if (x.s === 200 && low(x.t).indexOf('\"status\":\"ok\"') > -1) { done(true, 'Followed Successfully'); return; }",
+            "      done(false, 'FASTFALLBACK');",
+            "    });",
+            "  }",
+            "  var run = KID ? doFollow(KID) : req('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: H })",
+            "    .then(function(x) {",
+            "      var b = badInfo(x); if (b) { done(false, b); return; }",
+            "      var d = null; try { d = JSON.parse(x.t); } catch (e) {}",
+            "      var u = d && d.data && d.data.user;",
+            "      if (!u || !u.id) { done(false, 'FASTFALLBACK'); return; }",
+            "      if (u.followed_by_viewer || u.requested_by_viewer) { done(true, 'Already Following'); return; }",
+            "      return doFollow(u.id);",
+            "    });",
+            "  run.catch(function() { done(false, 'FASTFALLBACK'); });",
+            "  setTimeout(function() { done(false, 'FASTFALLBACK'); }, 18000);",
+            "})();"
+        );
+    }
+
+    // PREFETCH JS: sirf info nikalta hai (follow nahi karta)
+    private static String buildPrefetchJs(String name) {
+        return js(
+            "(function() {",
+            "  var U = '" + name + "';",
+            "  var fin = false;",
+            "  function out(st, id) { if (fin) return; fin = true; try { window.WorkerBridge.onPrefetch(U, st, id || ''); } catch (e) {} }",
+            "  fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest' } })",
+            "  .then(function(r) { return r.text(); })",
+            "  .then(function(t) {",
+            "    var d = null; try { d = JSON.parse(t); } catch (e) {}",
+            "    var u = d && d.data && d.data.user;",
+            "    if (!u || !u.id) { out('error', ''); return; }",
+            "    if (u.followed_by_viewer || u.requested_by_viewer) { out('already', u.id); return; }",
+            "    out('ok', u.id);",
+            "  }).catch(function() { out('error', ''); });",
+            "  setTimeout(function() { out('error', ''); }, 12000);",
+            "})();"
+        );
+    }
+
+    public class SlotBridge {
+        private final Slot s;
+        SlotBridge(Slot s) { this.s = s; }
+
+        // Script ne follow/like kar diya (API ya click)
+        @JavascriptInterface
+        public void onActed() {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (s.active) s.acted = true;
+                }
+            });
+        }
+
+        // Prefetch ka jawab: status = ok | already | error
+        @JavascriptInterface
+        public void onPrefetch(final String target, final String status, final String id) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    s.prefetchUntil = 0;
+                    if ("ok".equals(status) || "already".equals(status)) {
+                        PInfo c = new PInfo();
+                        c.st = status;
+                        c.id = id == null ? "" : id;
+                        c.at = System.currentTimeMillis();
+                        prefetchCache.put(s.uid + "|" + cleanName(target).toLowerCase(), c);
+                        // 'already' mila to us task ko turant skip karo
+                        pumpQueue();
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onTaskResult(final boolean success, final String message) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!s.active) return; // purane/band task ka result ignore
+                    // Fast raasta fail: purana page-load tarika (ye retry nahi gina jata)
+                    if ("FASTFALLBACK".equals(message)) {
+                        if (s.mode.startsWith("fast")) fallbackToPage(s);
+                        return;
+                    }
+                    if (!success && shouldRetry(s, message)) {
+                        if (s.mode.startsWith("fast")) fallbackToPage(s);
+                        else retrySlot(s);
+                        return;
+                    }
+                    String m2 = message;
+                    if (success && s.acted) {
+                        // Hamne khud follow/like kiya, to "Already" nahi "Successfully" bhejo (coin ke liye)
+                        if ("Already Following".equals(m2)) m2 = "Followed Successfully";
+                        else if ("Already Liked".equals(m2)) m2 = "Post Liked Successfully";
+                    }
+                    s.scriptDone = true;
+                    finishSlot(s, success, m2);
+                }
+            });
+        }
+    }
+
+    private class SlotClient extends WebViewClient {
+        private final Slot s;
+        SlotClient(Slot s) { this.s = s; }
+
+        @Override
+        public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+            WebResourceResponse blocked = blockHeavy(request);
+            return blocked != null ? blocked : super.shouldInterceptRequest(view, request);
+        }
+
+        @Override
+        public void onPageFinished(final WebView view, String url) {
+            super.onPageFinished(view, url);
+            if (url == null || url.startsWith("about:")) return;
+
+            String path = "";
+            try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
+
+            boolean igOk = url.startsWith(IG_URL)
+                    && !(path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")
+                    || path.startsWith("/challenge") || path.startsWith("/checkpoint")
+                    || path.startsWith("/auth_platform") || path.startsWith("/accounts/suspended")
+                    || path.startsWith("/accounts/disabled"));
+            s.fastReady = igOk;
+
+            if (!s.active) {
+                // Khali (warm) WebView ready ho gaya: ab agle task ki info pehle se nikalo
+                if (igOk) {
+                    uiHandler.post(new Runnable() {
+                        @Override
+                        public void run() { prefetchNext(); }
+                    });
+                }
+                return;
+            }
+
+            if (path.startsWith("/accounts/suspended")) { finishSlot(s, false, "Suspended: Instagram suspended this account"); return; }
+            if (path.startsWith("/accounts/disabled")) { finishSlot(s, false, "Disabled: Instagram disabled this account"); return; }
+            if (path.startsWith("/challenge") || path.startsWith("/checkpoint") || path.startsWith("/auth_platform")) { finishSlot(s, false, "Blocked: Challenge / Checkpoint"); return; }
+            if (path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")) { finishSlot(s, false, "Session expired"); return; }
+
+            if ("fast".equals(s.mode)) return;
+            if ("fast-wait".equals(s.mode)) {
+                s.mode = "fast";
+                final int sq = s.seq;
+                uiHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (s.active && s.seq == sq && "fast".equals(s.mode)) runFast(s);
+                    }
+                }, 300);
+                return;
+            }
+
+            uiHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (!s.active) return;
+                    if ("like".equalsIgnoreCase(s.taskType)) {
+                        injectLikeScript(view);
+                    } else {
+                        injectFollowScript(view);
+                    }
+                }
+            }, 400);
+        }
+
+        @Override
+        public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+            super.onReceivedError(view, request, error);
+            if (s.active && request != null && request.isForMainFrame()) {
+                if (shouldRetry(s, "page error")) {
+                    retrySlot(s);
+                } else {
+                    finishSlot(s, false, "Page error");
+                }
+            }
+        }
+    }
+
+    // ==================================================================
+    // SPEED: hidden browsers me photos / videos / fonts load nahi hote
+    // (follow/like ko sirf buttons chahiye) -> page 2-3 guna jaldi khulta hai
+    // ==================================================================
+    private WebResourceResponse blockHeavy(WebResourceRequest request) {
+        try {
+            if (request == null || request.getUrl() == null || request.isForMainFrame()) return null;
+            String p = String.valueOf(request.getUrl().getPath()).toLowerCase();
+            if (p.endsWith(".jpg") || p.endsWith(".jpeg") || p.endsWith(".png") || p.endsWith(".webp")
+                    || p.endsWith(".gif") || p.endsWith(".mp4") || p.endsWith(".m4s") || p.endsWith(".webm")
+                    || p.endsWith(".woff") || p.endsWith(".woff2") || p.endsWith(".ttf")) {
+                return new WebResourceResponse("text/plain", "UTF-8", new ByteArrayInputStream(new byte[0]));
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    // ==================================================================
+    // BACKGROUND FIX: app background me jaaye tab bhi automation na ruke
+    // 1) Foreground service (notification ke saath) -> Android process ko kill/sula nahi karta
+    // 2) Heartbeat -> background me WebView ke JS timers slow ho jaate hain, isliye
+    //    native side se har 1.5 sec page ko "tick" bheja jaata hai
+    // 3) onPause me timers dobara resume
+    // ==================================================================
+    private boolean automationOn = false;
+    private static final String POKE_JS =
+            "(function(){try{if(window.__ufTick&&window.__ufRunning&&Date.now()-(window.__ufLast||0)>1200){window.__ufTick();}}catch(e){}})();";
+
+    private final Runnable heartbeat = new Runnable() {
+        @Override
+        public void run() {
+            if (!automationOn) return;
+            try {
+                mainWebView.resumeTimers();
+                // Website chahe to is function me apna loop dobara jaga sakti hai
+                mainWebView.evaluateJavascript("if(window.onNativeHeartbeat) window.onNativeHeartbeat();", null);
+                if (taskActive) workerWebView.evaluateJavascript(POKE_JS, null);
+                for (Slot sl : new ArrayList<Slot>(slots.values())) {
+                    if (sl.active && sl.wv != null) sl.wv.evaluateJavascript(POKE_JS, null);
+                }
+            } catch (Exception ignored) {}
+            uiHandler.postDelayed(this, 1500);
+        }
+    };
+
+    private void startAutomationBackground() {
+        automationOn = true;
+        uiHandler.removeCallbacks(heartbeat);
+        uiHandler.postDelayed(heartbeat, 1500);
+        try {
+            Intent svc = new Intent(this, AutomationService.class);
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(svc);
+            } else {
+                startService(svc);
+            }
+        } catch (Exception ignored) {}
+        requestBatteryExemptionOnce();
+    }
+
+    private void stopAutomationBackground() {
+        automationOn = false;
+        uiHandler.removeCallbacks(heartbeat);
+        try {
+            stopService(new Intent(this, AutomationService.class));
+        } catch (Exception ignored) {}
+    }
+
+    // Battery optimization se app ko bahar karne ka system popup (sirf ek baar poochta hai)
+    private void requestBatteryExemptionOnce() {
+        try {
+            if (Build.VERSION.SDK_INT < 23 || prefs == null) return;
+            if (prefs.getBoolean("battery_asked", false)) return;
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                prefs.edit().putBoolean("battery_asked", true).apply();
+                Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                i.setData(Uri.parse("package:" + getPackageName()));
+                startActivity(i);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    // Instagram page se sirf username lene ke liye (nonce ke bina kaam nahi karta)
+    public class IgProbeInterface {
+        @JavascriptInterface
+        public void onIgInfo(final String nonce, final String username) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (captureBusy && nonce != null && nonce.equals(captureNonce)) {
+                        finishCapture(username);
+                    }
+                }
+            });
+        }
+    }
+
+    public class WorkerAppInterface {
+        // Script ne follow/like kar diya (API ya click), ye yaad rakhne ke liye
+        @JavascriptInterface
+        public void onActed() {
+            workerActed = true;
+        }
+
+        @JavascriptInterface
+        public void onTaskResult(final boolean success, final String message) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    // FIX: fail aaye to pehle retry, tabhi result bhejo jab retry khatam ho
+                    if (!success && workerShouldRetry(message)) {
+                        retryWorker();
+                        return;
+                    }
+                    String m2 = message;
+                    if (success && workerActed) {
+                        // Hamne khud follow/like kiya, to "Already" nahi "Successfully" bhejo (coin ke liye)
+                        if ("Already Following".equals(m2)) m2 = "Followed Successfully";
+                        else if ("Already Liked".equals(m2)) m2 = "Post Liked Successfully";
+                    }
+                    deliverResult(success, m2);
+                }
+            });
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // Background me jaane par bhi WebView ke JS timers chalte rahein
+        if (automationOn) {
+            try { mainWebView.resumeTimers(); } catch (Exception ignored) {}
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        try { mainWebView.resumeTimers(); } catch (Exception ignored) {}
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (mainWebView.canGoBack()) {
+            mainWebView.goBack();
+        } else {
+            super.onBackPressed();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        automationOn = false;
+        try { stopService(new Intent(this, AutomationService.class)); } catch (Exception ignored) {}
+        uiHandler.removeCallbacksAndMessages(null);
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+        }
+        super.onDestroy();
+    }
+}
