@@ -22,6 +22,7 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.ValueCallback;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -68,7 +69,8 @@ public class MainActivity extends Activity {
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
     private static final int NOTIFICATION_ID = 1001;
-    private static final long TASK_TIMEOUT_MS = 40000L;
+    // FIX: pehle 40 sec tha, jisse page dheere khulne par task jaldi fail ho jata tha
+    private static final long TASK_TIMEOUT_MS = 90000L;
 
     private NotificationManager notificationManager;
     private PowerManager.WakeLock wakeLock;
@@ -82,6 +84,9 @@ public class MainActivity extends Activity {
     private String currentTaskType = "follow";
     private boolean taskActive = false;
     private boolean workerActed = false; // is task me hamne khud follow/like kiya ya nahi
+    // FIX: single-worker mode me bhi retry (jab tak task poora na ho, aage mat jao)
+    private int workerRetries = 0;
+    private long workerStartedAt = 0;
 
     // Instagram login capture state
     private boolean captureBusy = false;
@@ -203,14 +208,9 @@ public class MainActivity extends Activity {
                 super.onPageFinished(view, url);
                 if (url != null) mainUrl = url;
                 checkInstagramLogin(url);
-                // NAYA: Auto-run ON ho to dashboard load hote hi website ko start karne ka signal
+                // FIX: Auto-run ON ho to website ka JS ready hone tak baar baar try karo
                 if (url != null && url.startsWith(HOSTING_BASE) && prefs != null && prefs.getBoolean("auto_run", false)) {
-                    uiHandler.postDelayed(new Runnable() {
-                        @Override
-                        public void run() {
-                            mainWebView.evaluateJavascript("if(window.onAppAutoStart) window.onAppAutoStart();", null);
-                        }
-                    }, 1500);
+                    tryAutoStart(0);
                 }
             }
         });
@@ -226,7 +226,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(final WebView view, String url) {
                 super.onPageFinished(view, url);
-                if (!taskActive || url == null) return;
+                if (!taskActive || url == null || url.startsWith("about:")) return;
 
                 String path = "";
                 try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
@@ -264,14 +264,40 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 super.onReceivedError(view, request, error);
-                if (request != null && request.isForMainFrame()) {
-                    deliverResult(false, "Page error");
+                if (taskActive && request != null && request.isForMainFrame()) {
+                    // FIX: page error par seedha fail nahi, pehle retry
+                    if (workerShouldRetry("page error")) {
+                        retryWorker();
+                    } else {
+                        deliverResult(false, "Page error");
+                    }
                 }
             }
         });
 
         // App start: hamesha dashboard (server decide karta hai: dashboard / saved accounts / login)
         mainWebView.loadUrl(HOSTING_DASHBOARD + "?dk=" + deviceKey);
+    }
+
+    // FIX: App khulte hi auto task. Website ka JS load hone tak (max ~20 sec) baar baar check karta hai
+    private void tryAutoStart(final int attempt) {
+        if (attempt > 20) return;
+        uiHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (mainWebView == null) return;
+                mainWebView.evaluateJavascript(
+                    "(function(){if(window.__autoStarted)return 'done';"
+                    + "if(typeof window.onAppAutoStart==='function'){window.__autoStarted=true;window.onAppAutoStart();return 'done';}"
+                    + "return 'wait';})()",
+                    new ValueCallback<String>() {
+                        @Override
+                        public void onReceiveValue(String v) {
+                            if (v != null && v.contains("wait")) tryAutoStart(attempt + 1);
+                        }
+                    });
+            }
+        }, attempt == 0 ? 1500 : 1000);
     }
 
     // Normal WebView (Instagram wale): bina secret key ke user agent
@@ -478,6 +504,31 @@ public class MainActivity extends Activity {
                 "if(window.onWorkerResult) window.onWorkerResult(" + success + ", '" + safe + "');", null);
     }
 
+    // FIX: single-worker mode retry (jab tak task poora na ho ya sach me error na ho, aage mat jao)
+    private boolean workerShouldRetry(String msg) {
+        if (!taskActive || workerRetries >= 2) return false;
+        if (System.currentTimeMillis() - workerStartedAt > 70000) return false;
+        String m = msg == null ? "" : msg.toLowerCase();
+        return m.contains("not found") || m.contains("did not register")
+                || m.contains("page error") || m.contains("js error")
+                || m.contains("unavailable");
+    }
+
+    private void retryWorker() {
+        workerRetries++;
+        uiHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!taskActive) return;
+                try {
+                    workerWebView.reload();
+                } catch (Exception e) {
+                    deliverResult(false, "Page error");
+                }
+            }
+        }, 3000);
+    }
+
     private static String js(String... lines) {
         StringBuilder sb = new StringBuilder();
         for (String l : lines) sb.append(l).append('\n');
@@ -486,6 +537,8 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------
     // Shared JS helpers (fatal state detection, popups)
+    // FIX: fatal() ab poore page ka text nahi padhta (bio me "try again later" se false block hota tha)
+    // FIX: gone() ab 8 sec tak lagatar "not available" dikhe tabhi maanta hai
     // ------------------------------------------------------------------
     private static final String JS_HEAD = js(
         "(function() {",
@@ -509,15 +562,22 @@ public class MainActivity extends Activity {
         "    if (p.indexOf('/challenge') === 0 || p.indexOf('/checkpoint') === 0 || p.indexOf('/auth_platform') === 0) return 'Blocked: Challenge / Checkpoint';",
         "    if (p.indexOf('/accounts/login') === 0 || p.indexOf('/accounts/emailsignup') === 0) return 'Session expired';",
         "    if (document.querySelector('input[name=password]')) return 'Session expired';",
-        "    var t = bodyText();",
+        "    var hasHdr = !!document.querySelector('header');",
+        "    var t = hasHdr ? '' : bodyText();",
         "    if (t.indexOf('account has been disabled') > -1 || t.indexOf('account was disabled') > -1) return 'Disabled: Instagram disabled this account';",
         "    if (t.indexOf('account has been suspended') > -1 || t.indexOf('suspended your account') > -1 || t.indexOf('account is suspended') > -1) return 'Suspended: Instagram suspended this account';",
-        "    if (t.indexOf('action blocked') > -1 || t.indexOf('confirm you') > -1 || t.indexOf('try again later') > -1 || t.indexOf('we restrict certain activity') > -1) return 'Blocked: Action Limit / Challenge';",
+        "    var dlg = document.querySelector('div[role=dialog]');",
+        "    var dt = dlg ? (dlg.innerText || '').toLowerCase() : '';",
+        "    if (dt.indexOf('action blocked') > -1 || dt.indexOf('try again later') > -1 || dt.indexOf('we restrict certain activity') > -1) return 'Blocked: Action Limit / Challenge';",
         "    return null;",
         "  }",
+        "  var goneSince = 0;",
         "  function gone() {",
         "    var t = bodyText();",
-        "    return (t.indexOf('page isn') > -1 && t.indexOf('available') > -1) || t.indexOf('content isn') > -1 && t.indexOf('available') > -1;",
+        "    var m = (t.indexOf('page isn') > -1 && t.indexOf('available') > -1) || (t.indexOf('content isn') > -1 && t.indexOf('available') > -1);",
+        "    if (!m || document.querySelector('header')) { goneSince = 0; return false; }",
+        "    if (!goneSince) goneSince = Date.now();",
+        "    return Date.now() - goneSince > 8000;",
         "  }",
         "  function dismiss() {",
         "    var w = ['not now', 'allow all cookies', 'allow essential and optional cookies', 'accept all'];",
@@ -527,6 +587,7 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------
     // FOLLOW SCRIPT
+    // FIX: fail bhejne se pehle API se verify (follow sach me hua ho to coin milega)
     // ------------------------------------------------------------------
     private void injectFollowScript(WebView view) {
         String script = JS_HEAD + js(
@@ -544,7 +605,21 @@ public class MainActivity extends Activity {
             "    return '';",
             "  }",
             "  function who() { return (location.pathname || '').split('/').filter(function(x) { return x; })[0] || ''; }",
-            "  function acted() { try { window.WorkerBridge.onActed(); } catch (e) {} }",
+            "  var didAct = false, softBusy = false;",
+            "  function acted() { didAct = true; try { window.WorkerBridge.onActed(); } catch (e) {} }",
+            "  function softFail(msg) {",
+            "    if (softBusy) return; softBusy = true;",
+            "    var name = who();",
+            "    if (!name) { finish(false, msg); return; }",
+            "    fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(name), { credentials: 'include', headers: { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest' } })",
+            "    .then(function(r) { return r.text(); })",
+            "    .then(function(t) {",
+            "      var d = null; try { d = JSON.parse(t); } catch (e) {}",
+            "      var u = d && d.data && d.data.user;",
+            "      if (u && (u.followed_by_viewer || u.requested_by_viewer)) finish(true, didAct ? 'Followed Successfully' : 'Already Following');",
+            "      else finish(false, msg);",
+            "    }).catch(function() { finish(false, msg); });",
+            "  }",
             // ---- Tez raasta: seedha API. Fail ho to neeche purana button-click chalega ----
             "  function apiFollow() {",
             "    apiTried = true;",
@@ -597,21 +672,21 @@ public class MainActivity extends Activity {
             "      dismiss();",
             "      if (apiBusy) { if (Date.now() - apiAt > 12000) { apiBusy = false; } else { return; } }",
             "      if (!apiTried && !clicked) { apiFollow(); if (apiBusy) return; }",
-            // 'unavailable' tabhi jab API bhi kaam na kare aur page 1 sec baad bhi 'not available' dikhaye
-            "      if (tries >= 3 && !clicked && gone()) { finish(false, 'Profile unavailable'); return; }",
+            // 'unavailable' tabhi jab API bhi kaam na kare aur page 8 sec tak lagatar 'not available' dikhaye
+            "      if (tries >= 3 && !clicked && gone()) { softFail('Profile unavailable'); return; }",
             "      var scope = (tries > 16) ? document : (document.querySelector('header') || document.querySelector('main') || document);",
             "      var list = btns(scope);",
             "      if (clicked) {",
             "        if (find(list, DONE)) { finish(true, 'Followed Successfully'); return; }",
             "        var waited = Date.now() - clickedAt;",
-            "        if (waited > 15000) { finish(false, 'Click did not register'); return; }",
+            "        if (waited > 20000) { softFail('Click did not register'); return; }",
             "        if (waited > 5000 && Date.now() - verifyAt > 3000) { verifyFollow(); }",
             "        return;",
             "      }",
             "      if (find(list, DONE)) { finish(true, 'Already Following'); return; }",
             "      var fb = find(list, FOLLOW);",
             "      if (fb) { acted(); fb.click(); clicked = true; clickedAt = Date.now(); return; }",
-            "      if (tries >= 80) { finish(false, 'Follow button not found'); }",
+            "      if (tries >= 180) { softFail('Follow button not found'); }",
             "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
             "  }",
             "  window.__ufTick = tick;",
@@ -688,7 +763,7 @@ public class MainActivity extends Activity {
             "      if (tries >= 3 && !clicked && gone()) { finish(false, 'Post unavailable'); return; }",
             "      if (clicked) {",
             "        var waited = Date.now() - clickedAt;",
-            "        if (waited > 15000) { finish(false, 'Like did not register'); return; }",
+            "        if (waited > 20000) { finish(false, 'Like did not register'); return; }",
             "        if (waited > 6000 && !apiTried) { callApi(); }",
             "        return;",
             "      }",
@@ -697,7 +772,7 @@ public class MainActivity extends Activity {
             "        var b = lk.closest('button, [role=button]') || lk.parentElement;",
             "        acted(); b.click(); clicked = true; clickedAt = Date.now(); return;",
             "      }",
-            "      if (tries >= 80) { finish(false, 'Like button not found'); }",
+            "      if (tries >= 180) { finish(false, 'Like button not found'); }",
             "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
             "  }",
             "  window.__ufTick = tick;",
@@ -1152,6 +1227,8 @@ public class MainActivity extends Activity {
                         return;
                     }
                     workerActed = false;
+                    workerRetries = 0;
+                    workerStartedAt = System.currentTimeMillis();
                     currentTaskType = taskType;
                     taskActive = true;
                     uiHandler.removeCallbacks(taskTimeout);
@@ -1361,8 +1438,8 @@ public class MainActivity extends Activity {
     // Ek account ke itne tasks ek hi WebView me lagatar (tez, bar bar account switch nahi)
     private static final int STICKY_BATCH = 5;
     private int stickyCount = 0;
-    // Parallel task ko poora samay (retry samet)
-    private static final long SLOT_TASK_TIMEOUT_MS = 40000L;
+    // FIX: Parallel task ko poora samay (retry samet). Pehle 40 sec tha.
+    private static final long SLOT_TASK_TIMEOUT_MS = 120000L;
 
     private class Slot {
         String uid = "";
@@ -1428,6 +1505,8 @@ public class MainActivity extends Activity {
         });
     }
 
+    // FIX: activeSlots >= maxParallel hone par kabhi naya account start nahi hota.
+    // Jab tak current task poora na ho (success ya sach ka error), next account nahi khulta.
     private void pumpQueue() {
         if (pendingTasks.isEmpty() || activeSlots >= maxParallel) return;
 
@@ -1542,6 +1621,7 @@ public class MainActivity extends Activity {
         if (s == null || !s.active) return;
         s.active = false;
         activeSlots--;
+        if (activeSlots < 0) activeSlots = 0;
         if (s.timeout != null) uiHandler.removeCallbacks(s.timeout);
         sendParallelResult(s.uid, s.target, ok, msg);
         // WebView zinda rakho (agla task isi account ka ho to tez chalega), bas purana page/JS band karo
@@ -1635,22 +1715,30 @@ public class MainActivity extends Activity {
         cm.flush();
     }
 
-    // 'button not found' / page error par ek baar page reload karke dobara try
+    // FIX: 'not found' / 'unavailable' / page error par 2 baar page reload karke dobara try
     private boolean shouldRetry(Slot s, String msg) {
-        if (s == null || !s.active || s.retries >= 1) return false;
-        if (System.currentTimeMillis() - s.startedAt > 22000) return false; // retry ke liye samay bacha ho
+        if (s == null || !s.active || s.retries >= 2) return false;
+        if (System.currentTimeMillis() - s.startedAt > 80000) return false; // retry ke liye samay bacha ho
         String m = msg == null ? "" : msg.toLowerCase();
         return m.contains("not found") || m.contains("did not register")
-                || m.contains("page error") || m.contains("js error");
+                || m.contains("page error") || m.contains("js error")
+                || m.contains("unavailable");
     }
 
-    private void retrySlot(Slot s) {
+    // FIX: reload se pehle 3 sec ruko taaki Instagram ko saans mile
+    private void retrySlot(final Slot s) {
         s.retries++;
-        try {
-            s.wv.reload();
-        } catch (Exception e) {
-            finishSlot(s, false, "Page error");
-        }
+        uiHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!s.active) return;
+                try {
+                    s.wv.reload();
+                } catch (Exception e) {
+                    finishSlot(s, false, "Page error");
+                }
+            }
+        }, 3000);
     }
 
     public class SlotBridge {
@@ -1849,6 +1937,11 @@ public class MainActivity extends Activity {
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
+                    // FIX: fail aaye to pehle retry, tabhi result bhejo jab retry khatam ho
+                    if (!success && workerShouldRetry(message)) {
+                        retryWorker();
+                        return;
+                    }
                     String m2 = message;
                     if (success && workerActed) {
                         // Hamne khud follow/like kiya, to "Already" nahi "Successfully" bhejo (coin ke liye)
