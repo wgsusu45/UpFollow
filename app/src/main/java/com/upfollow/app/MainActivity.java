@@ -7,6 +7,8 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.app.PendingIntent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.net.Uri;
@@ -22,6 +24,7 @@ import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -31,8 +34,10 @@ import org.json.JSONObject;
 
 
 import java.net.URLEncoder;
+import java.io.ByteArrayInputStream;
 import java.security.MessageDigest;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -44,7 +49,7 @@ import androidx.webkit.WebViewFeature;
 public class MainActivity extends Activity {
     private static final String APP_SECRET_KEY = "brohu2580";
     // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
-    private static final int APP_VERSION_CODE = 2;
+    private static final int APP_VERSION_CODE = 3;
     // Secret + version wala user agent: SIRF apni website (mainWebView) ke liye
     private static final String USER_AGENT_APP = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
     private WebView mainWebView;
@@ -69,6 +74,8 @@ public class MainActivity extends Activity {
 
     private volatile String mainUrl = "";
     private String deviceKey = "";
+    // NAYA: chhoti settings yaad rakhne ke liye (auto-run ON/OFF, battery prompt)
+    private SharedPreferences prefs;
 
     private String currentTaskType = "follow";
     private boolean taskActive = false;
@@ -93,6 +100,7 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        prefs = getSharedPreferences("upfollow_prefs", MODE_PRIVATE);
         deviceKey = computeDeviceKey();
 
         try {
@@ -116,6 +124,8 @@ public class MainActivity extends Activity {
         // Worker WebView: full-size, main WebView ke neeche chhupa hua
         workerWebView = new WebView(this);
         setupWebView(workerWebView);
+        // NAYA: hidden browser me photos/videos load nahi honge -> page jaldi khulega
+        workerWebView.getSettings().setBlockNetworkImage(true);
         workerWebView.setLayoutParams(new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         workerWebView.setAlpha(0.01f);
@@ -182,11 +192,26 @@ public class MainActivity extends Activity {
                 super.onPageFinished(view, url);
                 if (url != null) mainUrl = url;
                 checkInstagramLogin(url);
+                // NAYA: Auto-run ON ho to dashboard load hote hi website ko start karne ka signal
+                if (url != null && url.startsWith(HOSTING_BASE) && prefs != null && prefs.getBoolean("auto_run", false)) {
+                    uiHandler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            mainWebView.evaluateJavascript("if(window.onAppAutoStart) window.onAppAutoStart();", null);
+                        }
+                    }, 1500);
+                }
             }
         });
 
         // ---------- Worker WebView client ----------
         workerWebView.setWebViewClient(new WebViewClient() {
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                WebResourceResponse blocked = blockHeavy(request);
+                return blocked != null ? blocked : super.shouldInterceptRequest(view, request);
+            }
+
             @Override
             public void onPageFinished(final WebView view, String url) {
                 super.onPageFinished(view, url);
@@ -222,7 +247,7 @@ public class MainActivity extends Activity {
                             injectFollowScript(view);
                         }
                     }
-                }, 1200);
+                }, 400);
             }
 
             @Override
@@ -281,7 +306,10 @@ public class MainActivity extends Activity {
             final String real = url.replace("&open_external=1", "").replace("?open_external=1", "");
             try {
                 Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(real));
-                i.setPackage("com.android.chrome");
+                // Telegram link ho to Chrome force mat karo, Telegram app seedha khulegi
+                if (!real.startsWith("https://t.me/") && !real.startsWith("tg://")) {
+                    i.setPackage("com.android.chrome");
+                }
                 startActivity(i);
             } catch (Exception e) {
                 try {
@@ -493,17 +521,56 @@ public class MainActivity extends Activity {
         String script = JS_HEAD + js(
             "  var FOLLOW = ['follow', 'follow back', '\u092b\u0949\u0932\u094b \u0915\u0930\u0947\u0902'];",
             "  var DONE = ['following', 'requested'];",
+            "  var apiTried = false, apiBusy = false, apiAt = 0;",
+            "  window.__ufLast = Date.now();",
             "  function find(list, words) {",
             "    for (var i = 0; i < list.length; i++) { if (words.indexOf(txt(list[i])) > -1) return list[i]; }",
             "    return null;",
             "  }",
+            "  function cookie(name) {",
+            "    var c = (document.cookie || '').split(';');",
+            "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(name + '=') === 0) return p.substring(name.length + 1); }",
+            "    return '';",
+            "  }",
+            // ---- Tez raasta: seedha API (page ke buttons ka wait nahi). Fail ho to neeche purana button-click chalega ----
+            "  function apiFollow() {",
+            "    apiTried = true;",
+            "    var name = (location.pathname || '').split('/').filter(function(x) { return x; })[0] || '';",
+            "    var csrf = cookie('csrftoken');",
+            "    if (!name || !csrf) return;",
+            "    apiBusy = true; apiAt = Date.now();",
+            "    var H = { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest' };",
+            "    fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(name), { credentials: 'include', headers: H })",
+            "    .then(function(r) { return r.text(); })",
+            "    .then(function(t) {",
+            "      var d = null; try { d = JSON.parse(t); } catch (e) {}",
+            "      var u = d && d.data && d.data.user;",
+            "      if (!u || !u.id) { apiBusy = false; return; }",
+            "      if (u.followed_by_viewer || u.requested_by_viewer) { finish(true, 'Already Following'); return; }",
+            "      var h2 = { 'x-csrftoken': csrf, 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'content-type': 'application/x-www-form-urlencoded' };",
+            "      return fetch('/api/v1/friendships/create/' + u.id + '/', { method: 'POST', credentials: 'include', headers: h2, body: '' })",
+            "      .then(function(r) { return r.text().then(function(t2) { return { s: r.status, t: t2 }; }); })",
+            "      .then(function(x) {",
+            "        apiBusy = false;",
+            "        var low = x.t.toLowerCase().split(' ').join('');",
+            "        if (x.s === 200 && low.indexOf('\"status\":\"ok\"') > -1) { finish(true, 'Followed Successfully'); return; }",
+            "        if (low.indexOf('checkpoint') > -1 || low.indexOf('challenge') > -1) { finish(false, 'Blocked: Challenge / Checkpoint'); return; }",
+            "        if (low.indexOf('login_required') > -1) { finish(false, 'Session expired'); return; }",
+            "        if (low.indexOf('feedback_required') > -1 || x.s === 429 || low.indexOf('\"spam\":true') > -1 || low.indexOf('trylater') > -1) { finish(false, 'Blocked: Action Limit / Challenge'); return; }",
+            "      });",
+            "    }).catch(function() { apiBusy = false; });",
+            "  }",
             "  function tick() {",
             "    try {",
+            "      if (finished) return;",
+            "      window.__ufLast = Date.now();",
             "      tries++;",
             "      var f = fatal(); if (f) { finish(false, f); return; }",
             "      if (gone()) { finish(false, 'Profile unavailable'); return; }",
             "      dismiss();",
-            "      var scope = (tries > 8) ? document : (document.querySelector('header') || document.querySelector('main') || document);",
+            "      if (apiBusy) { if (Date.now() - apiAt > 12000) { apiBusy = false; } else { return; } }",
+            "      if (!apiTried) { apiFollow(); if (apiBusy) return; }",
+            "      var scope = (tries > 16) ? document : (document.querySelector('header') || document.querySelector('main') || document);",
             "      var list = btns(scope);",
             "      if (clicked) {",
             "        if (find(list, DONE)) { finish(true, 'Followed Successfully'); return; }",
@@ -513,10 +580,11 @@ public class MainActivity extends Activity {
             "      if (find(list, DONE)) { finish(true, 'Already Following'); return; }",
             "      var fb = find(list, FOLLOW);",
             "      if (fb) { fb.click(); clicked = true; clickedAt = Date.now(); return; }",
-            "      if (tries >= 40) { finish(false, 'Follow button not found'); }",
+            "      if (tries >= 80) { finish(false, 'Follow button not found'); }",
             "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
             "  }",
-            "  timer = setInterval(tick, 700);",
+            "  window.__ufTick = tick;",
+            "  timer = setInterval(tick, 350);",
             "  tick();",
             "})();"
         );
@@ -524,13 +592,14 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // LIKE SCRIPT: pehle DOM button, na mile to Instagram web API (fallback)
+    // LIKE SCRIPT: pehle Instagram web API (tez), na chale to DOM button (fallback)
     // ------------------------------------------------------------------
     private void injectLikeScript(WebView view) {
         String script = JS_HEAD + js(
             "  var LIKE = ['like', '\u092a\u0938\u0902\u0926 \u0915\u0930\u0947\u0902', 'me gusta', 'curtir', 'mi piace', 'suka', 'gef\u00e4llt mir'];",
             "  var UNLIKE = ['unlike', '\u092a\u0938\u0902\u0926 \u0930\u0926\u094d\u0926 \u0915\u0930\u0947\u0902', 'ya no me gusta', 'descurtir', 'batal suka', 'gef\u00e4llt mir nicht mehr'];",
-            "  var apiTried = false, apiBusy = false;",
+            "  var apiTried = false, apiBusy = false, apiAt = 0;",
+            "  window.__ufLast = Date.now();",
             "  function byLabel(set) {",
             "    var els = document.querySelectorAll('svg[aria-label], [role=button][aria-label], button[aria-label]');",
             "    for (var i = 0; i < els.length; i++) {",
@@ -557,7 +626,7 @@ public class MainActivity extends Activity {
             "    var a = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';",
             "    var id = BigInt(0); sc = sc.slice(0, 11);",
             "    for (var j = 0; j < sc.length; j++) { id = id * BigInt(64) + BigInt(a.indexOf(sc.charAt(j))); }",
-            "    apiBusy = true;",
+            "    apiBusy = true; apiAt = Date.now();",
             "    fetch('/api/v1/web/likes/' + id.toString() + '/like/', {",
             "      method: 'POST', credentials: 'include',",
             "      headers: { 'x-csrftoken': csrf, 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'content-type': 'application/x-www-form-urlencoded' },",
@@ -575,12 +644,15 @@ public class MainActivity extends Activity {
             "  }",
             "  function tick() {",
             "    try {",
+            "      if (finished) return;",
+            "      window.__ufLast = Date.now();",
             "      tries++;",
             "      var f = fatal(); if (f) { finish(false, f); return; }",
             "      if (gone()) { finish(false, 'Post unavailable'); return; }",
             "      dismiss();",
-            "      if (apiBusy) return;",
+            "      if (apiBusy) { if (Date.now() - apiAt > 12000) { apiBusy = false; } else { return; } }",
             "      if (byLabel(UNLIKE)) { finish(true, clicked ? 'Post Liked Successfully' : 'Already Liked'); return; }",
+            "      if (!apiTried && !clicked) { callApi(); if (apiBusy) return; }",
             "      if (clicked) {",
             "        if (Date.now() - clickedAt > 6000) { finish(false, 'Like did not register'); }",
             "        return;",
@@ -590,11 +662,12 @@ public class MainActivity extends Activity {
             "        var b = lk.closest('button, [role=button]') || lk.parentElement;",
             "        b.click(); clicked = true; clickedAt = Date.now(); return;",
             "      }",
-            "      if (!apiTried && tries >= 4) { callApi(); return; }",
-            "      if (tries >= 40) { finish(false, 'Like button not found'); }",
+            "      if (!apiTried && tries >= 8) { callApi(); return; }",
+            "      if (tries >= 80) { finish(false, 'Like button not found'); }",
             "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
             "  }",
-            "  timer = setInterval(tick, 700);",
+            "  window.__ufTick = tick;",
+            "  timer = setInterval(tick, 350);",
             "  tick();",
             "})();"
         );
@@ -1006,6 +1079,13 @@ public class MainActivity extends Activity {
                .setContentText("Accounts: " + accounts + " Active  |  Tasks: " + tasks + "  |  Coins: +" + coins)
                .setSmallIcon(android.R.drawable.stat_notify_sync)
                .setOngoing(true);
+        // NAYA: notification par tap karne se app khule
+        Intent open = new Intent(this, MainActivity.class);
+        open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        int pf = Build.VERSION.SDK_INT >= 23
+                ? (PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
+                : PendingIntent.FLAG_UPDATE_CURRENT;
+        builder.setContentIntent(PendingIntent.getActivity(this, 0, open, pf));
         notificationManager.notify(NOTIFICATION_ID, builder.build());
     }
 
@@ -1059,7 +1139,7 @@ public class MainActivity extends Activity {
             });
         }
 
-        // NAYA: accounts ke beech delay (seconds) set karne ke liye: Android.setAccountDelay(11)
+        // NAYA: accounts ke beech delay (seconds) set karne ke liye: Android.setAccountDelay(6)
         @JavascriptInterface
         public void setAccountDelay(final int seconds) {
             if (!trusted()) return;
@@ -1163,6 +1243,19 @@ public class MainActivity extends Activity {
             });
         }
 
+        // NAYA: Automation ON/OFF yaad rakhne ke liye. ON hone par app khulte hi website ko
+        // window.onAppAutoStart() ka signal milta hai. Stop dabane par setAutoRun(false) bulao.
+        @JavascriptInterface
+        public void setAutoRun(final boolean on) {
+            if (!trusted()) return;
+            prefs.edit().putBoolean("auto_run", on).apply();
+        }
+
+        @JavascriptInterface
+        public boolean isAutoRun() {
+            return trusted() && prefs.getBoolean("auto_run", false);
+        }
+
         @JavascriptInterface
         public void setKeepScreenOn(final boolean keepOn) {
             if (!trusted()) return;
@@ -1171,11 +1264,13 @@ public class MainActivity extends Activity {
                 public void run() {
                     if (keepOn) {
                         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        startAutomationBackground();
                         if (wakeLock != null && !wakeLock.isHeld()) {
                             wakeLock.acquire(12 * 60 * 60 * 1000L);
                         }
                     } else {
                         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        stopAutomationBackground();
                         if (wakeLock != null && wakeLock.isHeld()) {
                             wakeLock.release();
                         }
@@ -1208,9 +1303,9 @@ public class MainActivity extends Activity {
     }
 
     // ==================================================================
-    // PARALLEL ENGINE (naya): har account = alag WebView + alag cookie profile
+    // PARALLEL ENGINE: har account = alag WebView + alag cookie profile
     // - Accounts ek ke baad ek start hote hain (beech me startGapMs ka gap)
-    // - Ek saath chalne wale accounts unlimited
+    // - Ek saath chalne wale accounts MAX_PARALLEL tak
     // - Round-robin: ek account ka task khatam, agla task dusre account ka
     // ==================================================================
     // Ek saath max itne account chalenge (phone overload na ho, isse jyada slow = jyada 'button not found')
@@ -1241,8 +1336,8 @@ public class MainActivity extends Activity {
     private final ArrayDeque<PTask> pendingTasks = new ArrayDeque<PTask>();
     private int activeSlots = 0;
 
-    // Anti-block: har naya account itne ms baad start hota hai (default 11 sec)
-    private volatile long startGapMs = 11000L;
+    // Anti-block: har naya account itne ms baad start hota hai (default 6 sec, Android.setAccountDelay(n) se badlo)
+    private volatile long startGapMs = 6000L;
     private long lastStartAt = 0;
     private String lastStartedUid = "";
     private boolean pumpScheduled = false;
@@ -1330,6 +1425,7 @@ public class MainActivity extends Activity {
                 st.setJavaScriptEnabled(true);
                 st.setDomStorageEnabled(true);
                 st.setDatabaseEnabled(true);
+                st.setBlockNetworkImage(true); // photos load nahi honge -> tez
                 st.setUserAgentString(USER_AGENT); // normal UA: Instagram ko secret key nahi dikhani
                 s.cm.setAcceptCookie(true);
                 s.cm.setAcceptThirdPartyCookies(wv, true);
@@ -1480,6 +1576,12 @@ public class MainActivity extends Activity {
         SlotClient(Slot s) { this.s = s; }
 
         @Override
+        public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+            WebResourceResponse blocked = blockHeavy(request);
+            return blocked != null ? blocked : super.shouldInterceptRequest(view, request);
+        }
+
+        @Override
         public void onPageFinished(final WebView view, String url) {
             super.onPageFinished(view, url);
             if (!s.active || url == null || url.startsWith("about:")) return;
@@ -1502,7 +1604,7 @@ public class MainActivity extends Activity {
                         injectFollowScript(view);
                     }
                 }
-            }, 1200);
+            }, 400);
         }
 
         @Override
@@ -1516,6 +1618,89 @@ public class MainActivity extends Activity {
                 }
             }
         }
+    }
+
+    // ==================================================================
+    // SPEED: hidden browsers me photos / videos / fonts load nahi hote
+    // (follow/like ko sirf buttons chahiye) -> page 2-3 guna jaldi khulta hai
+    // ==================================================================
+    private WebResourceResponse blockHeavy(WebResourceRequest request) {
+        try {
+            if (request == null || request.getUrl() == null || request.isForMainFrame()) return null;
+            String p = String.valueOf(request.getUrl().getPath()).toLowerCase();
+            if (p.endsWith(".jpg") || p.endsWith(".jpeg") || p.endsWith(".png") || p.endsWith(".webp")
+                    || p.endsWith(".gif") || p.endsWith(".mp4") || p.endsWith(".m4s") || p.endsWith(".webm")
+                    || p.endsWith(".woff") || p.endsWith(".woff2") || p.endsWith(".ttf")) {
+                return new WebResourceResponse("text/plain", "UTF-8", new ByteArrayInputStream(new byte[0]));
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    // ==================================================================
+    // BACKGROUND FIX: app background me jaaye tab bhi automation na ruke
+    // 1) Foreground service (notification ke saath) -> Android process ko kill/sula nahi karta
+    // 2) Heartbeat -> background me WebView ke JS timers slow ho jaate hain, isliye
+    //    native side se har 1.5 sec page ko "tick" bheja jaata hai
+    // 3) onPause me timers dobara resume
+    // ==================================================================
+    private boolean automationOn = false;
+    private static final String POKE_JS =
+            "(function(){try{if(window.__ufTick&&window.__ufRunning&&Date.now()-(window.__ufLast||0)>1200){window.__ufTick();}}catch(e){}})();";
+
+    private final Runnable heartbeat = new Runnable() {
+        @Override
+        public void run() {
+            if (!automationOn) return;
+            try {
+                mainWebView.resumeTimers();
+                // Website chahe to is function me apna loop dobara jaga sakti hai
+                mainWebView.evaluateJavascript("if(window.onNativeHeartbeat) window.onNativeHeartbeat();", null);
+                if (taskActive) workerWebView.evaluateJavascript(POKE_JS, null);
+                for (Slot sl : new ArrayList<Slot>(slots.values())) {
+                    if (sl.active && sl.wv != null) sl.wv.evaluateJavascript(POKE_JS, null);
+                }
+            } catch (Exception ignored) {}
+            uiHandler.postDelayed(this, 1500);
+        }
+    };
+
+    private void startAutomationBackground() {
+        automationOn = true;
+        uiHandler.removeCallbacks(heartbeat);
+        uiHandler.postDelayed(heartbeat, 1500);
+        try {
+            Intent svc = new Intent(this, AutomationService.class);
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(svc);
+            } else {
+                startService(svc);
+            }
+        } catch (Exception ignored) {}
+        requestBatteryExemptionOnce();
+    }
+
+    private void stopAutomationBackground() {
+        automationOn = false;
+        uiHandler.removeCallbacks(heartbeat);
+        try {
+            stopService(new Intent(this, AutomationService.class));
+        } catch (Exception ignored) {}
+    }
+
+    // Battery optimization se app ko bahar karne ka system popup (sirf ek baar poochta hai)
+    private void requestBatteryExemptionOnce() {
+        try {
+            if (Build.VERSION.SDK_INT < 23 || prefs == null) return;
+            if (prefs.getBoolean("battery_asked", false)) return;
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                prefs.edit().putBoolean("battery_asked", true).apply();
+                Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                i.setData(Uri.parse("package:" + getPackageName()));
+                startActivity(i);
+            }
+        } catch (Exception ignored) {}
     }
 
     // Instagram page se sirf username lene ke liye (nonce ke bina kaam nahi karta)
@@ -1546,6 +1731,21 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onPause() {
+        super.onPause();
+        // Background me jaane par bhi WebView ke JS timers chalte rahein
+        if (automationOn) {
+            try { mainWebView.resumeTimers(); } catch (Exception ignored) {}
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        try { mainWebView.resumeTimers(); } catch (Exception ignored) {}
+    }
+
+    @Override
     public void onBackPressed() {
         if (mainWebView.canGoBack()) {
             mainWebView.goBack();
@@ -1556,6 +1756,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        automationOn = false;
+        try { stopService(new Intent(this, AutomationService.class)); } catch (Exception ignored) {}
         uiHandler.removeCallbacksAndMessages(null);
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
