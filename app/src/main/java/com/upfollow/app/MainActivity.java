@@ -51,7 +51,8 @@ public class MainActivity extends Activity {
     // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
     private static final int APP_VERSION_CODE = 3;
     // Secret + version wala user agent: SIRF apni website (mainWebView) ke liye
-    private static final String USER_AGENT_APP = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
+    // onCreate me phone ke asli WebView user agent se set hota hai
+    private String USER_AGENT_APP = "";
     private WebView mainWebView;
     private WebView workerWebView;
     private WebView searchWebView;
@@ -62,7 +63,8 @@ public class MainActivity extends Activity {
     private static final String IG_URL = "https://www.instagram.com";
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
     // Normal user agent (bina secret ke): Instagram wale WebViews ke liye
-    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36";
+    // Normal user agent (bina secret ke): asli device wala, onCreate me set hota hai
+    private String USER_AGENT = "";
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
     private static final int NOTIFICATION_ID = 1001;
@@ -79,6 +81,7 @@ public class MainActivity extends Activity {
 
     private String currentTaskType = "follow";
     private boolean taskActive = false;
+    private boolean workerActed = false; // is task me hamne khud follow/like kiya ya nahi
 
     // Instagram login capture state
     private boolean captureBusy = false;
@@ -98,6 +101,14 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // Phone ka asli WebView user agent: Instagram ko mismatch nahi dikhega (unavailable / can't find account kam)
+        String baseUa = WebSettings.getDefaultUserAgent(this);
+        if (baseUa == null) baseUa = "";
+        baseUa = baseUa.replace("; wv", "").replace(" Version/4.0", "");
+        USER_AGENT = baseUa;
+        USER_AGENT_APP = USER_AGENT + " " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
+
         setContentView(R.layout.activity_main);
 
         prefs = getSharedPreferences("upfollow_prefs", MODE_PRIVATE);
@@ -521,7 +532,7 @@ public class MainActivity extends Activity {
         String script = JS_HEAD + js(
             "  var FOLLOW = ['follow', 'follow back', '\u092b\u0949\u0932\u094b \u0915\u0930\u0947\u0902'];",
             "  var DONE = ['following', 'requested'];",
-            "  var apiTried = false, apiBusy = false, apiAt = 0;",
+            "  var apiTried = false, apiBusy = false, apiAt = 0, verifyAt = 0;",
             "  window.__ufLast = Date.now();",
             "  function find(list, words) {",
             "    for (var i = 0; i < list.length; i++) { if (words.indexOf(txt(list[i])) > -1) return list[i]; }",
@@ -532,11 +543,12 @@ public class MainActivity extends Activity {
             "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(name + '=') === 0) return p.substring(name.length + 1); }",
             "    return '';",
             "  }",
-            // ---- Tez raasta: seedha API (page ke buttons ka wait nahi). Fail ho to neeche purana button-click chalega ----
+            "  function who() { return (location.pathname || '').split('/').filter(function(x) { return x; })[0] || ''; }",
+            "  function acted() { try { window.WorkerBridge.onActed(); } catch (e) {} }",
+            // ---- Tez raasta: seedha API. Fail ho to neeche purana button-click chalega ----
             "  function apiFollow() {",
             "    apiTried = true;",
-            "    var name = (location.pathname || '').split('/').filter(function(x) { return x; })[0] || '';",
-            "    var csrf = cookie('csrftoken');",
+            "    var name = who(), csrf = cookie('csrftoken');",
             "    if (!name || !csrf) return;",
             "    apiBusy = true; apiAt = Date.now();",
             "    var H = { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest' };",
@@ -548,6 +560,7 @@ public class MainActivity extends Activity {
             "      if (!u || !u.id) { apiBusy = false; return; }",
             "      if (u.followed_by_viewer || u.requested_by_viewer) { finish(true, 'Already Following'); return; }",
             "      var h2 = { 'x-csrftoken': csrf, 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'content-type': 'application/x-www-form-urlencoded' };",
+            "      acted();",
             "      return fetch('/api/v1/friendships/create/' + u.id + '/', { method: 'POST', credentials: 'include', headers: h2, body: '' })",
             "      .then(function(r) { return r.text().then(function(t2) { return { s: r.status, t: t2 }; }); })",
             "      .then(function(x) {",
@@ -560,26 +573,44 @@ public class MainActivity extends Activity {
             "      });",
             "    }).catch(function() { apiBusy = false; });",
             "  }",
+            // ---- Click ke baad pakka karo ki follow sach me hua (button late badle to bhi galat 'fail' na jaye) ----
+            "  function verifyFollow() {",
+            "    verifyAt = Date.now();",
+            "    var name = who();",
+            "    if (!name) return;",
+            "    apiBusy = true; apiAt = Date.now();",
+            "    fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(name), { credentials: 'include', headers: { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest' } })",
+            "    .then(function(r) { return r.text(); })",
+            "    .then(function(t) {",
+            "      apiBusy = false;",
+            "      var d = null; try { d = JSON.parse(t); } catch (e) {}",
+            "      var u = d && d.data && d.data.user;",
+            "      if (u && (u.followed_by_viewer || u.requested_by_viewer)) { finish(true, 'Followed Successfully'); }",
+            "    }).catch(function() { apiBusy = false; });",
+            "  }",
             "  function tick() {",
             "    try {",
             "      if (finished) return;",
             "      window.__ufLast = Date.now();",
             "      tries++;",
             "      var f = fatal(); if (f) { finish(false, f); return; }",
-            "      if (gone()) { finish(false, 'Profile unavailable'); return; }",
             "      dismiss();",
             "      if (apiBusy) { if (Date.now() - apiAt > 12000) { apiBusy = false; } else { return; } }",
-            "      if (!apiTried) { apiFollow(); if (apiBusy) return; }",
+            "      if (!apiTried && !clicked) { apiFollow(); if (apiBusy) return; }",
+            // 'unavailable' tabhi jab API bhi kaam na kare aur page 1 sec baad bhi 'not available' dikhaye
+            "      if (tries >= 3 && !clicked && gone()) { finish(false, 'Profile unavailable'); return; }",
             "      var scope = (tries > 16) ? document : (document.querySelector('header') || document.querySelector('main') || document);",
             "      var list = btns(scope);",
             "      if (clicked) {",
             "        if (find(list, DONE)) { finish(true, 'Followed Successfully'); return; }",
-            "        if (Date.now() - clickedAt > 6000) { finish(false, 'Click did not register'); }",
+            "        var waited = Date.now() - clickedAt;",
+            "        if (waited > 15000) { finish(false, 'Click did not register'); return; }",
+            "        if (waited > 5000 && Date.now() - verifyAt > 3000) { verifyFollow(); }",
             "        return;",
             "      }",
             "      if (find(list, DONE)) { finish(true, 'Already Following'); return; }",
             "      var fb = find(list, FOLLOW);",
-            "      if (fb) { fb.click(); clicked = true; clickedAt = Date.now(); return; }",
+            "      if (fb) { acted(); fb.click(); clicked = true; clickedAt = Date.now(); return; }",
             "      if (tries >= 80) { finish(false, 'Follow button not found'); }",
             "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
             "  }",
@@ -600,6 +631,7 @@ public class MainActivity extends Activity {
             "  var UNLIKE = ['unlike', '\u092a\u0938\u0902\u0926 \u0930\u0926\u094d\u0926 \u0915\u0930\u0947\u0902', 'ya no me gusta', 'descurtir', 'batal suka', 'gef\u00e4llt mir nicht mehr'];",
             "  var apiTried = false, apiBusy = false, apiAt = 0;",
             "  window.__ufLast = Date.now();",
+            "  function acted() { try { window.WorkerBridge.onActed(); } catch (e) {} }",
             "  function byLabel(set) {",
             "    var els = document.querySelectorAll('svg[aria-label], [role=button][aria-label], button[aria-label]');",
             "    for (var i = 0; i < els.length; i++) {",
@@ -627,6 +659,7 @@ public class MainActivity extends Activity {
             "    var id = BigInt(0); sc = sc.slice(0, 11);",
             "    for (var j = 0; j < sc.length; j++) { id = id * BigInt(64) + BigInt(a.indexOf(sc.charAt(j))); }",
             "    apiBusy = true; apiAt = Date.now();",
+            "    acted();",
             "    fetch('/api/v1/web/likes/' + id.toString() + '/like/', {",
             "      method: 'POST', credentials: 'include',",
             "      headers: { 'x-csrftoken': csrf, 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'content-type': 'application/x-www-form-urlencoded' },",
@@ -648,21 +681,22 @@ public class MainActivity extends Activity {
             "      window.__ufLast = Date.now();",
             "      tries++;",
             "      var f = fatal(); if (f) { finish(false, f); return; }",
-            "      if (gone()) { finish(false, 'Post unavailable'); return; }",
             "      dismiss();",
             "      if (apiBusy) { if (Date.now() - apiAt > 12000) { apiBusy = false; } else { return; } }",
             "      if (byLabel(UNLIKE)) { finish(true, clicked ? 'Post Liked Successfully' : 'Already Liked'); return; }",
             "      if (!apiTried && !clicked) { callApi(); if (apiBusy) return; }",
+            "      if (tries >= 3 && !clicked && gone()) { finish(false, 'Post unavailable'); return; }",
             "      if (clicked) {",
-            "        if (Date.now() - clickedAt > 6000) { finish(false, 'Like did not register'); }",
+            "        var waited = Date.now() - clickedAt;",
+            "        if (waited > 15000) { finish(false, 'Like did not register'); return; }",
+            "        if (waited > 6000 && !apiTried) { callApi(); }",
             "        return;",
             "      }",
             "      var lk = byLabel(LIKE);",
             "      if (lk) {",
             "        var b = lk.closest('button, [role=button]') || lk.parentElement;",
-            "        b.click(); clicked = true; clickedAt = Date.now(); return;",
+            "        acted(); b.click(); clicked = true; clickedAt = Date.now(); return;",
             "      }",
-            "      if (!apiTried && tries >= 8) { callApi(); return; }",
             "      if (tries >= 80) { finish(false, 'Like button not found'); }",
             "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
             "  }",
@@ -1112,6 +1146,12 @@ public class MainActivity extends Activity {
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
+                    // Pichhla task abhi chal raha ho to ruko (beech me dusra account na khule)
+                    if (taskActive) {
+                        uiHandler.postDelayed(this, 500);
+                        return;
+                    }
+                    workerActed = false;
                     currentTaskType = taskType;
                     taskActive = true;
                     uiHandler.removeCallbacks(taskTimeout);
@@ -1144,6 +1184,13 @@ public class MainActivity extends Activity {
         public void setAccountDelay(final int seconds) {
             if (!trusted()) return;
             startGapMs = Math.max(0, Math.min(60, seconds)) * 1000L;
+        }
+
+        // NAYA: ek saath kitne account chalein (1 = ek ke baad ek, sabse safe). Android.setMaxParallel(1)
+        @JavascriptInterface
+        public void setMaxParallel(final int n) {
+            if (!trusted()) return;
+            maxParallel = Math.max(1, Math.min(3, n));
         }
 
         // Purana method (compatibility)
@@ -1309,9 +1356,13 @@ public class MainActivity extends Activity {
     // - Round-robin: ek account ka task khatam, agla task dusre account ka
     // ==================================================================
     // Ek saath max itne account chalenge (phone overload na ho, isse jyada slow = jyada 'button not found')
-    private static final int MAX_PARALLEL = 3;
+    // DEFAULT 1 = turn by turn: ek account ka task poora hone ke baad hi agla khulega
+    private volatile int maxParallel = 1;
+    // Ek account ke itne tasks ek hi WebView me lagatar (tez, bar bar account switch nahi)
+    private static final int STICKY_BATCH = 5;
+    private int stickyCount = 0;
     // Parallel task ko poora samay (retry samet)
-    private static final long SLOT_TASK_TIMEOUT_MS = 80000L;
+    private static final long SLOT_TASK_TIMEOUT_MS = 40000L;
 
     private class Slot {
         String uid = "";
@@ -1322,6 +1373,8 @@ public class MainActivity extends Activity {
         String target = "";
         String taskType = "follow";
         Runnable timeout;
+        boolean acted = false;
+        long startedAt = 0;
     }
 
     private class PTask {
@@ -1376,7 +1429,7 @@ public class MainActivity extends Activity {
     }
 
     private void pumpQueue() {
-        if (pendingTasks.isEmpty() || activeSlots >= MAX_PARALLEL) return;
+        if (pendingTasks.isEmpty() || activeSlots >= maxParallel) return;
 
         long wait = lastStartAt + startGapMs - System.currentTimeMillis();
         if (wait > 0) {
@@ -1387,17 +1440,32 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // Round-robin: pichhle account ke baad agla task DUSRE account ka uthao.
-        // Dusra account na ho to hi same account ka agla task chalega.
         PTask pick = null;
-        for (PTask t : pendingTasks) {
-            Slot s = slots.get(t.uid);
-            if (s != null && s.active) continue; // is account ka task abhi chal raha hai
-            if (pick == null) pick = t;          // fallback: pehla free task
-            if (!t.uid.equals(lastStartedUid)) { pick = t; break; }
+        // 1) Pehle wahi account (WebView garam hai -> tez), jab tak STICKY_BATCH poora na ho
+        if (stickyCount < STICKY_BATCH) {
+            for (PTask t : pendingTasks) {
+                Slot s = slots.get(t.uid);
+                if (s != null && s.active) continue;
+                if (t.uid.equals(lastStartedUid)) { pick = t; break; }
+            }
+        }
+        // 2) Warna agla account (round-robin). Dusra na ho to hi same account ka agla task
+        if (pick == null) {
+            for (PTask t : pendingTasks) {
+                Slot s = slots.get(t.uid);
+                if (s != null && s.active) continue; // is account ka task abhi chal raha hai
+                if (pick == null) pick = t;          // fallback: pehla free task
+                if (!t.uid.equals(lastStartedUid)) { pick = t; break; }
+            }
         }
         if (pick != null) {
             pendingTasks.remove(pick);
+            if (pick.uid.equals(lastStartedUid)) {
+                stickyCount++;
+            } else {
+                releaseIdleSlot(lastStartedUid); // pichhle account ka WebView band
+                stickyCount = 1;
+            }
             lastStartAt = System.currentTimeMillis();
             lastStartedUid = pick.uid;
             startOnSlot(pick, slots.get(pick.uid));
@@ -1447,7 +1515,14 @@ public class MainActivity extends Activity {
         }
 
         final Slot fs = s;
-        applyCookiesTo(fs.cm, t.cookieStr);
+        // Cookies sirf tab lagao jab zaroorat ho (naya WebView ya session badla). Garam WebView ki cookies mat chhedo.
+        String curCk = fs.cm.getCookie(IG_URL);
+        String curSid = cookieValue(curCk, "sessionid");
+        if (curSid.isEmpty() || !curSid.equals(cookieValue(t.cookieStr, "sessionid"))) {
+            applyCookiesTo(fs.cm, t.cookieStr);
+        }
+        fs.acted = false;
+        fs.startedAt = System.currentTimeMillis();
         fs.active = true;
         fs.retries = 0;
         fs.target = t.target.replaceAll("[^A-Za-z0-9._]", "");
@@ -1469,8 +1544,21 @@ public class MainActivity extends Activity {
         activeSlots--;
         if (s.timeout != null) uiHandler.removeCallbacks(s.timeout);
         sendParallelResult(s.uid, s.target, ok, msg);
-        slots.remove(s.uid);
-        // WebView band karke RAM free karo (callback ke andar nahi, thodi der baad)
+        // WebView zinda rakho (agla task isi account ka ho to tez chalega), bas purana page/JS band karo
+        try {
+            s.wv.stopLoading();
+            s.wv.loadUrl("about:blank");
+        } catch (Exception ignored) {}
+        scheduleIdleCleanup();
+        pumpQueue();
+    }
+
+    // Ruka hua (idle) WebView band karke RAM free karo
+    private void releaseIdleSlot(String uid) {
+        if (uid == null || uid.isEmpty()) return;
+        final Slot s = slots.get(uid);
+        if (s == null || s.active) return;
+        slots.remove(uid);
         uiHandler.post(new Runnable() {
             @Override
             public void run() {
@@ -1482,7 +1570,23 @@ public class MainActivity extends Activity {
                 } catch (Exception ignored) {}
             }
         });
-        pumpQueue();
+    }
+
+    // Queue khali ho jaye to 45 sec baad saare idle WebView band
+    private final Runnable idleCleanup = new Runnable() {
+        @Override
+        public void run() {
+            if (activeSlots == 0 && pendingTasks.isEmpty()) {
+                for (String u : new ArrayList<String>(slots.keySet())) {
+                    releaseIdleSlot(u);
+                }
+            }
+        }
+    };
+
+    private void scheduleIdleCleanup() {
+        uiHandler.removeCallbacks(idleCleanup);
+        uiHandler.postDelayed(idleCleanup, 45000);
     }
 
     // Result page ko jaata hai: onWorkerResult(success, msg, accountId, target)
@@ -1534,6 +1638,7 @@ public class MainActivity extends Activity {
     // 'button not found' / page error par ek baar page reload karke dobara try
     private boolean shouldRetry(Slot s, String msg) {
         if (s == null || !s.active || s.retries >= 1) return false;
+        if (System.currentTimeMillis() - s.startedAt > 22000) return false; // retry ke liye samay bacha ho
         String m = msg == null ? "" : msg.toLowerCase();
         return m.contains("not found") || m.contains("did not register")
                 || m.contains("page error") || m.contains("js error");
@@ -1541,10 +1646,6 @@ public class MainActivity extends Activity {
 
     private void retrySlot(Slot s) {
         s.retries++;
-        if (s.timeout != null) {
-            uiHandler.removeCallbacks(s.timeout);
-            uiHandler.postDelayed(s.timeout, SLOT_TASK_TIMEOUT_MS);
-        }
         try {
             s.wv.reload();
         } catch (Exception e) {
@@ -1556,16 +1657,34 @@ public class MainActivity extends Activity {
         private final Slot s;
         SlotBridge(Slot s) { this.s = s; }
 
+        // Script ne follow/like kar diya (API ya click)
+        @JavascriptInterface
+        public void onActed() {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (s.active) s.acted = true;
+                }
+            });
+        }
+
         @JavascriptInterface
         public void onTaskResult(final boolean success, final String message) {
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
+                    if (!s.active) return; // purane/band task ka result ignore
                     if (!success && shouldRetry(s, message)) {
                         retrySlot(s);
-                    } else {
-                        finishSlot(s, success, message);
+                        return;
                     }
+                    String m2 = message;
+                    if (success && s.acted) {
+                        // Hamne khud follow/like kiya, to "Already" nahi "Successfully" bhejo (coin ke liye)
+                        if ("Already Following".equals(m2)) m2 = "Followed Successfully";
+                        else if ("Already Liked".equals(m2)) m2 = "Post Liked Successfully";
+                    }
+                    finishSlot(s, success, m2);
                 }
             });
         }
@@ -1719,12 +1838,24 @@ public class MainActivity extends Activity {
     }
 
     public class WorkerAppInterface {
+        // Script ne follow/like kar diya (API ya click), ye yaad rakhne ke liye
+        @JavascriptInterface
+        public void onActed() {
+            workerActed = true;
+        }
+
         @JavascriptInterface
         public void onTaskResult(final boolean success, final String message) {
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
-                    deliverResult(success, message);
+                    String m2 = message;
+                    if (success && workerActed) {
+                        // Hamne khud follow/like kiya, to "Already" nahi "Successfully" bhejo (coin ke liye)
+                        if ("Already Following".equals(m2)) m2 = "Followed Successfully";
+                        else if ("Already Liked".equals(m2)) m2 = "Post Liked Successfully";
+                    }
+                    deliverResult(success, m2);
                 }
             });
         }
