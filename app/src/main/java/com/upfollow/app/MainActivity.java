@@ -1911,7 +1911,8 @@ public class MainActivity extends Activity {
                 "(function(){var t='" + jsq(target) + "',ty='" + jsq(type) + "',r='" + jsq(reason)
                         + "',m='" + jsq(mediaId) + "';"
                         + "if(window.onProfileDead){window.onProfileDead(t,ty,r,m);return;}"
-                        + "try{var fd=new FormData();fd.append('target',m||t);fd.append('type',ty);fd.append('reason',r);"
+                        + "try{var fd=new FormData();fd.append('target',t);fd.append('media',m);"
+                        + "fd.append('type',ty);fd.append('reason',r);fd.append('dk','" + deviceKey + "');"
                         + "fetch('" + HOSTING_BASE + "dead_profile.php',{method:'POST',body:fd,credentials:'include'});}catch(e){}})();",
                 null);
     }
