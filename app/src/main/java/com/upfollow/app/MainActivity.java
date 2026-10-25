@@ -1,6 +1,7 @@
 package com.upfollow.app;
 
 import android.annotation.SuppressLint;
+import android.annotation.TargetApi;
 import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -18,10 +19,12 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.ValueCallback;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
@@ -53,7 +56,8 @@ import androidx.webkit.WebViewFeature;
 public class MainActivity extends Activity {
     private static final String APP_SECRET_KEY = "brohu2580";
     // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
-    private static final int APP_VERSION_CODE = 3;
+    // SMOOTH: 3 -> 4 (is naye build ke liye)
+    private static final int APP_VERSION_CODE = 4;
     // Secret + version wala user agent: SIRF apni website (mainWebView) ke liye
     // onCreate me phone ke asli WebView user agent se set hota hai
     private String USER_AGENT_APP = "";
@@ -166,6 +170,14 @@ public class MainActivity extends Activity {
         }
         searchWebView.addJavascriptInterface(new SearchBridge(), "SearchBridge");
         searchWebView.setWebViewClient(new WebViewClient() {
+            // SMOOTH: WebView ka renderer mar jaye to poori app crash na ho
+            @TargetApi(Build.VERSION_CODES.O)
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                onRendererGone("search");
+                return true;
+            }
+
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
@@ -202,6 +214,14 @@ public class MainActivity extends Activity {
                 return handleNav(url);
             }
 
+            // SMOOTH: main WebView ka renderer mar jaye to app crash na ho, Activity naye sire se banti hai
+            @TargetApi(Build.VERSION_CODES.O)
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                onRendererGone("main");
+                return true;
+            }
+
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
@@ -213,6 +233,8 @@ public class MainActivity extends Activity {
                 super.onPageFinished(view, url);
                 if (url != null) mainUrl = url;
                 checkInstagramLogin(url);
+                // SMOOTH: page reload ke wajah se jo result atke the, ab unhe bhejo
+                flushResults();
                 // FIX: Auto-run ON ho to website ka JS ready hone tak baar baar try karo
                 if (url != null && url.startsWith(HOSTING_BASE) && prefs != null && prefs.getBoolean("auto_run", false)) {
                     tryAutoStart(0);
@@ -222,6 +244,14 @@ public class MainActivity extends Activity {
 
         // ---------- Worker WebView client ----------
         workerWebView.setWebViewClient(new WebViewClient() {
+            // SMOOTH: worker WebView ka renderer mar jaye to app crash na ho
+            @TargetApi(Build.VERSION_CODES.O)
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                onRendererGone("worker");
+                return true;
+            }
+
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 WebResourceResponse blocked = blockHeavy(request);
@@ -505,6 +535,15 @@ public class MainActivity extends Activity {
         taskActive = false;
         uiHandler.removeCallbacks(taskTimeout);
         String safe = message == null ? "" : message.replace("\\", "\\\\").replace("'", "\\'");
+        // SMOOTH: result page tak pakka pahunche (page reload ho raha ho to ruk kar dobara bhejta hai)
+        // aur message me newline / quote ho to bhi JS na tute. Purana tareeka niche as-is rakha hai.
+        if (RESULT_RETRY_ENABLED) {
+            dbg("single result ok=" + success + " msg=" + message);
+            enqueueResultCall("window.onWorkerResult(" + success + ", "
+                    + JSONObject.quote(message == null ? "" : message) + ")");
+            onSingleTaskEnded();
+            return;
+        }
         mainWebView.evaluateJavascript(
                 "if(window.onWorkerResult) window.onWorkerResult(" + success + ", '" + safe + "');", null);
     }
@@ -1223,6 +1262,12 @@ public class MainActivity extends Activity {
                 parallelEnqueue(target, taskType, mediaId, cookieStr);
                 return;
             }
+            // SMOOTH: single mode me ab proper queue (FIFO, accounts ke beech gap, Stop se cancel).
+            // Neeche purana code as-is bacha hai; SINGLE_QUEUE_ENABLED = false karo to wahi chalega.
+            if (SINGLE_QUEUE_ENABLED) {
+                singleEnqueue(target, taskType, mediaId, cookieStr);
+                return;
+            }
             uiHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -1385,6 +1430,18 @@ public class MainActivity extends Activity {
             return c == null ? "" : c;
         }
 
+        // SMOOTH: debug log (last ~150 events). Website me Android.getDebugLog() se padh sakte ho,
+        // "Sync Error" aane par ye bhejne se turant pata chalta hai ki kya hua.
+        @JavascriptInterface
+        public String getDebugLog() {
+            if (!trusted()) return "";
+            StringBuilder sb = new StringBuilder();
+            synchronized (dbgLog) {
+                for (String l : dbgLog) sb.append(l).append('\n');
+            }
+            return sb.toString();
+        }
+
         // Website ko app ka version batane ke liye (optional use)
         @JavascriptInterface
         public int getAppVersion() {
@@ -1411,6 +1468,11 @@ public class MainActivity extends Activity {
                     PTask t;
                     while ((t = pendingTasks.poll()) != null) {
                         sendParallelResult(t.uid, t.target, false, "Cancelled");
+                    }
+                    // SMOOTH: single mode queue ke ruke hue tasks bhi cancel
+                    PTask st;
+                    while ((st = singleQueue.poll()) != null) {
+                        enqueueResultCall("window.onWorkerResult(false, \"Cancelled\")");
                     }
                 }
             });
@@ -1473,6 +1535,199 @@ public class MainActivity extends Activity {
                 }
             });
         }
+    }
+
+    // ==================================================================
+    // SMOOTH PACK (naya): bulk me "Sync Error" kam karne ke liye
+    //  1) Single mode ki proper queue: FIFO, accounts ke beech gap, Stop se cancel
+    //     (pehle har task alag 500ms polling runnable tha: order gadbad, Stop ke baad bhi chal jate the)
+    //  2) Result page tak pakka pahunche: page reload ho raha ho to result gum nahi hota,
+    //     ruk kar dobara bhejta hai (pehle "if(window.onWorkerResult)" fail hone par chupchap gum)
+    //  3) Result string me newline/quote ho to JS na tute (JSONObject.quote)
+    //  4) Task khatam hote hi worker page about:blank: purani script naye task ka result na bhej de
+    //  5) WebView renderer mar jaye to app crash nahi hota
+    //  6) Debug log: getDebugLog()
+    // ==================================================================
+    private static final boolean SINGLE_QUEUE_ENABLED = true;
+    private static final boolean RESULT_RETRY_ENABLED = true;
+    private static final long RESULT_MAX_AGE_MS = 120000L;
+
+    private final ArrayDeque<PTask> singleQueue = new ArrayDeque<PTask>();
+    private long singleLastEnd = 0;
+    private long singleGap = 0;
+    private boolean singlePumpScheduled = false;
+    private final Runnable singlePumpRunnable = new Runnable() {
+        @Override
+        public void run() {
+            singlePumpScheduled = false;
+            singlePump();
+        }
+    };
+
+    private void singleEnqueue(String target, String taskType, String mediaId, String cookieStr) {
+        final PTask t = new PTask();
+        t.target = target == null ? "" : target;
+        t.taskType = taskType == null ? "follow" : taskType;
+        t.mediaId = mediaId == null ? "" : mediaId;
+        t.cookieStr = cookieStr == null ? "" : cookieStr;
+        t.uid = cookieValue(t.cookieStr, "ds_user_id").replaceAll("[^A-Za-z0-9]", "");
+        t.key = taskKey(t.taskType, t.target, t.mediaId);
+        uiHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                singleQueue.add(t);
+                singlePump();
+            }
+        });
+    }
+
+    private void singlePump() {
+        if (taskActive || singleQueue.isEmpty()) return;
+        long wait = singleLastEnd + singleGap - System.currentTimeMillis();
+        if (wait > 0) {
+            if (!singlePumpScheduled) {
+                singlePumpScheduled = true;
+                uiHandler.postDelayed(singlePumpRunnable, wait);
+            }
+            return;
+        }
+        PTask t = singleQueue.poll();
+        if (t == null) return;
+        startSingleTask(t);
+    }
+
+    private void startSingleTask(PTask t) {
+        workerActed = false;
+        workerRetries = 0;
+        workerStartedAt = System.currentTimeMillis();
+        currentTaskType = t.taskType;
+        taskActive = true;
+        uiHandler.removeCallbacks(taskTimeout);
+        uiHandler.postDelayed(taskTimeout, TASK_TIMEOUT_MS);
+        if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
+            applyInstagramCookies(t.cookieStr);
+        }
+        dbg("single start uid=" + t.uid + " type=" + t.taskType + " target=" + cleanName(t.target));
+        try {
+            workerWebView.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
+        } catch (Exception e) {
+            deliverResult(false, "Page error");
+        }
+    }
+
+    // Task khatam: worker page saaf, gap set, agla task
+    private void onSingleTaskEnded() {
+        singleLastEnd = System.currentTimeMillis();
+        singleGap = nextGap();
+        try {
+            workerWebView.stopLoading();
+            workerWebView.loadUrl("about:blank");
+        } catch (Exception ignored) {}
+        singlePump();
+    }
+
+    // ---- Result page tak pakka pahunchane ka system ----
+    private final ArrayDeque<String> pendingResultJs = new ArrayDeque<String>();
+    private final ArrayDeque<Long> pendingResultAt = new ArrayDeque<Long>();
+    private boolean resultFlushBusy = false;
+    private long resultFlushBusyAt = 0;
+    private boolean resultRetryScheduled = false;
+
+    private void enqueueResultCall(String call) {
+        pendingResultJs.add(call);
+        pendingResultAt.add(Long.valueOf(System.currentTimeMillis()));
+        flushResults();
+    }
+
+    private void flushResults() {
+        if (mainWebView == null) return;
+        long now = System.currentTimeMillis();
+        // bahut purane (2 min+) results hata do, naye page ko purana kachra na mile
+        while (!pendingResultAt.isEmpty() && now - pendingResultAt.peek().longValue() > RESULT_MAX_AGE_MS) {
+            pendingResultAt.poll();
+            pendingResultJs.poll();
+        }
+        if (pendingResultJs.isEmpty()) return;
+        if (resultFlushBusy && now - resultFlushBusyAt < 5000L) return;
+        resultFlushBusy = true;
+        resultFlushBusyAt = now;
+        final String call = pendingResultJs.peek();
+        try {
+            mainWebView.evaluateJavascript(
+                    "(function(){if(typeof window.onWorkerResult!=='function')return 0;"
+                            + "try{" + call + ";}catch(e){}return 1;})()",
+                    new ValueCallback<String>() {
+                        @Override
+                        public void onReceiveValue(String v) {
+                            resultFlushBusy = false;
+                            if ("1".equals(v)) {
+                                if (pendingResultJs.peek() == call) {
+                                    pendingResultJs.poll();
+                                    pendingResultAt.poll();
+                                }
+                                flushResults(); // agla result (order same rahega)
+                            } else {
+                                scheduleResultRetry(); // page abhi taiyar nahi, 1 sec baad dobara
+                            }
+                        }
+                    });
+        } catch (Exception e) {
+            resultFlushBusy = false;
+            scheduleResultRetry();
+        }
+    }
+
+    private void scheduleResultRetry() {
+        if (resultRetryScheduled) return;
+        resultRetryScheduled = true;
+        uiHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                resultRetryScheduled = false;
+                flushResults();
+            }
+        }, 1000);
+    }
+
+    // ---- WebView renderer crash handling ----
+    private long lastRecreateAt = 0;
+
+    private void onRendererGone(String who) {
+        dbg("WebView renderer gone: " + who);
+        long now = System.currentTimeMillis();
+        if (now - lastRecreateAt < 20000L) return; // baar baar crash ho to loop me mat phanso
+        lastRecreateAt = now;
+        uiHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                // Activity naye sire se banti hai; Auto-run ON ho to automation khud chalu ho jata hai
+                try { recreate(); } catch (Exception ignored) {}
+            }
+        });
+    }
+
+    private void destroyWebViewSafe(WebView w) {
+        if (w == null) return;
+        try {
+            ViewGroup par = (ViewGroup) w.getParent();
+            if (par != null) par.removeView(w);
+            w.destroy();
+        } catch (Exception ignored) {}
+    }
+
+    // ---- Debug log ----
+    private final ArrayDeque<String> dbgLog = new ArrayDeque<String>();
+
+    private void dbg(String m) {
+        try {
+            String line = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                    .format(new java.util.Date()) + " " + m;
+            synchronized (dbgLog) {
+                dbgLog.add(line);
+                while (dbgLog.size() > 150) dbgLog.poll();
+            }
+            Log.d("UpFollow", m);
+        } catch (Exception ignored) {}
     }
 
     // ==================================================================
@@ -1717,6 +1972,7 @@ public class MainActivity extends Activity {
         activeSlots--;
         if (activeSlots < 0) activeSlots = 0;
         lastEndAt = System.currentTimeMillis();
+        dbg("slot done uid=" + s.uid + " ok=" + ok + " msg=" + msg);
         if (s.timeout != null) uiHandler.removeCallbacks(s.timeout);
         if (ok) {
             doneMap.put(s.uid + "|" + s.key, lastEndAt);
@@ -1776,6 +2032,15 @@ public class MainActivity extends Activity {
     private void sendParallelResult(String uid, String target, boolean ok, String msg) {
         String safe = (msg == null ? "" : msg).replace("\\", "\\\\").replace("'", "\\'");
         String safeT = (target == null ? "" : target).replace("\\", "\\\\").replace("'", "\\'");
+        // SMOOTH: result page tak pakka pahunche + special characters se JS na tute.
+        // Purana tareeka niche as-is rakha hai (RESULT_RETRY_ENABLED = false karo to wahi chalega).
+        if (RESULT_RETRY_ENABLED) {
+            enqueueResultCall("window.onWorkerResult(" + ok + ", "
+                    + JSONObject.quote(msg == null ? "" : msg) + ", "
+                    + JSONObject.quote(uid == null ? "" : uid) + ", "
+                    + JSONObject.quote(target == null ? "" : target) + ")");
+            return;
+        }
         mainWebView.evaluateJavascript(
                 "if(window.onWorkerResult) window.onWorkerResult(" + ok + ", '" + safe + "', '" + uid + "', '" + safeT + "');", null);
     }
@@ -1994,6 +2259,18 @@ public class MainActivity extends Activity {
     private class SlotClient extends WebViewClient {
         private final Slot s;
         SlotClient(Slot s) { this.s = s; }
+
+        // SMOOTH: is account ka WebView mar jaye to sirf ye task fail ho, app crash na ho,
+        // aur agla task naya WebView bana kar chale
+        @TargetApi(Build.VERSION_CODES.O)
+        @Override
+        public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+            dbg("renderer gone slot uid=" + s.uid);
+            slots.remove(s.uid); // pump naya WebView banayega
+            finishSlot(s, false, "Page error");
+            destroyWebViewSafe(s.wv);
+            return true;
+        }
 
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
