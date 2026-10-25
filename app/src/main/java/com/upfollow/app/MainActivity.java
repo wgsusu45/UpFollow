@@ -57,7 +57,8 @@ public class MainActivity extends Activity {
     private static final String APP_SECRET_KEY = "brohu2580";
     // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
     // SMOOTH: 3 -> 4 (is naye build ke liye)
-    private static final int APP_VERSION_CODE = 4;
+    // SMOOTH v2: 4 -> 5
+    private static final int APP_VERSION_CODE = 5;
     // Secret + version wala user agent: SIRF apni website (mainWebView) ke liye
     // onCreate me phone ke asli WebView user agent se set hota hai
     private String USER_AGENT_APP = "";
@@ -77,7 +78,8 @@ public class MainActivity extends Activity {
     private static final String CHANNEL_ID = "upfollow_automation_channel";
     private static final int NOTIFICATION_ID = 1001;
     // FIX: pehle 40 sec tha, jisse page dheere khulne par task jaldi fail ho jata tha
-    private static final long TASK_TIMEOUT_MS = 90000L;
+    // SMOOTH v2: ek account ke task ko max 25 sec (action ho chuka ho to +15 sec sirf verify ke liye)
+    private static final long TASK_TIMEOUT_MS = 25000L;
 
     private NotificationManager notificationManager;
     private PowerManager.WakeLock wakeLock;
@@ -105,7 +107,7 @@ public class MainActivity extends Activity {
     private final Runnable taskTimeout = new Runnable() {
         @Override
         public void run() {
-            deliverResult(false, "Timeout");
+            handleSingleTimeout();
         }
     };
 
@@ -261,6 +263,8 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(final WebView view, String url) {
                 super.onPageFinished(view, url);
+                // SMOOTH v2: task shuru hone se pehle (gap ke dauran) next account ka page pehle se load ho raha hota hai
+                if (!taskActive) { singleOnPreFinished(url); return; }
                 if (!taskActive || url == null || url.startsWith("about:")) return;
 
                 String path = "";
@@ -306,6 +310,9 @@ public class MainActivity extends Activity {
                     } else {
                         deliverResult(false, "Page error");
                     }
+                } else if (!taskActive && request != null && request.isForMainFrame()) {
+                    // prewarm wala page fail hua: task start par normal tareeke se load hoga
+                    singlePreKey = ""; singlePreLoading = false; singlePreReady = false; singlePreBad = "";
                 }
             }
         });
@@ -550,8 +557,8 @@ public class MainActivity extends Activity {
 
     // FIX: single-worker mode retry (jab tak task poora na ho ya sach me error na ho, aage mat jao)
     private boolean workerShouldRetry(String msg) {
-        if (!taskActive || workerRetries >= 2) return false;
-        if (System.currentTimeMillis() - workerStartedAt > 70000) return false;
+        if (!taskActive || workerRetries >= 1) return false;
+        if (System.currentTimeMillis() - workerStartedAt > 14000) return false;
         String m = msg == null ? "" : msg.toLowerCase();
         return m.contains("not found") || m.contains("did not register")
                 || m.contains("page error") || m.contains("js error")
@@ -1310,14 +1317,14 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void setAccountDelay(final int seconds) {
             if (!trusted()) return;
-            startGapMs = Math.max(0, Math.min(60, seconds)) * 1000L;
+            startGapMs = Math.max(MIN_GAP_MS, Math.min(60, seconds) * 1000L);
         }
 
         // NAYA: ek saath kitne account chalein (1 = ek ke baad ek, sabse safe). Android.setMaxParallel(1)
         @JavascriptInterface
         public void setMaxParallel(final int n) {
             if (!trusted()) return;
-            maxParallel = Math.max(1, Math.min(3, n));
+            maxParallel = FORCE_SERIAL ? 1 : Math.max(1, Math.min(3, n));
         }
 
         // Purani website ke liye bacha hua (kuch nahi karta): Fast Mode hata diya gaya hai
@@ -1428,6 +1435,19 @@ public class MainActivity extends Activity {
             if (!trusted()) return "";
             String c = CookieManager.getInstance().getCookie(IG_URL);
             return c == null ? "" : c;
+        }
+
+        // SMOOTH v2: queue ki halat (website ke liye): {"queued":n,"active":bool,"gap_ms":n}
+        @JavascriptInterface
+        public String getQueueInfo() {
+            if (!trusted()) return "{}";
+            try {
+                return "{\"queued\":" + (pendingTasks.size() + singleQueue.size())
+                        + ",\"active\":" + (activeSlots > 0 || taskActive)
+                        + ",\"gap_ms\":" + curGapMs + "}";
+            } catch (Exception e) {
+                return "{}";
+            }
         }
 
         // SMOOTH: debug log (last ~150 events). Website me Android.getDebugLog() se padh sakte ho,
@@ -1585,6 +1605,7 @@ public class MainActivity extends Activity {
         if (taskActive || singleQueue.isEmpty()) return;
         long wait = singleLastEnd + singleGap - System.currentTimeMillis();
         if (wait > 0) {
+            singlePrewarm(); // SMOOTH v2: gap me next account ka page taiyar karo
             if (!singlePumpScheduled) {
                 singlePumpScheduled = true;
                 uiHandler.postDelayed(singlePumpRunnable, wait);
@@ -1597,22 +1618,103 @@ public class MainActivity extends Activity {
     }
 
     private void startSingleTask(PTask t) {
+        final String pk = t.uid + "|" + t.key;
+        boolean pre = pk.equals(singlePreKey) && (singlePreLoading || singlePreReady)
+                && System.currentTimeMillis() - singlePreAt < 60000L;
+        boolean preReady = pre && singlePreReady;
+        String preBad = pre ? singlePreBad : "";
+        singlePreKey = ""; singlePreLoading = false; singlePreReady = false; singlePreBad = "";
+
         workerActed = false;
         workerRetries = 0;
+        workerExtended = false;
         workerStartedAt = System.currentTimeMillis();
         currentTaskType = t.taskType;
         taskActive = true;
         uiHandler.removeCallbacks(taskTimeout);
-        uiHandler.postDelayed(taskTimeout, TASK_TIMEOUT_MS);
+        uiHandler.postDelayed(taskTimeout, TASK_TIMEOUT_MS + (preReady ? 0L : SLOT_LOAD_ALLOWANCE_MS));
+        dbg("single start uid=" + t.uid + " type=" + t.taskType + " target=" + cleanName(t.target)
+                + " prewarmed=" + pre);
+        notifyStarted(t.uid, cleanName(t.target), t.taskType);
+        if (preBad.length() > 0) {
+            deliverResult(false, preBad);
+            return;
+        }
+        if (preReady) {
+            // page pehle se khula hai: seedha script chalao
+            uiHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (!taskActive) return;
+                    if ("like".equalsIgnoreCase(currentTaskType)) {
+                        injectLikeScript(workerWebView);
+                    } else {
+                        injectFollowScript(workerWebView);
+                    }
+                }
+            }, 300);
+            return;
+        }
+        if (pre) return; // page abhi load ho raha hai, onPageFinished se script chalegi
         if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
             applyInstagramCookies(t.cookieStr);
         }
-        dbg("single start uid=" + t.uid + " type=" + t.taskType + " target=" + cleanName(t.target));
         try {
             workerWebView.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
         } catch (Exception e) {
             deliverResult(false, "Page error");
         }
+    }
+
+    // ---- Single mode: gap ke dauran next account ka page pehle se load (prewarm) ----
+    private long singlePreAt = 0;
+    private String singlePreKey = "";
+    private boolean singlePreLoading = false;
+    private boolean singlePreReady = false;
+    private String singlePreBad = "";
+    private boolean workerExtended = false;
+
+    private void singlePrewarm() {
+        if (!PREWARM_ENABLED || taskActive) return;
+        PTask t = singleQueue.peek();
+        if (t == null) return;
+        String pk = t.uid + "|" + t.key;
+        if (pk.equals(singlePreKey) && (singlePreLoading || singlePreReady)) return;
+        try {
+            if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
+                applyInstagramCookies(t.cookieStr);
+            }
+            singlePreKey = pk;
+            singlePreAt = System.currentTimeMillis();
+            singlePreLoading = true;
+            singlePreReady = false;
+            singlePreBad = "";
+            dbg("single prewarm uid=" + t.uid + " target=" + cleanName(t.target));
+            workerWebView.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
+        } catch (Exception e) {
+            singlePreKey = ""; singlePreLoading = false; singlePreReady = false;
+        }
+    }
+
+    private void singleOnPreFinished(String url) {
+        if (singlePreLoading && url != null && !url.startsWith("about:")) {
+            singlePreLoading = false;
+            singlePreReady = true;
+            singlePreBad = fatalPathReason(url);
+        }
+    }
+
+    // 25 sec poore: agar follow/like ho chuka hai to 15 sec aur verify ke liye, warna fail
+    private void handleSingleTimeout() {
+        if (!taskActive) return;
+        if (workerActed && !workerExtended) {
+            workerExtended = true;
+            dbg("single timeout but action done -> verify window");
+            uiHandler.postDelayed(taskTimeout, TASK_VERIFY_EXTRA_MS);
+            try { workerWebView.evaluateJavascript(POKE_JS, null); } catch (Exception ignored) {}
+            return;
+        }
+        deliverResult(false, "Timeout");
     }
 
     // Task khatam: worker page saaf, gap set, agla task
@@ -1632,6 +1734,7 @@ public class MainActivity extends Activity {
     private boolean resultFlushBusy = false;
     private long resultFlushBusyAt = 0;
     private boolean resultRetryScheduled = false;
+    private boolean resultWaitLogged = false;
 
     private void enqueueResultCall(String call) {
         pendingResultJs.add(call);
@@ -1654,19 +1757,30 @@ public class MainActivity extends Activity {
         final String call = pendingResultJs.peek();
         try {
             mainWebView.evaluateJavascript(
-                    "(function(){if(typeof window.onWorkerResult!=='function')return 0;"
-                            + "try{" + call + ";}catch(e){}return 1;})()",
+                    "(function(){if(typeof window.onWorkerResult!=='function')return 'NOHANDLER';"
+                            + "try{" + call + ";}catch(e){return 'E:'+(e&&e.message);}return 'OK';})()",
                     new ValueCallback<String>() {
                         @Override
                         public void onReceiveValue(String v) {
                             resultFlushBusy = false;
-                            if ("1".equals(v)) {
+                            boolean noHandler = v == null || "null".equals(v) || v.contains("NOHANDLER");
+                            if (!noHandler) {
+                                if (v.contains("E:")) {
+                                    dbg("website onWorkerResult ERROR: " + v + " call=" + call);
+                                } else {
+                                    dbg("result delivered to page: " + call);
+                                }
+                                resultWaitLogged = false;
                                 if (pendingResultJs.peek() == call) {
                                     pendingResultJs.poll();
                                     pendingResultAt.poll();
                                 }
                                 flushResults(); // agla result (order same rahega)
                             } else {
+                                if (!resultWaitLogged) {
+                                    resultWaitLogged = true;
+                                    dbg("page onWorkerResult not ready, retrying: " + call);
+                                }
                                 scheduleResultRetry(); // page abhi taiyar nahi, 1 sec baad dobara
                             }
                         }
@@ -1731,6 +1845,119 @@ public class MainActivity extends Activity {
     }
 
     // ==================================================================
+    // SMOOTH v2: timing + prewarm
+    //  - Ek account ka task max 25 sec (+8 sec agar page pehle se load nahi tha).
+    //    Follow/like ho chuka ho aur 25 sec poore ho jayein to +15 sec sirf verify ke liye
+    //    (taaki follow ho jaye par "Timeout" ke karan coin na kate).
+    //  - Task khatam hone ke baad kam se kam 7 sec ruko. Ye 7 sec kharab nahi jate:
+    //    isi me agle account ka WebView + cookies + target page pehle se load ho jata hai (prewarm).
+    //  - Hamesha ek hi account (FORCE_SERIAL), har task ke baad agla account (STICKY_BATCH = 1).
+    //  - Website ko onWorkerStarted(uid, target, type, maxMs) milta hai, taaki uska timer
+    //    queue me intezaar ke time se nahi, asli start se chale.
+    // ==================================================================
+    private static final long MIN_GAP_MS = 7000L;
+    private static final long TASK_VERIFY_EXTRA_MS = 15000L;
+    private static final long SLOT_VERIFY_EXTRA_MS = 15000L;
+    private static final long SLOT_LOAD_ALLOWANCE_MS = 8000L;
+    private static final boolean FORCE_SERIAL = true;
+    private static final boolean PREWARM_ENABLED = true;
+
+    // Queue me se agla task chunna (bina nikaale): pumpQueue aur prewarm dono yahi use karte hain
+    private PTask choosePending() {
+        PTask pick = null;
+        // 1) Pehle wahi account (WebView garam hai -> tez), jab tak STICKY_BATCH poora na ho
+        if (stickyCount < STICKY_BATCH) {
+            for (PTask t : pendingTasks) {
+                Slot s = slots.get(t.uid);
+                if (s != null && s.active) continue;
+                if (t.uid.equals(lastStartedUid)) { pick = t; break; }
+            }
+        }
+        // 2) Warna agla account (round-robin). Dusra na ho to hi same account ka agla task
+        if (pick == null) {
+            for (PTask t : pendingTasks) {
+                Slot s = slots.get(t.uid);
+                if (s != null && s.active) continue; // is account ka task abhi chal raha hai
+                if (pick == null) pick = t;          // fallback: pehla free task
+                if (!t.uid.equals(lastStartedUid)) { pick = t; break; }
+            }
+        }
+        return pick;
+    }
+
+    // Gap ke dauran: next account ka WebView banao, cookies lagao aur target page load karo
+    private void prewarmNext() {
+        if (!PREWARM_ENABLED || activeSlots > 0) return;
+        PTask pick = choosePending();
+        if (pick == null) return;
+        Slot s = slots.get(pick.uid);
+        try {
+            if (s == null) s = createSlot(pick.uid);
+        } catch (Throwable e) {
+            dbg("prewarm setup error: " + e.getMessage());
+            return;
+        }
+        if (s.active) return;
+        if (pick.key.equals(s.preKey) && (s.preLoading || s.preReady)) return; // pehle se taiyar
+        try {
+            ensureCookies(s, pick.cookieStr);
+            s.preKey = pick.key;
+            s.preAt = System.currentTimeMillis();
+            s.preLoading = true;
+            s.preReady = false;
+            s.preBad = "";
+            dbg("prewarm uid=" + pick.uid + " target=" + cleanName(pick.target));
+            s.wv.loadUrl(buildTaskUrl(pick.target, pick.taskType, pick.mediaId));
+        } catch (Exception e) {
+            s.preKey = ""; s.preLoading = false; s.preReady = false;
+        }
+    }
+
+    private void slotTimeout(Slot s) {
+        if (s == null || !s.active) return;
+        if (s.acted && !s.extended) {
+            s.extended = true;
+            dbg("slot timeout but action done -> verify window uid=" + s.uid);
+            uiHandler.postDelayed(s.timeout, SLOT_VERIFY_EXTRA_MS);
+            try { s.wv.evaluateJavascript(POKE_JS, null); } catch (Exception ignored) {}
+            return;
+        }
+        finishSlot(s, false, "Timeout");
+    }
+
+    private void injectForSlot(Slot s) {
+        if ("like".equalsIgnoreCase(s.taskType)) {
+            injectLikeScript(s.wv);
+        } else {
+            injectFollowScript(s.wv);
+        }
+    }
+
+    // URL ke path se pata chalna ki page login / challenge / suspended jaisa to nahi
+    private String fatalPathReason(String url) {
+        String path = "";
+        try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
+        if (path.startsWith("/accounts/suspended")) return "Suspended: Instagram suspended this account";
+        if (path.startsWith("/accounts/disabled")) return "Disabled: Instagram disabled this account";
+        if (path.startsWith("/challenge") || path.startsWith("/checkpoint") || path.startsWith("/auth_platform")) return "Blocked: Challenge / Checkpoint";
+        if (path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")) return "Session expired";
+        return "";
+    }
+
+    // Website ko batao ki task ASLI me ab shuru hua (uska timer yahi se chalna chahiye)
+    private void notifyStarted(String uid, String target, String type) {
+        try {
+            long maxMs = SLOT_TASK_TIMEOUT_MS + SLOT_LOAD_ALLOWANCE_MS + SLOT_VERIFY_EXTRA_MS;
+            mainWebView.evaluateJavascript(
+                    "try{if(typeof window.onWorkerStarted==='function')window.onWorkerStarted("
+                            + JSONObject.quote(uid == null ? "" : uid) + ","
+                            + JSONObject.quote(target == null ? "" : target) + ","
+                            + JSONObject.quote(type == null ? "" : type) + "," + maxMs + ");}catch(e){}",
+                    null);
+        } catch (Exception ignored) {}
+    }
+
+    // ==================================================================
     // PARALLEL ENGINE: har account = alag WebView + alag cookie profile
     // - Accounts ek ke baad ek start hote hain (beech me startGapMs ka gap)
     // - Ek saath chalne wale accounts MAX_PARALLEL tak
@@ -1740,10 +1967,11 @@ public class MainActivity extends Activity {
     // DEFAULT 1 = turn by turn: ek account ka task poora hone ke baad hi agla khulega
     private volatile int maxParallel = 1;
     // Ek account ke itne tasks ek hi WebView me lagatar (tez, bar bar account switch nahi)
-    private static final int STICKY_BATCH = 5;
+    // SMOOTH v2: 1 = har task ke baad agla account (round-robin)
+    private static final int STICKY_BATCH = 1;
     private int stickyCount = 0;
     // FIX: Parallel task ko poora samay (retry samet). Pehle 40 sec tha.
-    private static final long SLOT_TASK_TIMEOUT_MS = 120000L;
+    private static final long SLOT_TASK_TIMEOUT_MS = 25000L;
 
     private class Slot {
         String uid = "";
@@ -1758,6 +1986,13 @@ public class MainActivity extends Activity {
         Runnable timeout;
         boolean acted = false;
         long startedAt = 0;
+        // SMOOTH v2
+        boolean extended = false;
+        String preKey = "";
+        boolean preLoading = false;
+        boolean preReady = false;
+        String preBad = "";
+        long preAt = 0;
     }
 
     private class PTask {
@@ -1781,9 +2016,9 @@ public class MainActivity extends Activity {
     private static final long DEAD_TTL_MS = 7L * 24 * 60 * 60 * 1000L;
 
     // Anti-block gap: ek task KHATAM hone ke baad itna ruk ke agla account (default 9 sec +- jitter)
-    private volatile long startGapMs = 9000L;
-    private volatile long gapJitterMs = 2000L;
-    private long curGapMs = 9000L;
+    private volatile long startGapMs = 7000L;
+    private volatile long gapJitterMs = 0L;
+    private long curGapMs = 7000L;
     private long lastStartAt = 0;
     private long lastEndAt = 0;
     private final Random rnd = new Random();
@@ -1800,8 +2035,9 @@ public class MainActivity extends Activity {
     private long nextGap() {
         long j = gapJitterMs;
         long g = startGapMs;
-        if (j > 0) g += (long) (rnd.nextDouble() * 2.0 * j) - j;
-        return Math.max(0L, g);
+        // SMOOTH v2: jitter sirf upar ki taraf, gap kabhi MIN_GAP_MS (7 sec) se kam nahi
+        if (j > 0) g += (long) (rnd.nextDouble() * j);
+        return Math.max(MIN_GAP_MS, g);
     }
 
     private boolean parallelEnabled(String cookieStr) {
@@ -1889,6 +2125,7 @@ public class MainActivity extends Activity {
         long base = (maxParallel <= 1) ? lastEndAt : lastStartAt;
         long wait = base + curGapMs - System.currentTimeMillis();
         if (wait > 0) {
+            prewarmNext(); // SMOOTH v2: gap me next account ko reload karke taiyar rakho
             if (!pumpScheduled) {
                 pumpScheduled = true;
                 uiHandler.postDelayed(pumpRunnable, wait);
@@ -1896,24 +2133,7 @@ public class MainActivity extends Activity {
             return;
         }
 
-        PTask pick = null;
-        // 1) Pehle wahi account (WebView garam hai -> tez), jab tak STICKY_BATCH poora na ho
-        if (stickyCount < STICKY_BATCH) {
-            for (PTask t : pendingTasks) {
-                Slot s = slots.get(t.uid);
-                if (s != null && s.active) continue;
-                if (t.uid.equals(lastStartedUid)) { pick = t; break; }
-            }
-        }
-        // 2) Warna agla account (round-robin). Dusra na ho to hi same account ka agla task
-        if (pick == null) {
-            for (PTask t : pendingTasks) {
-                Slot s = slots.get(t.uid);
-                if (s != null && s.active) continue; // is account ka task abhi chal raha hai
-                if (pick == null) pick = t;          // fallback: pehla free task
-                if (!t.uid.equals(lastStartedUid)) { pick = t; break; }
-            }
-        }
+        PTask pick = choosePending();
         if (pick != null) {
             pendingTasks.remove(pick);
             if (pick.uid.equals(lastStartedUid)) {
@@ -1945,9 +2165,17 @@ public class MainActivity extends Activity {
         }
 
         final Slot fs = s;
+        // SMOOTH v2: gap ke dauran is account ka page pehle se khul chuka ho to wahi use karo
+        // 60 sec se purana prewarm page bharose layak nahi, naya load karo
+        final boolean pre = t.key.equals(fs.preKey) && (fs.preLoading || fs.preReady)
+                && System.currentTimeMillis() - fs.preAt < 60000L;
+        final boolean preReady = pre && fs.preReady;
+        final String preBad = pre ? fs.preBad : "";
+        fs.preKey = ""; fs.preLoading = false; fs.preReady = false; fs.preBad = "";
         // Cookies sirf tab lagao jab zaroorat ho (naya WebView ya session badla). Garam WebView ki cookies mat chhedo.
         ensureCookies(fs, t.cookieStr);
         fs.acted = false;
+        fs.extended = false;
         fs.startedAt = System.currentTimeMillis();
         fs.active = true;
         fs.retries = 0;
@@ -1959,10 +2187,26 @@ public class MainActivity extends Activity {
         fs.timeout = new Runnable() {
             @Override
             public void run() {
-                finishSlot(fs, false, "Timeout");
+                slotTimeout(fs);
             }
         };
-        uiHandler.postDelayed(fs.timeout, SLOT_TASK_TIMEOUT_MS);
+        uiHandler.postDelayed(fs.timeout, SLOT_TASK_TIMEOUT_MS + (preReady ? 0L : SLOT_LOAD_ALLOWANCE_MS));
+        dbg("slot start uid=" + fs.uid + " type=" + fs.taskType + " target=" + fs.target + " prewarmed=" + pre);
+        notifyStarted(fs.uid, fs.target, fs.taskType);
+        if (preBad.length() > 0) {
+            finishSlot(fs, false, preBad);
+            return;
+        }
+        if (preReady) {
+            uiHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (fs.active) injectForSlot(fs);
+                }
+            }, 300);
+            return;
+        }
+        if (pre) return; // page abhi load ho raha hai, onPageFinished se script chalegi
         fs.wv.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
     }
 
@@ -2084,8 +2328,8 @@ public class MainActivity extends Activity {
 
     // 'not found' / 'unavailable' / page error par 2 baar page reload karke dobara try
     private boolean shouldRetry(Slot s, String msg) {
-        if (s == null || !s.active || s.retries >= 2) return false;
-        if (System.currentTimeMillis() - s.startedAt > 80000) return false; // retry ke liye samay bacha ho
+        if (s == null || !s.active || s.retries >= 1) return false;
+        if (System.currentTimeMillis() - s.startedAt > 14000) return false; // retry ke liye samay bacha ho
         String m = msg == null ? "" : msg.toLowerCase();
         return m.contains("not found") || m.contains("did not register")
                 || m.contains("page error") || m.contains("js error")
@@ -2281,6 +2525,15 @@ public class MainActivity extends Activity {
         @Override
         public void onPageFinished(final WebView view, String url) {
             super.onPageFinished(view, url);
+            // SMOOTH v2: task shuru hone se pehle prewarm wala page load hua
+            if (!s.active) {
+                if (s.preLoading && url != null && !url.startsWith("about:")) {
+                    s.preLoading = false;
+                    s.preReady = true;
+                    s.preBad = fatalPathReason(url);
+                }
+                return;
+            }
             if (!s.active || url == null || url.startsWith("about:")) return;
 
             String path = "";
@@ -2313,6 +2566,9 @@ public class MainActivity extends Activity {
                 } else {
                     finishSlot(s, false, "Page error");
                 }
+            } else if (!s.active && request != null && request.isForMainFrame()) {
+                // prewarm page fail: task start par normal tareeke se load hoga
+                s.preKey = ""; s.preLoading = false; s.preReady = false; s.preBad = "";
             }
         }
     }
