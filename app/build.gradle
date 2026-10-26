@@ -10,13 +10,27 @@ android {
         applicationId "com.upfollow.app"
         minSdk 21
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode 2
+        versionName "1.1"
+    }
+
+    // Har build isi ek keystore se sign hoga, isliye update seedha install hoga
+    signingConfigs {
+        upfollow {
+            storeFile file('upfollow.keystore')
+            storePassword 'K3biKj3H6Wvnyyl0ON5n'
+            keyAlias 'upfollow'
+            keyPassword 'K3biKj3H6Wvnyyl0ON5n'
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig signingConfigs.upfollow
+        }
         release {
             minifyEnabled false
+            signingConfig signingConfigs.upfollow
         }
     }
     compileOptions {
