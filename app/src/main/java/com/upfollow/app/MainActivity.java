@@ -58,7 +58,7 @@ public class MainActivity extends Activity {
     // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
     // SMOOTH: 3 -> 4 (is naye build ke liye)
     // SMOOTH v2: 4 -> 5
-    private static final int APP_VERSION_CODE = 5;
+    private static final int APP_VERSION_CODE = 6;
     // Secret + version wala user agent: SIRF apni website (mainWebView) ke liye
     // onCreate me phone ke asli WebView user agent se set hota hai
     private String USER_AGENT_APP = "";
