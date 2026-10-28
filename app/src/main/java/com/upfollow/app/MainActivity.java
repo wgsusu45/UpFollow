@@ -1270,6 +1270,9 @@ public class MainActivity extends Activity {
             // DIRECT MODE: cookie ho to seedha HTTP request. Cookie na ho / kaam na kare to neeche ka purana tareeka chalta hai.
             if (direct != null && direct.run(target, taskType, mediaId, cookieStr, new DirectRunner.Callback() {
                 @Override
+                public void onLog(String line) { dbg("direct " + line); }
+
+                @Override
                 public void onStarted(final String t, final String ty, final long maxMs) {
                     uiHandler.post(new Runnable() {
                         @Override
