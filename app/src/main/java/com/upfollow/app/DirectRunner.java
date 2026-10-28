@@ -30,6 +30,9 @@ import java.util.regex.Pattern;
 /**
  * Direct HTTP runner: page khole bina follow / like bhejta hai.
  * Alag file hai, MainActivity me sirf chhota hook lagta hai.
+ *
+ * CHANGE: ab targetId (numeric user id) pass kar sakte ho. ID mil gayi to
+ * profile lookup hota hi nahi, isliye "lookup throttled" error nahi aata.
  */
 public class DirectRunner {
 
@@ -37,22 +40,22 @@ public class DirectRunner {
         void onStarted(String target, String type, long maxMs);
         void onResult(boolean success, String message, String target);
 
-        // default method: MainActivity me onLog na ho to bhi compile error nahi aayega
         default void onLog(String line) {}
     }
 
-    // ---- settings (chaho to badal sakte ho) ----
-    public static int DAILY_FOLLOW_CAP = 150;   // ek account, ek din
+    // ---- settings ----
+    public static int DAILY_FOLLOW_CAP = 150;
     public static int DAILY_LIKE_CAP = 300;
-    private static final int MAX_PER_ACCOUNT = 2;           // ek account par ek saath max requests
-    private static final long MIN_GAP_MS = 800;             // ek account ki do requests ke beech minimum gap
-    private static final long BLOCK_PAUSE_MS = 30L * 60 * 1000; // action block ke baad 30 min pause
-    private static final long LOOKUP_GAP_MS = 4000;             // do profile lookups ke beech minimum gap (sab accounts mila ke)
-    private static final long LOOKUP_PAUSE_MS = 2L * 60 * 1000; // lookup 429 ke baad 2 min tak naye lookup nahi
+    private static final int MAX_PER_ACCOUNT = 2;
+    private static final long MIN_GAP_MS = 800;
+    private static final long BLOCK_PAUSE_MS = 60L * 60 * 1000;     // action block ke baad 60 min
+    private static final long LOOKUP_GAP_MS = 10000;                // lookups ke beech 10 sec
+    private static final long LOOKUP_PAUSE_MS = 8L * 60 * 1000;     // lookup 429 ke baad 8 min
 
     private static final String APP_ID = "936619743392459";
     private static final String B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     private static final Pattern MEDIA_RE = Pattern.compile("/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)");
+    private static final Pattern DIGITS = Pattern.compile("^[0-9]{5,20}$");
 
     private final SharedPreferences prefs;
     private final String ua;
@@ -96,12 +99,19 @@ public class DirectRunner {
         this.ua = userAgent == null ? "" : userAgent;
     }
 
+    /** Purana signature: targetId nahi, to lookup/cache use hoga. */
+    public boolean run(final String target, final String type, final String mediaUrl,
+                       final String cookie, final Callback cb) {
+        return run(target, null, type, mediaUrl, cookie, cb);
+    }
+
     /**
+     * NAYA: targetId = target ka numeric Instagram user id (null/empty ho sakta hai).
      * true  = task hamne le liya (result Callback se aayega)
      * false = hamare paas kaam ka cookie nahi, purana tareeka chalao
      */
-    public boolean run(final String target, final String type, final String mediaUrl,
-                       final String cookie, final Callback cb) {
+    public boolean run(final String target, final String targetId, final String type,
+                       final String mediaUrl, final String cookie, final Callback cb) {
         if (target == null || target.isEmpty() || cookie == null) return false;
         final Map<String, String> ck = parseCookie(cookie);
         String sid = ck.get("sessionid");
@@ -125,7 +135,7 @@ public class DirectRunner {
                     got = true;
                     gap(a);
                     cb.onStarted(target, type, 20000L);
-                    Res r = doTask(key, target, type, mediaUrl, ck);
+                    Res r = doTask(key, target, targetId, type, mediaUrl, ck);
                     cb.onResult(r.ok, r.msg, target);
                 } catch (Exception e) {
                     String m = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
@@ -163,7 +173,7 @@ public class DirectRunner {
     }
 
     // ------------------------------------------------------------------
-    private Res doTask(String key, String target, String type, String mediaUrl,
+    private Res doTask(String key, String target, String targetId, String type, String mediaUrl,
                        Map<String, String> ck) throws Exception {
         boolean like = "like".equalsIgnoreCase(type);
 
@@ -180,28 +190,38 @@ public class DirectRunner {
             return new Res(false, "Action blocked: daily cap reached");
         }
 
-        // csrftoken cookie me na ho to ek bana ke cookie + header dono me lagate hain
         String csrf = ck.get("csrftoken");
         if (csrf == null || csrf.isEmpty()) {
             ck.put("csrftoken", randomToken(32));
         }
 
-        Res res = like ? doLike(key, mediaUrl, target, ck) : doFollow(key, target, ck);
+        Res res = like ? doLike(key, mediaUrl, target, ck) : doFollow(key, target, targetId, ck);
         if (res.ok) prefs.edit().putInt(capKey, used + 1).apply();
         return res;
     }
 
-    private Res doFollow(String key, String target, Map<String, String> ck) throws Exception {
+    private Res doFollow(String key, String target, String targetId, Map<String, String> ck) throws Exception {
         String name = target.startsWith("@") ? target.substring(1) : target;
         String cacheKey = name.toLowerCase(Locale.US);
-        String id = idCache.get(cacheKey);
+        String id = null;
 
+        // 1) Server/list se aayi hui ID (lookup bilkul nahi lagega)
+        if (targetId != null && DIGITS.matcher(targetId.trim()).matches()) {
+            id = targetId.trim();
+            idCache.put(cacheKey, id);
+            prefs.edit().putString("uid_" + cacheKey, id).apply();
+        }
+
+        // 2) Memory cache
+        if (id == null) id = idCache.get(cacheKey);
+
+        // 3) Phone me saved ID
         if (id == null) {
-            // pehle phone me saved ID dekho (dobara lookup na karna pade)
             id = prefs.getString("uid_" + cacheKey, null);
             if (id != null) idCache.put(cacheKey, id);
         }
 
+        // 4) Aakhri raasta: profile lookup
         if (id == null) {
             if (System.currentTimeMillis() < lookupPausedUntil) {
                 return new Res(false, "Failed: profile lookup throttled (cooling down)");
@@ -212,8 +232,7 @@ public class DirectRunner {
             lookupGap();
             Http p = httpR("GET", lookupUrl, ck, lookupRef);
             if (p.code == 429) {
-                // ek baar thoda ruk ke dobara
-                Thread.sleep(4000);
+                Thread.sleep(8000 + rnd.nextInt(4000));
                 lookupGap();
                 p = httpR("GET", lookupUrl, ck, lookupRef);
             }
@@ -317,12 +336,10 @@ public class DirectRunner {
         if (h.code == 429 || bl.contains("feedback_required") || bl.contains("\"spam\":true")
                 || bl.contains("please wait a few minutes")) {
             if (isAction) {
-                // asli follow/like par block aaya, tabhi cooldown lagao
                 pausedUntil.put(key, Long.valueOf(System.currentTimeMillis() + BLOCK_PAUSE_MS));
                 log("COOLDOWN set (action): HTTP " + h.code + " :: " + cut(b));
                 return new Res(false, "Action blocked: Instagram rate limit");
             }
-            // profile lookup throttle hua: ye account block nahi hai, cooldown mat lagao
             log("Lookup throttled (no cooldown): HTTP " + h.code + " :: " + cut(b));
             return new Res(false, "Failed: profile lookup throttled (HTTP " + h.code + ")");
         }
