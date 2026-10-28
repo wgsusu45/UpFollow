@@ -84,8 +84,6 @@ public class MainActivity extends Activity {
     private NotificationManager notificationManager;
     private PowerManager.WakeLock wakeLock;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
-    // DIRECT MODE: page kholne ki jagah seedha request (DirectRunner.java)
-    private DirectRunner direct;
 
     private volatile String mainUrl = "";
     private String deviceKey = "";
@@ -123,7 +121,6 @@ public class MainActivity extends Activity {
         if (baseUa == null) baseUa = "";
         baseUa = baseUa.replace("; wv", "").replace(" Version/4.0", "");
         USER_AGENT = baseUa;
-        direct = new DirectRunner(this, USER_AGENT);
         USER_AGENT_APP = USER_AGENT + " " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
 
         setContentView(R.layout.activity_main);
@@ -1266,46 +1263,16 @@ public class MainActivity extends Activity {
         // Naya: account ki cookies ke saath task chalao (har account apna session use karta hai)
         @JavascriptInterface
         public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
-            runTaskWithId(target, null, taskType, mediaId, cookieStr);
-        }
-
-        // NAYA: targetId (numeric Instagram user id) bhi pass kar sakte ho — lookup bilkul nahi hoga
-        @JavascriptInterface
-        public void runTaskWithId(final String target, final String targetId, final String taskType, final String mediaId, final String cookieStr) {
             if (!trusted()) return;
-            // DIRECT MODE: cookie ho to seedha HTTP request. Cookie na ho / kaam na kare to neeche ka purana tareeka chalta hai.
-            if (direct != null && direct.run(target, targetId, taskType, mediaId, cookieStr, new DirectRunner.Callback() {
-                @Override
-                public void onLog(String line) { dbg("direct " + line); }
-
-                @Override
-                public void onStarted(final String t, final String ty, final long maxMs) {
-                    uiHandler.post(new Runnable() {
-                        @Override
-                        public void run() { notifyStarted("0", t, ty); }
-                    });
-                }
-
-                @Override
-                public void onResult(final boolean ok, final String msg, final String t) {
-                    dbg("direct " + taskType + " @" + t + " ok=" + ok + " msg=" + msg);
-                    uiHandler.post(new Runnable() {
-                        @Override
-                        public void run() { sendParallelResult("0", t, ok, msg); }
-                    });
-                }
-            })) {
-                return;
-            }
             // NAYA: multi-account parallel mode (WebView support na kare to neeche wala purana code chalega)
             if (parallelEnabled(cookieStr)) {
-                parallelEnqueue(target, targetId, taskType, mediaId, cookieStr);
+                parallelEnqueue(target, taskType, mediaId, cookieStr);
                 return;
             }
             // SMOOTH: single mode me ab proper queue (FIFO, accounts ke beech gap, Stop se cancel).
             // Neeche purana code as-is bacha hai; SINGLE_QUEUE_ENABLED = false karo to wahi chalega.
             if (SINGLE_QUEUE_ENABLED) {
-                singleEnqueue(target, targetId, taskType, mediaId, cookieStr);
+                singleEnqueue(target, taskType, mediaId, cookieStr);
                 return;
             }
             uiHandler.post(new Runnable() {
@@ -1618,13 +1585,8 @@ public class MainActivity extends Activity {
     };
 
     private void singleEnqueue(String target, String taskType, String mediaId, String cookieStr) {
-        singleEnqueue(target, null, taskType, mediaId, cookieStr);
-    }
-
-    private void singleEnqueue(String target, String targetId, String taskType, String mediaId, String cookieStr) {
         final PTask t = new PTask();
         t.target = target == null ? "" : target;
-        t.targetId = targetId == null ? "" : targetId.trim();
         t.taskType = taskType == null ? "follow" : taskType;
         t.mediaId = mediaId == null ? "" : mediaId;
         t.cookieStr = cookieStr == null ? "" : cookieStr;
@@ -2036,7 +1998,6 @@ public class MainActivity extends Activity {
     private class PTask {
         String uid = "";
         String target = "";
-        String targetId = "";   // NAYA: numeric Instagram user id (lookup avoid karta hai)
         String taskType = "follow";
         String mediaId = "";
         String cookieStr = "";
@@ -2123,13 +2084,8 @@ public class MainActivity extends Activity {
     }
 
     private void parallelEnqueue(String target, String taskType, String mediaId, String cookieStr) {
-        parallelEnqueue(target, null, taskType, mediaId, cookieStr);
-    }
-
-    private void parallelEnqueue(String target, String targetId, String taskType, String mediaId, String cookieStr) {
         final PTask t = new PTask();
         t.target = target == null ? "" : target;
-        t.targetId = targetId == null ? "" : targetId.trim();
         t.taskType = taskType == null ? "follow" : taskType;
         t.mediaId = mediaId == null ? "" : mediaId;
         t.cookieStr = cookieStr;
