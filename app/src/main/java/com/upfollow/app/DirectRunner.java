@@ -13,7 +13,9 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -34,6 +36,7 @@ public class DirectRunner {
     public interface Callback {
         void onStarted(String target, String type, long maxMs);
         void onResult(boolean success, String message, String target);
+        void onLog(String line);
     }
 
     // ---- settings (chaho to badal sakte ho) ----
@@ -54,6 +57,14 @@ public class DirectRunner {
     private final Map<String, Long> pausedUntil = new ConcurrentHashMap<String, Long>();
     private final Map<String, Acct> accts = new ConcurrentHashMap<String, Acct>();
     private final Random rnd = new Random();
+    private volatile Callback logCb;
+
+    private void log(String s) {
+        Callback c = logCb;
+        if (c != null) {
+            try { c.onLog(s); } catch (Exception ignored) {}
+        }
+    }
 
     private static class Acct {
         final Semaphore sem = new Semaphore(MAX_PER_ACCOUNT, true);
@@ -63,6 +74,7 @@ public class DirectRunner {
     private static class Http {
         int code;
         String body = "";
+        List<String> setCookies = new ArrayList<String>();
         JSONObject json;
     }
 
@@ -90,6 +102,7 @@ public class DirectRunner {
         final String uid = ck.get("ds_user_id");
         final String key = (uid != null && !uid.isEmpty()) ? uid : Integer.toHexString(sid.hashCode());
 
+        logCb = cb;
         pool.execute(new Runnable() {
             @Override
             public void run() {
@@ -163,7 +176,7 @@ public class DirectRunner {
         String id = idCache.get(cacheKey);
 
         if (id == null) {
-            Http h = http("GET", "https://www.instagram.com/api/v1/users/web_profile_info/?username="
+            Http h = httpR("GET", "https://www.instagram.com/api/v1/users/web_profile_info/?username="
                     + URLEncoder.encode(name, "UTF-8"), ck, "https://www.instagram.com/" + name + "/");
             if (h.code == 404) return new Res(false, "Profile unavailable");
             Res err = commonError(key, h);
@@ -179,7 +192,7 @@ public class DirectRunner {
             idCache.put(cacheKey, id);
         }
 
-        Http h = http("POST", "https://www.instagram.com/api/v1/friendships/create/" + id + "/",
+        Http h = httpR("POST", "https://www.instagram.com/api/v1/friendships/create/" + id + "/",
                 ck, "https://www.instagram.com/" + name + "/");
         Res err = commonError(key, h);
         if (err != null) return err;
@@ -206,7 +219,7 @@ public class DirectRunner {
         String mediaId = shortcodeToId(code);
         if (mediaId == null) return new Res(false, "Failed: bad post code");
 
-        Http h = http("POST", "https://www.instagram.com/api/v1/web/likes/" + mediaId + "/like/",
+        Http h = httpR("POST", "https://www.instagram.com/api/v1/web/likes/" + mediaId + "/like/",
                 ck, "https://www.instagram.com/p/" + code + "/");
         if (h.code == 404) return new Res(false, "Profile unavailable");
         Res err = commonError(key, h);
@@ -220,6 +233,29 @@ public class DirectRunner {
         if (ml.contains("already")) return new Res(true, "Already liked");
         if (ml.contains("not found") || ml.contains("unavailable")) return new Res(false, "Profile unavailable");
         return new Res(false, "Failed: HTTP " + h.code + " " + cut(m.isEmpty() ? h.body : m));
+    }
+
+    /** 403 + csrf error aaye to naya csrftoken lekar ek baar dobara try. */
+    private Http httpR(String method, String url, Map<String, String> ck, String referer) throws IOException {
+        Http h = http(method, url, ck, referer);
+        if (h.code == 403 && h.body != null && h.body.toLowerCase(Locale.US).contains("csrf")) {
+            refreshCsrf(ck);
+            h = http(method, url, ck, referer);
+        }
+        return h;
+    }
+
+    private void refreshCsrf(Map<String, String> ck) {
+        try {
+            Http g = http("GET", "https://www.instagram.com/accounts/login/", ck, "https://www.instagram.com/");
+            for (String sc : g.setCookies) {
+                if (sc.startsWith("csrftoken=")) {
+                    int e = sc.indexOf(';');
+                    String v = e > 0 ? sc.substring(10, e) : sc.substring(10);
+                    if (!v.isEmpty()) ck.put("csrftoken", v);
+                }
+            }
+        } catch (Exception ignored) {}
     }
 
     /** login / challenge / block jaise common errors. null = koi common error nahi. */
@@ -238,7 +274,7 @@ public class DirectRunner {
             pausedUntil.put(key, System.currentTimeMillis() + BLOCK_PAUSE_MS);
             return new Res(false, "Action blocked: Instagram rate limit");
         }
-        if (h.code == 403) return new Res(false, "Action blocked: HTTP 403");
+        if (h.code == 403) return new Res(false, "Failed: HTTP 403 rejected by Instagram (see log)");
         return null;
     }
 
@@ -268,6 +304,8 @@ public class DirectRunner {
             }
             Http h = new Http();
             h.code = c.getResponseCode();
+            List<String> sc = c.getHeaderFields().get("Set-Cookie");
+            if (sc != null) h.setCookies.addAll(sc);
             InputStream is = h.code >= 400 ? c.getErrorStream() : c.getInputStream();
             if (is != null) {
                 ByteArrayOutputStream bo = new ByteArrayOutputStream();
@@ -278,6 +316,8 @@ public class DirectRunner {
                 h.body = bo.toString("UTF-8");
             }
             try { h.json = new JSONObject(h.body); } catch (Exception ignored) { h.json = null; }
+            String shortUrl = url.indexOf('?') > 0 ? url.substring(0, url.indexOf('?')) : url;
+            log(method + " " + shortUrl.replace("https://www.instagram.com", "") + " -> HTTP " + h.code + " :: " + cut(h.body));
             return h;
         } finally {
             c.disconnect();
@@ -327,6 +367,6 @@ public class DirectRunner {
     private static String cut(String s) {
         if (s == null) return "";
         s = s.replaceAll("[\\r\\n]+", " ").trim();
-        return s.length() > 80 ? s.substring(0, 80) : s;
+        return s.length() > 160 ? s.substring(0, 160) : s;
     }
 }
