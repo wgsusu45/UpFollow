@@ -84,6 +84,8 @@ public class MainActivity extends Activity {
     private NotificationManager notificationManager;
     private PowerManager.WakeLock wakeLock;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    // DIRECT MODE: page kholne ki jagah seedha request (DirectRunner.java)
+    private DirectRunner direct;
 
     private volatile String mainUrl = "";
     private String deviceKey = "";
@@ -121,6 +123,7 @@ public class MainActivity extends Activity {
         if (baseUa == null) baseUa = "";
         baseUa = baseUa.replace("; wv", "").replace(" Version/4.0", "");
         USER_AGENT = baseUa;
+        direct = new DirectRunner(this, USER_AGENT);
         USER_AGENT_APP = USER_AGENT + " " + APP_SECRET_KEY + " UFV/" + APP_VERSION_CODE;
 
         setContentView(R.layout.activity_main);
@@ -1264,6 +1267,27 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
             if (!trusted()) return;
+            // DIRECT MODE: cookie ho to seedha HTTP request. Cookie na ho / kaam na kare to neeche ka purana tareeka chalta hai.
+            if (direct != null && direct.run(target, taskType, mediaId, cookieStr, new DirectRunner.Callback() {
+                @Override
+                public void onStarted(final String t, final String ty, final long maxMs) {
+                    uiHandler.post(new Runnable() {
+                        @Override
+                        public void run() { notifyStarted("0", t, ty); }
+                    });
+                }
+
+                @Override
+                public void onResult(final boolean ok, final String msg, final String t) {
+                    dbg("direct " + taskType + " @" + t + " ok=" + ok + " msg=" + msg);
+                    uiHandler.post(new Runnable() {
+                        @Override
+                        public void run() { sendParallelResult("0", t, ok, msg); }
+                    });
+                }
+            })) {
+                return;
+            }
             // NAYA: multi-account parallel mode (WebView support na kare to neeche wala purana code chalega)
             if (parallelEnabled(cookieStr)) {
                 parallelEnqueue(target, taskType, mediaId, cookieStr);
