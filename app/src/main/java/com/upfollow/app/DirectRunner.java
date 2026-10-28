@@ -47,6 +47,8 @@ public class DirectRunner {
     private static final int MAX_PER_ACCOUNT = 2;           // ek account par ek saath max requests
     private static final long MIN_GAP_MS = 800;             // ek account ki do requests ke beech minimum gap
     private static final long BLOCK_PAUSE_MS = 30L * 60 * 1000; // action block ke baad 30 min pause
+    private static final long LOOKUP_GAP_MS = 4000;             // do profile lookups ke beech minimum gap (sab accounts mila ke)
+    private static final long LOOKUP_PAUSE_MS = 2L * 60 * 1000; // lookup 429 ke baad 2 min tak naye lookup nahi
 
     private static final String APP_ID = "936619743392459";
     private static final String B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -60,6 +62,9 @@ public class DirectRunner {
     private final ConcurrentHashMap<String, Acct> accts = new ConcurrentHashMap<String, Acct>();
     private final Random rnd = new Random();
     private volatile Callback logCb;
+    private final Object lookupLock = new Object();
+    private long lastLookup = 0;
+    private volatile long lookupPausedUntil = 0;
 
     private void log(String s) {
         Callback c = logCb;
@@ -145,6 +150,18 @@ public class DirectRunner {
         }
     }
 
+    private void lookupGap() throws InterruptedException {
+        synchronized (lookupLock) {
+            long now = System.currentTimeMillis();
+            long wait = lastLookup + LOOKUP_GAP_MS - now;
+            if (wait > 0) {
+                Thread.sleep(wait);
+                now += wait;
+            }
+            lastLookup = now;
+        }
+    }
+
     // ------------------------------------------------------------------
     private Res doTask(String key, String target, String type, String mediaUrl,
                        Map<String, String> ck) throws Exception {
@@ -180,11 +197,34 @@ public class DirectRunner {
         String id = idCache.get(cacheKey);
 
         if (id == null) {
-            Http p = httpR("GET", "https://www.instagram.com/api/v1/users/web_profile_info/?username="
-                    + URLEncoder.encode(name, "UTF-8"), ck, "https://www.instagram.com/" + name + "/");
+            // pehle phone me saved ID dekho (dobara lookup na karna pade)
+            id = prefs.getString("uid_" + cacheKey, null);
+            if (id != null) idCache.put(cacheKey, id);
+        }
+
+        if (id == null) {
+            if (System.currentTimeMillis() < lookupPausedUntil) {
+                return new Res(false, "Failed: profile lookup throttled (cooling down)");
+            }
+            String lookupUrl = "https://www.instagram.com/api/v1/users/web_profile_info/?username="
+                    + URLEncoder.encode(name, "UTF-8");
+            String lookupRef = "https://www.instagram.com/" + name + "/";
+            lookupGap();
+            Http p = httpR("GET", lookupUrl, ck, lookupRef);
+            if (p.code == 429) {
+                // ek baar thoda ruk ke dobara
+                Thread.sleep(4000);
+                lookupGap();
+                p = httpR("GET", lookupUrl, ck, lookupRef);
+            }
             if (p.code == 404) return new Res(false, "Profile unavailable");
             Res perr = commonError(key, p, false);
-            if (perr != null) return perr;
+            if (perr != null) {
+                if (perr.msg.startsWith("Failed: profile lookup throttled")) {
+                    lookupPausedUntil = System.currentTimeMillis() + LOOKUP_PAUSE_MS;
+                }
+                return perr;
+            }
             String found = "";
             if (p.json != null) {
                 JSONObject data = p.json.optJSONObject("data");
@@ -194,6 +234,7 @@ public class DirectRunner {
             if (found.isEmpty()) return new Res(false, "Profile unavailable");
             id = found;
             idCache.put(cacheKey, id);
+            prefs.edit().putString("uid_" + cacheKey, id).apply();
         }
 
         Http h = httpR("POST", "https://www.instagram.com/api/v1/friendships/create/" + id + "/",
