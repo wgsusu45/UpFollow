@@ -29,14 +29,16 @@ import java.util.regex.Pattern;
 
 /**
  * Direct HTTP runner: page khole bina follow / like bhejta hai.
- * Alag file hai, MainActivity me sirf chhota hook lagta hai (neeche steps me).
+ * Alag file hai, MainActivity me sirf chhota hook lagta hai.
  */
 public class DirectRunner {
 
     public interface Callback {
         void onStarted(String target, String type, long maxMs);
         void onResult(boolean success, String message, String target);
-        void onLog(String line);
+
+        // default method: MainActivity me onLog na ho to bhi compile error nahi aayega
+        default void onLog(String line) {}
     }
 
     // ---- settings (chaho to badal sakte ho) ----
@@ -55,7 +57,7 @@ public class DirectRunner {
     private final ExecutorService pool = Executors.newFixedThreadPool(6);
     private final Map<String, String> idCache = new ConcurrentHashMap<String, String>();
     private final Map<String, Long> pausedUntil = new ConcurrentHashMap<String, Long>();
-    private final Map<String, Acct> accts = new ConcurrentHashMap<String, Acct>();
+    private final ConcurrentHashMap<String, Acct> accts = new ConcurrentHashMap<String, Acct>();
     private final Random rnd = new Random();
     private volatile Callback logCb;
 
@@ -109,7 +111,7 @@ public class DirectRunner {
                 Acct a = accts.get(key);
                 if (a == null) {
                     Acct n = new Acct();
-                    Acct old = ((ConcurrentHashMap<String, Acct>) accts).putIfAbsent(key, n);
+                    Acct old = accts.putIfAbsent(key, n);
                     a = old != null ? old : n;
                 }
                 boolean got = false;
@@ -117,7 +119,7 @@ public class DirectRunner {
                     a.sem.acquire();
                     got = true;
                     gap(a);
-                    cb.onStarted(target, type, 20000);
+                    cb.onStarted(target, type, 20000L);
                     Res r = doTask(key, target, type, mediaUrl, ck);
                     cb.onResult(r.ok, r.msg, target);
                 } catch (Exception e) {
@@ -149,7 +151,8 @@ public class DirectRunner {
         boolean like = "like".equalsIgnoreCase(type);
 
         Long pu = pausedUntil.get(key);
-        if (pu != null && System.currentTimeMillis() < pu) {
+        if (pu != null && System.currentTimeMillis() < pu.longValue()) {
+            log("Cooldown active: " + ((pu.longValue() - System.currentTimeMillis()) / 60000L) + " min left");
             return new Res(false, "Action blocked: account on cooldown");
         }
 
@@ -161,7 +164,8 @@ public class DirectRunner {
         }
 
         // csrftoken cookie me na ho to ek bana ke cookie + header dono me lagate hain
-        if (ck.get("csrftoken") == null || ck.get("csrftoken").isEmpty()) {
+        String csrf = ck.get("csrftoken");
+        if (csrf == null || csrf.isEmpty()) {
             ck.put("csrftoken", randomToken(32));
         }
 
@@ -176,14 +180,14 @@ public class DirectRunner {
         String id = idCache.get(cacheKey);
 
         if (id == null) {
-            Http h = httpR("GET", "https://www.instagram.com/api/v1/users/web_profile_info/?username="
+            Http p = httpR("GET", "https://www.instagram.com/api/v1/users/web_profile_info/?username="
                     + URLEncoder.encode(name, "UTF-8"), ck, "https://www.instagram.com/" + name + "/");
-            if (h.code == 404) return new Res(false, "Profile unavailable");
-            Res err = commonError(key, h);
-            if (err != null) return err;
+            if (p.code == 404) return new Res(false, "Profile unavailable");
+            Res perr = commonError(key, p, false);
+            if (perr != null) return perr;
             String found = "";
-            if (h.json != null) {
-                JSONObject data = h.json.optJSONObject("data");
+            if (p.json != null) {
+                JSONObject data = p.json.optJSONObject("data");
                 JSONObject user = data == null ? null : data.optJSONObject("user");
                 if (user != null) found = user.optString("id", "");
             }
@@ -194,26 +198,26 @@ public class DirectRunner {
 
         Http h = httpR("POST", "https://www.instagram.com/api/v1/friendships/create/" + id + "/",
                 ck, "https://www.instagram.com/" + name + "/");
-        Res err = commonError(key, h);
+        Res err = commonError(key, h, true);
         if (err != null) return err;
 
         if (h.json != null && "ok".equals(h.json.optString("status"))) {
             return new Res(true, "Followed Successfully");
         }
-        String m = h.json != null ? h.json.optString("message", "") : "";
-        String ml = m.toLowerCase(Locale.US);
+        String msg = h.json != null ? h.json.optString("message", "") : "";
+        String ml = msg.toLowerCase(Locale.US);
         if (ml.contains("not found") || ml.contains("isn't available") || ml.contains("unavailable")) {
             return new Res(false, "Profile unavailable");
         }
         if (ml.contains("already")) return new Res(true, "Already followed");
-        return new Res(false, "Failed: HTTP " + h.code + " " + cut(m.isEmpty() ? h.body : m));
+        return new Res(false, "Failed: HTTP " + h.code + " " + cut(msg.isEmpty() ? h.body : msg));
     }
 
     private Res doLike(String key, String mediaUrl, String target, Map<String, String> ck) throws Exception {
         String code = null;
         if (mediaUrl != null) {
-            Matcher m = MEDIA_RE.matcher(mediaUrl);
-            if (m.find()) code = m.group(1);
+            Matcher mm = MEDIA_RE.matcher(mediaUrl);
+            if (mm.find()) code = mm.group(1);
         }
         if (code == null) return new Res(false, "Failed: post link missing");
         String mediaId = shortcodeToId(code);
@@ -222,17 +226,17 @@ public class DirectRunner {
         Http h = httpR("POST", "https://www.instagram.com/api/v1/web/likes/" + mediaId + "/like/",
                 ck, "https://www.instagram.com/p/" + code + "/");
         if (h.code == 404) return new Res(false, "Profile unavailable");
-        Res err = commonError(key, h);
+        Res err = commonError(key, h, true);
         if (err != null) return err;
 
         if (h.json != null && "ok".equals(h.json.optString("status"))) {
             return new Res(true, "Post Liked Successfully");
         }
-        String m = h.json != null ? h.json.optString("message", "") : "";
-        String ml = m.toLowerCase(Locale.US);
+        String msg = h.json != null ? h.json.optString("message", "") : "";
+        String ml = msg.toLowerCase(Locale.US);
         if (ml.contains("already")) return new Res(true, "Already liked");
         if (ml.contains("not found") || ml.contains("unavailable")) return new Res(false, "Profile unavailable");
-        return new Res(false, "Failed: HTTP " + h.code + " " + cut(m.isEmpty() ? h.body : m));
+        return new Res(false, "Failed: HTTP " + h.code + " " + cut(msg.isEmpty() ? h.body : msg));
     }
 
     /** 403 + csrf error aaye to naya csrftoken lekar ek baar dobara try. */
@@ -249,7 +253,7 @@ public class DirectRunner {
         try {
             Http g = http("GET", "https://www.instagram.com/accounts/login/", ck, "https://www.instagram.com/");
             for (String sc : g.setCookies) {
-                if (sc.startsWith("csrftoken=")) {
+                if (sc != null && sc.startsWith("csrftoken=")) {
                     int e = sc.indexOf(';');
                     String v = e > 0 ? sc.substring(10, e) : sc.substring(10);
                     if (!v.isEmpty()) ck.put("csrftoken", v);
@@ -259,7 +263,7 @@ public class DirectRunner {
     }
 
     /** login / challenge / block jaise common errors. null = koi common error nahi. */
-    private Res commonError(String key, Http h) {
+    private Res commonError(String key, Http h, boolean isAction) {
         String b = h.body == null ? "" : h.body;
         String bl = b.toLowerCase(Locale.US);
         if (h.code == 401 || h.code == 302 || h.code == 301 || bl.contains("login_required")
@@ -271,8 +275,15 @@ public class DirectRunner {
         }
         if (h.code == 429 || bl.contains("feedback_required") || bl.contains("\"spam\":true")
                 || bl.contains("please wait a few minutes")) {
-            pausedUntil.put(key, System.currentTimeMillis() + BLOCK_PAUSE_MS);
-            return new Res(false, "Action blocked: Instagram rate limit");
+            if (isAction) {
+                // asli follow/like par block aaya, tabhi cooldown lagao
+                pausedUntil.put(key, Long.valueOf(System.currentTimeMillis() + BLOCK_PAUSE_MS));
+                log("COOLDOWN set (action): HTTP " + h.code + " :: " + cut(b));
+                return new Res(false, "Action blocked: Instagram rate limit");
+            }
+            // profile lookup throttle hua: ye account block nahi hai, cooldown mat lagao
+            log("Lookup throttled (no cooldown): HTTP " + h.code + " :: " + cut(b));
+            return new Res(false, "Failed: profile lookup throttled (HTTP " + h.code + ")");
         }
         if (h.code == 403) return new Res(false, "Failed: HTTP 403 rejected by Instagram (see log)");
         return null;
@@ -292,7 +303,8 @@ public class DirectRunner {
             c.setRequestProperty("x-ig-app-id", APP_ID);
             c.setRequestProperty("x-ig-www-claim", "0");
             c.setRequestProperty("x-requested-with", "XMLHttpRequest");
-            c.setRequestProperty("x-csrftoken", ck.get("csrftoken"));
+            String csrf = ck.get("csrftoken");
+            c.setRequestProperty("x-csrftoken", csrf == null ? "" : csrf);
             c.setRequestProperty("Origin", "https://www.instagram.com");
             c.setRequestProperty("Referer", referer);
             c.setRequestProperty("Cookie", buildCookie(ck));
