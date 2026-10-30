@@ -36,50 +36,63 @@ import android.widget.FrameLayout;
 
 import org.json.JSONObject;
 
-
-import java.net.URLEncoder;
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.net.URLEncoder;
 import java.security.MessageDigest;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Map;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
-import androidx.webkit.Profile;
-import androidx.webkit.ProfileStore;
+// =========================================================
+//  HIDDEN HTTP STACK: okhttp3 (HTTP/2 + ALPN, bina WebView)
+//  Gradle me add karo: implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+// =========================================================
+import okhttp3.Cookie;
+import okhttp3.CookieJar;
+import okhttp3.FormBody;
+import okhttp3.HttpUrl;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Protocol;
+import okhttp3.Request;
+import okhttp3.Response;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+
 import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
+import androidx.webkit.Profile;
+import androidx.webkit.ProfileStore;
 
 public class MainActivity extends Activity {
+
     private static final String APP_SECRET_KEY = "brohu2580";
-    // APP VERSION: har naye APK me ise badhao (2, 3, 4...). Server ka min_version_code isse compare hota hai.
-    // SMOOTH: 3 -> 4 (is naye build ke liye)
-    // SMOOTH v2: 4 -> 5
     private static final int APP_VERSION_CODE = 6;
-    // Secret + version wala user agent: SIRF apni website (mainWebView) ke liye
-    // onCreate me phone ke asli WebView user agent se set hota hai
+
     private String USER_AGENT_APP = "";
+    private String USER_AGENT = "";
+
+    // ---- WebViews: sirf main dashboard ke liye ----
     private WebView mainWebView;
-    private WebView workerWebView;
-    private WebView searchWebView;
-    private String pendingSearchUser = null;
 
     private static final String HOSTING_BASE = "https://follow2follow.shop/";
     private static final String HOSTING_DASHBOARD = HOSTING_BASE + "index.php";
     private static final String IG_URL = "https://www.instagram.com";
     private static final String IG_LOGIN_URL = "https://www.instagram.com/accounts/login/";
-    // Normal user agent (bina secret ke): Instagram wale WebViews ke liye
-    // Normal user agent (bina secret ke): asli device wala, onCreate me set hota hai
-    private String USER_AGENT = "";
 
     private static final String CHANNEL_ID = "upfollow_automation_channel";
     private static final int NOTIFICATION_ID = 1001;
-    // FIX: pehle 40 sec tha, jisse page dheere khulne par task jaldi fail ho jata tha
-    // SMOOTH v2: ek account ke task ko max 25 sec (action ho chuka ho to +15 sec sirf verify ke liye)
-    private static final long TASK_TIMEOUT_MS = 25000L;
+    private static final long TASK_TIMEOUT_MS = 20000L;
 
     private NotificationManager notificationManager;
     private PowerManager.WakeLock wakeLock;
@@ -87,43 +100,884 @@ public class MainActivity extends Activity {
 
     private volatile String mainUrl = "";
     private String deviceKey = "";
-    // NAYA: chhoti settings yaad rakhne ke liye (auto-run ON/OFF, battery prompt)
     private SharedPreferences prefs;
 
-    private String currentTaskType = "follow";
-    private boolean taskActive = false;
-    private boolean workerActed = false; // is task me hamne khud follow/like kiya ya nahi
-    // FIX: single-worker mode me bhi retry (jab tak task poora na ho, aage mat jao)
-    private int workerRetries = 0;
-    private long workerStartedAt = 0;
-
-    // Instagram login capture state
+    // Instagram login capture
     private boolean captureBusy = false;
     private boolean addMode = false;
     private String captureNonce = "";
     private String captureCookies = "";
 
-    // FAST FOLLOW - SINGLE MODE: page load nahi, seedha API se follow
-    private boolean singleWorkerWarm = false;   // worker WebView warm page (robots.txt) par hai
-    private boolean singleFastPending = false;  // warm load hone ke baad fast follow chalana hai
-    private String singleFastTarget = "";       // current fast task ka target username
-    private String singleFastCookies = "";      // current fast task ki cookies
-    private String singleFastMediaId = "";      // current fast task ka mediaId (like ke liye)
+    // =========================================================
+    //  OKHTTP CLIENT SETUP
+    //  - HTTP/2 + HTTP/1.1 fallback (ALPN se negotiate hota hai)
+    //  - Custom TLS + CookieJar: cookies string se inject
+    //  - User-Agent: normal phone UA (WebView se match)
+    //  - Ye sab CDN / firewall ke liye unseen HTTP stack hai
+    // =========================================================
+    private OkHttpClient httpClient;
+    private final ExecutorService ioPool = Executors.newCachedThreadPool();
 
+    // In-memory cookie store per-account (session cookies thread-safe)
+    private final ConcurrentHashMap<String, List<Cookie>> cookieStore = new ConcurrentHashMap<>();
 
-    private final Runnable taskTimeout = new Runnable() {
-        @Override
-        public void run() {
-            handleSingleTimeout();
+    private void buildHttpClient() {
+        CookieJar jar = new CookieJar() {
+            @Override
+            public void saveFromResponse(HttpUrl url, List<Cookie> cookies) {
+                // Dynamic cookies save (API se jo milein)
+                List<Cookie> existing = cookieStore.get(url.host());
+                if (existing == null) existing = new ArrayList<>();
+                for (Cookie c : cookies) {
+                    existing.removeIf(o -> o.name().equals(c.name()));
+                    existing.add(c);
+                }
+                cookieStore.put(url.host(), existing);
+            }
+
+            @Override
+            public List<Cookie> loadForRequest(HttpUrl url) {
+                List<Cookie> c = cookieStore.get(url.host());
+                return c != null ? c : new ArrayList<>();
+            }
+        };
+
+        httpClient = new OkHttpClient.Builder()
+                // HTTP/2 preferred, HTTP/1.1 fallback (ALPN)
+                .protocols(Arrays.asList(Protocol.HTTP_2, Protocol.HTTP_1_1))
+                .cookieJar(jar)
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(20, TimeUnit.SECONDS)
+                .writeTimeout(10, TimeUnit.SECONDS)
+                // Redirects follow karo (login redirect handle)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .build();
+    }
+
+    // cookieStr (Instagram cookie string) se OkHttp store me inject karo
+    private void injectCookiesToHttp(String cookieStr) {
+        if (cookieStr == null || cookieStr.isEmpty()) return;
+        HttpUrl igUrl = HttpUrl.parse(IG_URL + "/");
+        if (igUrl == null) return;
+        List<Cookie> list = new ArrayList<>();
+        for (String part : cookieStr.split(";")) {
+            String p = part.trim();
+            int i = p.indexOf('=');
+            if (i <= 0) continue;
+            String name = p.substring(0, i).trim();
+            String value = p.substring(i + 1).trim();
+            list.add(new Cookie.Builder()
+                    .domain("instagram.com")
+                    .path("/")
+                    .name(name)
+                    .value(value)
+                    .build());
+        }
+        cookieStore.put("www.instagram.com", list);
+        cookieStore.put("instagram.com", list);
+    }
+
+    // OkHttp cookie store se csrftoken nikalo
+    private String getCsrfFromStore() {
+        List<Cookie> list = cookieStore.get("www.instagram.com");
+        if (list == null) return "";
+        for (Cookie c : list) {
+            if ("csrftoken".equals(c.name())) return c.value();
+        }
+        return "";
+    }
+
+    // =========================================================
+    //  IG HEADERS: asli Instagram app jaise headers
+    //  (sabse badi trick yahi hai — common HTTP client yahi nahi karta)
+    // =========================================================
+    private Map<String, String> igHeaders(String csrf) {
+        Map<String, String> h = new HashMap<>();
+        h.put("User-Agent", USER_AGENT);
+        h.put("X-IG-App-ID", "936619743392459");
+        h.put("X-Requested-With", "XMLHttpRequest");
+        h.put("Accept", "*/*");
+        h.put("Accept-Language", "en-US,en;q=0.9");
+        h.put("Accept-Encoding", "gzip, deflate, br");
+        h.put("Origin", IG_URL);
+        h.put("Referer", IG_URL + "/");
+        h.put("Sec-Fetch-Site", "same-origin");
+        h.put("Sec-Fetch-Mode", "cors");
+        h.put("Sec-Fetch-Dest", "empty");
+        if (csrf != null && !csrf.isEmpty()) {
+            h.put("X-CSRFToken", csrf);
+        }
+        return h;
+    }
+
+    private Request.Builder addIgHeaders(Request.Builder b, String csrf) {
+        for (Map.Entry<String, String> e : igHeaders(csrf).entrySet()) {
+            b.header(e.getKey(), e.getValue());
+        }
+        return b;
+    }
+
+    // =========================================================
+    //  TASK SYSTEM: follow + like seedha OkHttp se
+    // =========================================================
+    private static final boolean SINGLE_QUEUE_ENABLED = true;
+    private static final boolean RESULT_RETRY_ENABLED = true;
+    private static final long RESULT_MAX_AGE_MS = 120000L;
+
+    private final ArrayDeque<PTask> singleQueue = new ArrayDeque<>();
+    private long singleLastEnd = 0;
+    private long singleGap = 0;
+    private boolean taskActive = false;
+    private boolean singlePumpScheduled = false;
+    private String currentTaskType = "follow";
+
+    private final Runnable singlePumpRunnable = new Runnable() {
+        @Override public void run() {
+            singlePumpScheduled = false;
+            singlePump();
         }
     };
 
+    private final Runnable taskTimeout = new Runnable() {
+        @Override public void run() {
+            if (taskActive) {
+                deliverResult(false, "Timeout");
+            }
+        }
+    };
+
+    private static final long MIN_GAP_MS = 7000L;
+    private volatile long startGapMs = 7000L;
+    private volatile long gapJitterMs = 0L;
+    private long curGapMs = 7000L;
+    private final Random rnd = new Random();
+
+    private long nextGap() {
+        long j = gapJitterMs;
+        long g = startGapMs;
+        if (j > 0) g += (long)(rnd.nextDouble() * j);
+        return Math.max(MIN_GAP_MS, g);
+    }
+
+    private void singleEnqueue(String target, String taskType, String mediaId, String cookieStr) {
+        final PTask t = new PTask();
+        t.target = target == null ? "" : target;
+        t.taskType = taskType == null ? "follow" : taskType;
+        t.mediaId = mediaId == null ? "" : mediaId;
+        t.cookieStr = cookieStr == null ? "" : cookieStr;
+        t.uid = cookieValue(t.cookieStr, "ds_user_id").replaceAll("[^A-Za-z0-9]", "");
+        t.key = taskKey(t.taskType, t.target, t.mediaId);
+        uiHandler.post(new Runnable() {
+            @Override public void run() {
+                singleQueue.add(t);
+                singlePump();
+            }
+        });
+    }
+
+    private void singlePump() {
+        if (taskActive || singleQueue.isEmpty()) return;
+        long wait = singleLastEnd + singleGap - System.currentTimeMillis();
+        if (wait > 0) {
+            if (!singlePumpScheduled) {
+                singlePumpScheduled = true;
+                uiHandler.postDelayed(singlePumpRunnable, wait);
+            }
+            return;
+        }
+        PTask t = singleQueue.poll();
+        if (t == null) return;
+        startApiTask(t);
+    }
+
+    private void startApiTask(final PTask t) {
+        taskActive = true;
+        currentTaskType = t.taskType;
+        uiHandler.removeCallbacks(taskTimeout);
+        uiHandler.postDelayed(taskTimeout, TASK_TIMEOUT_MS);
+        dbg("api task start uid=" + t.uid + " type=" + t.taskType + " target=" + cleanName(t.target));
+        notifyStarted(t.uid, cleanName(t.target), t.taskType);
+
+        // Cookies inject karo is task ke liye
+        injectCookiesToHttp(t.cookieStr);
+
+        ioPool.execute(new Runnable() {
+            @Override public void run() {
+                try {
+                    if ("like".equalsIgnoreCase(t.taskType)) {
+                        runLikeApi(t);
+                    } else {
+                        runFollowApi(t);
+                    }
+                } catch (Exception e) {
+                    deliverResult(false, "Network error: " + e.getMessage());
+                }
+            }
+        });
+    }
+
+    // =========================================================
+    //  FOLLOW API: seedha Instagram friendship/create endpoint
+    //  Step 1: web_profile_info se user_id nikalo (cached)
+    //  Step 2: /api/v1/friendships/create/{id}/ POST
+    // =========================================================
+    private final ConcurrentHashMap<String, String> fastIdCache = new ConcurrentHashMap<>();
+
+    private void runFollowApi(PTask t) throws IOException {
+        String name = cleanName(t.target);
+        if (name.isEmpty()) { deliverResult(false, "Invalid target"); return; }
+
+        String csrf = getCsrfFromStore();
+        if (csrf.isEmpty()) { deliverResult(false, "Session expired"); return; }
+
+        // Cached ID check
+        String cachedId = fastIdCache.get(name.toLowerCase());
+        if (cachedId != null) {
+            followWithId(name, cachedId, csrf, true, t);
+            return;
+        }
+
+        // Step 1: User ID fetch
+        Request req = addIgHeaders(new Request.Builder()
+                .url(IG_URL + "/api/v1/users/web_profile_info/?username=" + URLEncoder.encode(name, "UTF-8")), csrf)
+                .get().build();
+
+        try (Response r = httpClient.newCall(req).execute()) {
+            String body = r.body() != null ? r.body().string() : "";
+            String low = body.toLowerCase();
+
+            if (low.contains("checkpoint_required") || low.contains("challenge_required")) {
+                deliverResult(false, "Blocked: Challenge / Checkpoint"); return;
+            }
+            if (low.contains("login_required")) {
+                deliverResult(false, "Session expired"); return;
+            }
+            if (r.code() == 429) {
+                deliverResult(false, "Blocked: Action Limit / Challenge"); return;
+            }
+
+            JSONObject d = null;
+            try { d = new JSONObject(body); } catch (Exception ignored) {}
+            if (d == null) { deliverResult(false, "API parse error"); return; }
+
+            JSONObject user = null;
+            try {
+                user = d.optJSONObject("data") != null
+                        ? d.getJSONObject("data").optJSONObject("user")
+                        : d.optJSONObject("user");
+            } catch (Exception ignored) {}
+
+            if (user == null || !user.has("id")) {
+                deliverResult(false, "User not found"); return;
+            }
+
+            String userId = user.optString("id", "");
+            if (userId.isEmpty()) { deliverResult(false, "User not found"); return; }
+
+            // Cache kar lo
+            fastIdCache.put(name.toLowerCase(), userId);
+
+            boolean alreadyFollowing = user.optBoolean("followed_by_viewer", false)
+                    || user.optBoolean("requested_by_viewer", false);
+            if (alreadyFollowing) {
+                deliverResult(true, "Already Following"); return;
+            }
+
+            followWithId(name, userId, csrf, false, t);
+        }
+    }
+
+    private void followWithId(String name, String userId, String csrf, boolean fromCache, PTask t) throws IOException {
+        // Step 2: friendship create
+        FormBody body = new FormBody.Builder().build(); // empty body
+        Request req = addIgHeaders(new Request.Builder()
+                .url(IG_URL + "/api/v1/friendships/create/" + userId + "/"), csrf)
+                .post(body).build();
+
+        try (Response r = httpClient.newCall(req).execute()) {
+            String resp = r.body() != null ? r.body().string() : "";
+            String low = resp.toLowerCase().replace(" ", "");
+
+            if (r.code() == 200 && low.contains("\"status\":\"ok\"")) {
+                deliverResult(true, "Followed Successfully"); return;
+            }
+            if (low.contains("checkpoint") || low.contains("challenge")) {
+                deliverResult(false, "Blocked: Challenge / Checkpoint"); return;
+            }
+            if (low.contains("login_required")) {
+                deliverResult(false, "Session expired"); return;
+            }
+            if (low.contains("feedback_required") || r.code() == 429
+                    || low.contains("\"spam\":true") || low.contains("trylater")) {
+                deliverResult(false, "Blocked: Action Limit / Challenge"); return;
+            }
+            if (fromCache && (r.code() == 400 || r.code() == 404)) {
+                fastIdCache.remove(name.toLowerCase());
+            }
+            deliverResult(false, "Follow failed: HTTP " + r.code());
+        }
+    }
+
+    // =========================================================
+    //  LIKE API: shortcode -> media_id -> /api/v1/web/likes/{id}/like/
+    // =========================================================
+    private void runLikeApi(PTask t) throws IOException {
+        String mediaId = t.mediaId;
+        String csrf = getCsrfFromStore();
+        if (csrf.isEmpty()) { deliverResult(false, "Session expired"); return; }
+
+        // Shortcode se numeric ID nikalo (Instagram ka base64-like encoding)
+        String numericId = shortcodeToId(mediaId);
+        if (numericId == null || numericId.isEmpty()) {
+            deliverResult(false, "Invalid media ID"); return;
+        }
+
+        FormBody body = new FormBody.Builder().build();
+        Request req = addIgHeaders(new Request.Builder()
+                .url(IG_URL + "/api/v1/web/likes/" + numericId + "/like/"), csrf)
+                .post(body).build();
+
+        try (Response r = httpClient.newCall(req).execute()) {
+            String resp = r.body() != null ? r.body().string() : "";
+            String low = resp.toLowerCase().replace(" ", "");
+
+            if (r.code() == 200 && low.contains("\"status\":\"ok\"")) {
+                deliverResult(true, "Post Liked Successfully"); return;
+            }
+            if (low.contains("checkpoint") || low.contains("challenge")) {
+                deliverResult(false, "Blocked: Challenge / Checkpoint"); return;
+            }
+            if (low.contains("login_required")) {
+                deliverResult(false, "Session expired"); return;
+            }
+            if (low.contains("feedback_required") || r.code() == 429
+                    || low.contains("\"spam\":true") || low.contains("trylater")) {
+                deliverResult(false, "Blocked: Action Limit / Challenge"); return;
+            }
+            if (r.code() == 404) { deliverResult(false, "Post unavailable"); return; }
+            deliverResult(false, "Like failed: HTTP " + r.code());
+        }
+    }
+
+    // Instagram shortcode -> numeric media_id (BigInt logic Java me)
+    private String shortcodeToId(String sc) {
+        if (sc == null) return null;
+        sc = sc.trim();
+        // Numeric pehle se hai
+        if (sc.matches("[0-9]+")) return sc;
+        // URL se shortcode extract
+        if (sc.contains("/p/") || sc.contains("/reel/")) {
+            String[] parts = sc.split("/");
+            for (int i = 0; i < parts.length - 1; i++) {
+                if ("p".equals(parts[i]) || "reel".equals(parts[i])
+                        || "reels".equals(parts[i]) || "tv".equals(parts[i])) {
+                    sc = parts[i + 1]; break;
+                }
+            }
+        }
+        sc = sc.replaceAll("[^A-Za-z0-9_-]", "");
+        if (sc.isEmpty() || sc.length() > 12) return sc.isEmpty() ? null : sc;
+        String alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        try {
+            long id = 0;
+            for (char c : sc.toCharArray()) {
+                int idx = alpha.indexOf(c);
+                if (idx < 0) return null;
+                id = id * 64 + idx;
+            }
+            return String.valueOf(id);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // =========================================================
+    //  PROFILE SEARCH: OkHttp se seedha
+    // =========================================================
+    private String pendingSearchUser = null;
+    private boolean searchRunning = false;
+
+    private final Runnable searchTimeout = new Runnable() {
+        @Override public void run() {
+            deliverSearch("{\"success\":false,\"message\":\"Search timeout. Dobara try karo.\"}");
+        }
+    };
+
+    private void startSearch(final String u) {
+        pendingSearchUser = u;
+        searchRunning = false;
+        uiHandler.removeCallbacks(searchTimeout);
+        uiHandler.postDelayed(searchTimeout, 20000);
+        ioPool.execute(new Runnable() {
+            @Override public void run() {
+                runSearchApi(u);
+            }
+        });
+    }
+
+    private void runSearchApi(String u) {
+        try {
+            String csrf = getCsrfFromStore();
+            Request.Builder b = new Request.Builder()
+                    .url(IG_URL + "/api/v1/users/web_profile_info/?username=" + URLEncoder.encode(u, "UTF-8"))
+                    .get();
+            addIgHeaders(b, csrf);
+            try (Response r = httpClient.newCall(b.build()).execute()) {
+                String body = r.body() != null ? r.body().string() : "";
+                JSONObject d = null;
+                try { d = new JSONObject(body); } catch (Exception ignored) {}
+                if (d == null) { deliverSearch("{\"success\":false,\"message\":\"Parse error\"}"); return; }
+
+                String low = body.toLowerCase();
+                if (low.contains("login_required")) {
+                    deliverSearch("{\"success\":false,\"message\":\"Instagram login expire. Account re-login karo.\"}"); return;
+                }
+
+                JSONObject user = null;
+                try {
+                    user = d.optJSONObject("data") != null
+                            ? d.getJSONObject("data").optJSONObject("user")
+                            : d.optJSONObject("user");
+                } catch (Exception ignored) {}
+
+                if (user == null) {
+                    deliverSearch("{\"success\":false,\"message\":\"Account not found on Instagram\"}"); return;
+                }
+
+                String username = user.optString("username", u);
+                String fullName = user.optString("full_name", "");
+                String pk = user.optString("id", user.optString("pk", ""));
+                long fc = 0;
+                try {
+                    JSONObject efb = user.optJSONObject("edge_followed_by");
+                    fc = efb != null ? efb.optLong("count", 0) : user.optLong("follower_count", 0);
+                } catch (Exception ignored) {}
+                boolean verified = user.optBoolean("is_verified", false);
+                String pic = user.optString("profile_pic_url_hd", user.optString("profile_pic_url", ""));
+
+                JSONObject out = new JSONObject();
+                out.put("success", true);
+                out.put("username", username);
+                out.put("full_name", fullName);
+                out.put("numeric_id", pk);
+                out.put("follower_count", fc);
+                out.put("followers_formatted", String.format("%,d", fc) + " followers");
+                out.put("is_verified", verified);
+                out.put("profile_pic", pic);
+                deliverSearch(out.toString());
+            }
+        } catch (Exception e) {
+            deliverSearch("{\"success\":false,\"message\":\"Search error: " + e.getMessage() + "\"}");
+        }
+    }
+
+    private void deliverSearch(final String json) {
+        if (pendingSearchUser == null) return;
+        pendingSearchUser = null;
+        searchRunning = false;
+        uiHandler.removeCallbacks(searchTimeout);
+        uiHandler.post(new Runnable() {
+            @Override public void run() {
+                if (mainWebView != null) {
+                    mainWebView.evaluateJavascript(
+                            "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, "
+                                    + JSONObject.quote(json) + ");", null);
+                }
+            }
+        });
+    }
+
+    // =========================================================
+    //  POSTS FETCH: OkHttp se seedha
+    // =========================================================
+    private String pendingPostsUser = null;
+
+    private final Runnable postsTimeout = new Runnable() {
+        @Override public void run() {
+            deliverPosts("{\"success\":false,\"message\":\"Request timed out. Please try again.\"}");
+        }
+    };
+
+    private void startPosts(final String u) {
+        pendingPostsUser = u;
+        uiHandler.removeCallbacks(postsTimeout);
+        uiHandler.postDelayed(postsTimeout, 40000);
+        ioPool.execute(new Runnable() {
+            @Override public void run() {
+                runPostsApi(u);
+            }
+        });
+    }
+
+    private void runPostsApi(String u) {
+        try {
+            String csrf = getCsrfFromStore();
+
+            // Step 1: profile info + first page posts
+            Request req = addIgHeaders(new Request.Builder()
+                    .url(IG_URL + "/api/v1/users/web_profile_info/?username=" + URLEncoder.encode(u, "UTF-8")), csrf)
+                    .get().build();
+
+            try (Response r = httpClient.newCall(req).execute()) {
+                String body = r.body() != null ? r.body().string() : "";
+                JSONObject d = null;
+                try { d = new JSONObject(body); } catch (Exception ignored) {}
+                if (d == null) { deliverPosts("{\"success\":false,\"message\":\"Parse error\"}"); return; }
+
+                String low = body.toLowerCase();
+                if (low.contains("login_required")) {
+                    deliverPosts("{\"success\":false,\"message\":\"Instagram session expired. Please log in again.\"}"); return;
+                }
+
+                JSONObject user = null;
+                try {
+                    user = d.optJSONObject("data") != null
+                            ? d.getJSONObject("data").optJSONObject("user")
+                            : d.optJSONObject("user");
+                } catch (Exception ignored) {}
+
+                if (user == null) {
+                    deliverPosts("{\"success\":false,\"message\":\"Account not found on Instagram.\"}"); return;
+                }
+
+                // Build result
+                JSONObject out = new JSONObject();
+                out.put("success", true);
+                out.put("username", u);
+                out.put("is_private", user.optBoolean("is_private", false));
+                out.put("profile_pic", user.optString("profile_pic_url_hd", user.optString("profile_pic_url", "")));
+                out.put("full_name", user.optString("full_name", ""));
+                JSONObject efb = user.optJSONObject("edge_followed_by");
+                if (efb != null) out.put("follower_count", efb.optLong("count", 0));
+
+                // Posts
+                org.json.JSONArray posts = new org.json.JSONArray();
+                try {
+                    JSONObject etm = user.optJSONObject("edge_owner_to_timeline_media");
+                    if (etm != null) {
+                        org.json.JSONArray edges = etm.optJSONArray("edges");
+                        if (edges != null) {
+                            for (int i = 0; i < Math.min(edges.length(), 30); i++) {
+                                JSONObject node = edges.getJSONObject(i).optJSONObject("node");
+                                if (node == null) continue;
+                                JSONObject p = new JSONObject();
+                                p.put("code", node.optString("shortcode", ""));
+                                p.put("thumb", node.optString("thumbnail_src", node.optString("display_url", "")));
+                                JSONObject elb = node.optJSONObject("edge_liked_by");
+                                p.put("likes", elb != null ? elb.optLong("count", 0) : 0);
+                                p.put("video", node.optBoolean("is_video", false));
+                                p.put("reel", "clips".equals(node.optString("product_type", "")));
+                                p.put("ts", node.optLong("taken_at_timestamp", 0));
+                                posts.put(p);
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+                out.put("posts", posts);
+                deliverPosts(out.toString());
+            }
+        } catch (Exception e) {
+            deliverPosts("{\"success\":false,\"message\":\"Posts error: " + e.getMessage() + "\"}");
+        }
+    }
+
+    private void deliverPosts(final String json) {
+        if (pendingPostsUser == null) return;
+        pendingPostsUser = null;
+        uiHandler.removeCallbacks(postsTimeout);
+        uiHandler.post(new Runnable() {
+            @Override public void run() {
+                if (mainWebView != null) {
+                    mainWebView.evaluateJavascript(
+                            "if(window.onInstagramPostsResult) window.onInstagramPostsResult(true, "
+                                    + JSONObject.quote(json) + ");", null);
+                }
+            }
+        });
+    }
+
+    // =========================================================
+    //  RESULT DELIVERY
+    // =========================================================
+    private void deliverResult(final boolean success, final String message) {
+        uiHandler.post(new Runnable() {
+            @Override public void run() {
+                if (!taskActive) return;
+                taskActive = false;
+                uiHandler.removeCallbacks(taskTimeout);
+                dbg("task result ok=" + success + " msg=" + message);
+                if (RESULT_RETRY_ENABLED) {
+                    enqueueResultCall("window.onWorkerResult(" + success + ", "
+                            + JSONObject.quote(message == null ? "" : message) + ")");
+                    onApiTaskEnded();
+                } else {
+                    String safe = (message == null ? "" : message).replace("\\", "\\\\").replace("'", "\\'");
+                    if (mainWebView != null) {
+                        mainWebView.evaluateJavascript(
+                                "if(window.onWorkerResult) window.onWorkerResult(" + success + ", '" + safe + "');", null);
+                    }
+                    onApiTaskEnded();
+                }
+            }
+        });
+    }
+
+    private void onApiTaskEnded() {
+        singleLastEnd = System.currentTimeMillis();
+        singleGap = nextGap();
+        singlePump();
+    }
+
+    // =========================================================
+    //  RESULT RETRY SYSTEM (page reload ke baad bhi result mile)
+    // =========================================================
+    private final ArrayDeque<String> pendingResultJs = new ArrayDeque<>();
+    private final ArrayDeque<Long> pendingResultAt = new ArrayDeque<>();
+    private boolean resultFlushBusy = false;
+    private long resultFlushBusyAt = 0;
+    private boolean resultRetryScheduled = false;
+
+    private void enqueueResultCall(String call) {
+        pendingResultJs.add(call);
+        pendingResultAt.add(System.currentTimeMillis());
+        flushResults();
+    }
+
+    private void flushResults() {
+        if (mainWebView == null) return;
+        long now = System.currentTimeMillis();
+        while (!pendingResultAt.isEmpty() && now - pendingResultAt.peek() > RESULT_MAX_AGE_MS) {
+            pendingResultAt.poll(); pendingResultJs.poll();
+        }
+        if (pendingResultJs.isEmpty()) return;
+        if (resultFlushBusy && now - resultFlushBusyAt < 5000L) return;
+        resultFlushBusy = true;
+        resultFlushBusyAt = now;
+        final String call = pendingResultJs.peek();
+        try {
+            mainWebView.evaluateJavascript(
+                    "(function(){if(typeof window.onWorkerResult!=='function')return 'NOHANDLER';"
+                            + "try{" + call + ";}catch(e){return 'E:'+(e&&e.message);}return 'OK';})()",
+                    new ValueCallback<String>() {
+                        @Override public void onReceiveValue(String v) {
+                            resultFlushBusy = false;
+                            boolean noHandler = v == null || "null".equals(v) || v.contains("NOHANDLER");
+                            if (!noHandler) {
+                                if (pendingResultJs.peek() == call) {
+                                    pendingResultJs.poll(); pendingResultAt.poll();
+                                }
+                                flushResults();
+                            } else {
+                                scheduleResultRetry();
+                            }
+                        }
+                    });
+        } catch (Exception e) {
+            resultFlushBusy = false;
+            scheduleResultRetry();
+        }
+    }
+
+    private void scheduleResultRetry() {
+        if (resultRetryScheduled) return;
+        resultRetryScheduled = true;
+        uiHandler.postDelayed(new Runnable() {
+            @Override public void run() {
+                resultRetryScheduled = false;
+                flushResults();
+            }
+        }, 1000);
+    }
+
+    // =========================================================
+    //  PARALLEL ENGINE (multi-account): OkHttp thread pool
+    // =========================================================
+    private volatile int maxParallel = 1;
+    private int activeSlots = 0;
+    private final ArrayDeque<PTask> pendingTasks = new ArrayDeque<>();
+    private final Map<String, Long> doneMap = new HashMap<>();
+    private final Map<String, Long> deadMap = new HashMap<>();
+    private final Map<String, HashSet<String>> unavailVotes = new HashMap<>();
+    private static final long DONE_TTL_MS = 30L * 24 * 60 * 60 * 1000L;
+    private static final long DEAD_TTL_MS = 7L * 24 * 60 * 60 * 1000L;
+
+    private long lastEndAt = 0;
+    private long lastStartAt = 0;
+    private String lastStartedUid = "";
+    private boolean pumpScheduled = false;
+
+    private final Runnable pumpRunnable = new Runnable() {
+        @Override public void run() { pumpScheduled = false; pumpQueue(); }
+    };
+
+    private void parallelEnqueue(String target, String taskType, String mediaId, String cookieStr) {
+        final PTask t = new PTask();
+        t.target = target == null ? "" : target;
+        t.taskType = taskType == null ? "follow" : taskType;
+        t.mediaId = mediaId == null ? "" : mediaId;
+        t.cookieStr = cookieStr == null ? "" : cookieStr;
+        t.uid = cookieValue(t.cookieStr, "ds_user_id").replaceAll("[^A-Za-z0-9]", "");
+        t.key = taskKey(t.taskType, t.target, t.mediaId);
+        uiHandler.post(new Runnable() {
+            @Override public void run() {
+                if (isDead(t.key)) {
+                    sendParallelResult(t.uid, t.target, false, "Skipped: dead profile"); return;
+                }
+                if (isDone(t.uid + "|" + t.key)) {
+                    boolean like = "like".equalsIgnoreCase(t.taskType);
+                    sendParallelResult(t.uid, t.target, true, like ? "Already Liked" : "Already Following"); return;
+                }
+                pendingTasks.add(t);
+                pumpQueue();
+            }
+        });
+    }
+
+    private void pumpQueue() {
+        if (pendingTasks.isEmpty() || activeSlots >= maxParallel) return;
+        long wait = lastEndAt + curGapMs - System.currentTimeMillis();
+        if (wait > 0) {
+            if (!pumpScheduled) { pumpScheduled = true; uiHandler.postDelayed(pumpRunnable, wait); }
+            return;
+        }
+        PTask t = pendingTasks.poll();
+        if (t == null) return;
+        lastStartAt = System.currentTimeMillis();
+        lastStartedUid = t.uid;
+        curGapMs = nextGap();
+        activeSlots++;
+        startParallelApiTask(t);
+    }
+
+    private void startParallelApiTask(final PTask t) {
+        dbg("parallel api start uid=" + t.uid + " type=" + t.taskType + " target=" + cleanName(t.target));
+        notifyStarted(t.uid, cleanName(t.target), t.taskType);
+        injectCookiesToHttp(t.cookieStr);
+        ioPool.execute(new Runnable() {
+            @Override public void run() {
+                boolean ok = false;
+                String msg = "Unknown error";
+                try {
+                    if ("like".equalsIgnoreCase(t.taskType)) {
+                        Object[] res = doLikeSync(t);
+                        ok = (Boolean) res[0]; msg = (String) res[1];
+                    } else {
+                        Object[] res = doFollowSync(t);
+                        ok = (Boolean) res[0]; msg = (String) res[1];
+                    }
+                } catch (Exception e) {
+                    msg = "Network error: " + e.getMessage();
+                }
+                final boolean fok = ok; final String fmsg = msg;
+                uiHandler.post(new Runnable() {
+                    @Override public void run() {
+                        activeSlots = Math.max(0, activeSlots - 1);
+                        lastEndAt = System.currentTimeMillis();
+                        if (fok) {
+                            doneMap.put(t.uid + "|" + t.key, lastEndAt);
+                            saveMap("done_map", doneMap, DONE_TTL_MS, 1500);
+                        }
+                        sendParallelResult(t.uid, t.target, fok, fmsg);
+                        pumpQueue();
+                    }
+                });
+            }
+        });
+    }
+
+    private Object[] doFollowSync(PTask t) throws IOException {
+        String name = cleanName(t.target);
+        if (name.isEmpty()) return new Object[]{false, "Invalid target"};
+        String csrf = getCsrfFromStore();
+        if (csrf.isEmpty()) return new Object[]{false, "Session expired"};
+
+        String cachedId = fastIdCache.get(name.toLowerCase());
+        if (cachedId == null) {
+            // Fetch user info
+            Request req = addIgHeaders(new Request.Builder()
+                    .url(IG_URL + "/api/v1/users/web_profile_info/?username=" + URLEncoder.encode(name, "UTF-8")), csrf)
+                    .get().build();
+            try (Response r = httpClient.newCall(req).execute()) {
+                String body = r.body() != null ? r.body().string() : "";
+                String low = body.toLowerCase();
+                if (low.contains("login_required")) return new Object[]{false, "Session expired"};
+                if (r.code() == 429) return new Object[]{false, "Blocked: Action Limit / Challenge"};
+                if (low.contains("checkpoint_required") || low.contains("challenge_required"))
+                    return new Object[]{false, "Blocked: Challenge / Checkpoint"};
+                JSONObject d = null; try { d = new JSONObject(body); } catch (Exception ignored) {}
+                JSONObject user = null;
+                if (d != null) {
+                    try { user = d.optJSONObject("data") != null
+                            ? d.getJSONObject("data").optJSONObject("user")
+                            : d.optJSONObject("user"); } catch (Exception ignored) {}
+                }
+                if (user == null || !user.has("id")) return new Object[]{false, "User not found"};
+                cachedId = user.optString("id", "");
+                fastIdCache.put(name.toLowerCase(), cachedId);
+                if (user.optBoolean("followed_by_viewer", false) || user.optBoolean("requested_by_viewer", false))
+                    return new Object[]{true, "Already Following"};
+            }
+        }
+
+        // Follow call
+        Request req2 = addIgHeaders(new Request.Builder()
+                .url(IG_URL + "/api/v1/friendships/create/" + cachedId + "/"), csrf)
+                .post(new FormBody.Builder().build()).build();
+        try (Response r2 = httpClient.newCall(req2).execute()) {
+            String resp = r2.body() != null ? r2.body().string() : "";
+            String low = resp.toLowerCase().replace(" ", "");
+            if (r2.code() == 200 && low.contains("\"status\":\"ok\"")) return new Object[]{true, "Followed Successfully"};
+            if (low.contains("checkpoint") || low.contains("challenge")) return new Object[]{false, "Blocked: Challenge / Checkpoint"};
+            if (low.contains("login_required")) return new Object[]{false, "Session expired"};
+            if (low.contains("feedback_required") || r2.code() == 429) return new Object[]{false, "Blocked: Action Limit / Challenge"};
+            return new Object[]{false, "Follow failed: HTTP " + r2.code()};
+        }
+    }
+
+    private Object[] doLikeSync(PTask t) throws IOException {
+        String csrf = getCsrfFromStore();
+        if (csrf.isEmpty()) return new Object[]{false, "Session expired"};
+        String numId = shortcodeToId(t.mediaId);
+        if (numId == null) return new Object[]{false, "Invalid media ID"};
+        Request req = addIgHeaders(new Request.Builder()
+                .url(IG_URL + "/api/v1/web/likes/" + numId + "/like/"), csrf)
+                .post(new FormBody.Builder().build()).build();
+        try (Response r = httpClient.newCall(req).execute()) {
+            String resp = r.body() != null ? r.body().string() : "";
+            String low = resp.toLowerCase().replace(" ", "");
+            if (r.code() == 200 && low.contains("\"status\":\"ok\"")) return new Object[]{true, "Post Liked Successfully"};
+            if (low.contains("checkpoint") || low.contains("challenge")) return new Object[]{false, "Blocked: Challenge / Checkpoint"};
+            if (low.contains("login_required")) return new Object[]{false, "Session expired"};
+            if (low.contains("feedback_required") || r.code() == 429) return new Object[]{false, "Blocked: Action Limit / Challenge"};
+            if (r.code() == 404) return new Object[]{false, "Post unavailable"};
+            return new Object[]{false, "Like failed: HTTP " + r.code()};
+        }
+    }
+
+    private void sendParallelResult(String uid, String target, boolean ok, String msg) {
+        if (RESULT_RETRY_ENABLED) {
+            enqueueResultCall("window.onWorkerResult(" + ok + ", "
+                    + JSONObject.quote(msg == null ? "" : msg) + ", "
+                    + JSONObject.quote(uid == null ? "" : uid) + ", "
+                    + JSONObject.quote(target == null ? "" : target) + ")");
+        } else {
+            String safe = (msg == null ? "" : msg).replace("\\", "\\\\").replace("'", "\\'");
+            if (mainWebView != null) {
+                mainWebView.evaluateJavascript(
+                        "if(window.onWorkerResult) window.onWorkerResult(" + ok + ", '" + safe + "', '" + uid + "', '" + target + "');", null);
+            }
+        }
+    }
+
+    // =========================================================
+    //  onCreate
+    // =========================================================
     @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Phone ka asli WebView user agent: Instagram ko mismatch nahi dikhega (unavailable / can't find account kam)
         String baseUa = WebSettings.getDefaultUserAgent(this);
         if (baseUa == null) baseUa = "";
         baseUa = baseUa.replace("; wv", "").replace(" Version/4.0", "");
@@ -137,11 +991,12 @@ public class MainActivity extends Activity {
         loadMap("done_map", doneMap);
         loadMap("dead_map", deadMap);
 
+        // OkHttp client init
+        buildHttpClient();
+
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            if (pm != null) {
-                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UpFollow:WakeLock");
-            }
+            if (pm != null) wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UpFollow:WakeLock");
         } catch (Exception ignored) {}
 
         createNotificationChannel();
@@ -152,65 +1007,10 @@ public class MainActivity extends Activity {
         }
 
         mainWebView = findViewById(R.id.webView);
-        // Main WebView: secret key + version wala user agent (website security ke liye)
         setupWebView(mainWebView, USER_AGENT_APP);
-
-        // Worker WebView: full-size, main WebView ke neeche chhupa hua
-        workerWebView = new WebView(this);
-        setupWebView(workerWebView);
-        // NAYA: hidden browser me photos/videos load nahi honge -> page jaldi khulega
-        workerWebView.getSettings().setBlockNetworkImage(true);
-        workerWebView.setLayoutParams(new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        workerWebView.setAlpha(0.01f);
-        ViewGroup rootView = (ViewGroup) findViewById(android.R.id.content);
-        if (rootView != null) {
-            rootView.addView(workerWebView, 0);
-        }
-
-        // Search WebView (target profile search ke liye, worker se alag)
-        searchWebView = new WebView(this);
-        setupWebView(searchWebView);
-        searchWebView.setLayoutParams(new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        searchWebView.setAlpha(0.01f);
-        if (rootView != null) {
-            rootView.addView(searchWebView, 0);
-        }
-        searchWebView.addJavascriptInterface(new SearchBridge(), "SearchBridge");
-        searchWebView.setWebViewClient(new WebViewClient() {
-            // SMOOTH: WebView ka renderer mar jaye to poori app crash na ho
-            @TargetApi(Build.VERSION_CODES.O)
-            @Override
-            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
-                onRendererGone("search");
-                return true;
-            }
-
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                super.onPageFinished(view, url);
-                if (pendingSearchUser != null && url != null && url.startsWith(IG_URL)) {
-                    runSearchJs(pendingSearchUser);
-                }
-                if (pendingPostsUser != null && url != null && url.startsWith(IG_URL)) {
-                    String pp = "";
-                    try { pp = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
-                    if (pp.startsWith("/accounts/login")) {
-                        deliverPosts("{\"success\":false,\"message\":\"Instagram session expired. Please log in again.\"}");
-                    } else if (pp.startsWith("/" + pendingPostsUser.toLowerCase())) {
-                        runPostsJs(pendingPostsUser);
-                    }
-                }
-            }
-        });
-
-        // Bridges
         mainWebView.addJavascriptInterface(new MainAppInterface(), "Android");
         mainWebView.addJavascriptInterface(new IgProbeInterface(), "IgProbe");
-        workerWebView.addJavascriptInterface(new WorkerAppInterface(), "WorkerBridge");
 
-        // ---------- Main WebView client ----------
         mainWebView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
@@ -223,12 +1023,10 @@ public class MainActivity extends Activity {
                 return handleNav(url);
             }
 
-            // SMOOTH: main WebView ka renderer mar jaye to app crash na ho, Activity naye sire se banti hai
             @TargetApi(Build.VERSION_CODES.O)
             @Override
             public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
-                onRendererGone("main");
-                return true;
+                onRendererGone("main"); return true;
             }
 
             @Override
@@ -242,232 +1040,270 @@ public class MainActivity extends Activity {
                 super.onPageFinished(view, url);
                 if (url != null) mainUrl = url;
                 checkInstagramLogin(url);
-                // SMOOTH: page reload ke wajah se jo result atke the, ab unhe bhejo
                 flushResults();
-                // FIX: Auto-run ON ho to website ka JS ready hone tak baar baar try karo
                 if (url != null && url.startsWith(HOSTING_BASE) && prefs != null && prefs.getBoolean("auto_run", false)) {
                     tryAutoStart(0);
                 }
             }
         });
 
-        // ---------- Worker WebView client ----------
-        workerWebView.setWebViewClient(new WebViewClient() {
-            // SMOOTH: worker WebView ka renderer mar jaye to app crash na ho
-            @TargetApi(Build.VERSION_CODES.O)
-            @Override
-            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
-                onRendererGone("worker");
-                return true;
-            }
-
-            @Override
-            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                WebResourceResponse blocked = blockHeavy(request);
-                return blocked != null ? blocked : super.shouldInterceptRequest(view, request);
-            }
-
-            @Override
-            public void onPageFinished(final WebView view, String url) {
-                super.onPageFinished(view, url);
-                // SMOOTH v2: task shuru hone se pehle (gap ke dauran) next account ka page pehle se load ho raha hota hai
-                if (!taskActive) {
-                    singleOnPreFinished(url);
-                    // FAST FOLLOW: warm page (robots.txt) load hua, mark karo
-                    if (url != null && url.startsWith(WARM_URL)) {
-                        singleWorkerWarm = true;
-                    }
-                    return;
-                }
-                if (!taskActive || url == null || url.startsWith("about:")) return;
-
-                // FAST FOLLOW: warm page ready hua, seedha API chalao (page load nahi)
-                if (singleFastPending && url.startsWith(WARM_URL)) {
-                    singleWorkerWarm = true;
-                    singleFastPending = false;
-                    uiHandler.postDelayed(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (taskActive) runFastSingle(singleFastTarget, singleFastCookies);
-                        }
-                    }, 30);
-                    return;
-                }
-
-                String path = "";
-                try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
-
-                if (path.startsWith("/accounts/suspended")) {
-                    deliverResult(false, "Suspended: Instagram suspended this account");
-                    return;
-                }
-                if (path.startsWith("/accounts/disabled")) {
-                    deliverResult(false, "Disabled: Instagram disabled this account");
-                    return;
-                }
-                if (path.startsWith("/challenge") || path.startsWith("/checkpoint") || path.startsWith("/auth_platform")) {
-                    deliverResult(false, "Blocked: Challenge / Checkpoint");
-                    return;
-                }
-                if (path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")) {
-                    deliverResult(false, "Session expired");
-                    return;
-                }
-
-                uiHandler.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (!taskActive) return;
-                        if ("like".equalsIgnoreCase(currentTaskType)) {
-                            injectLikeScript(view);
-                        } else {
-                            injectFollowScript(view);
-                        }
-                    }
-                }, 400);
-            }
-
-            @Override
-            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                super.onReceivedError(view, request, error);
-                if (taskActive && request != null && request.isForMainFrame()) {
-                    // FIX: page error par seedha fail nahi, pehle retry
-                    if (workerShouldRetry("page error")) {
-                        retryWorker();
-                    } else {
-                        deliverResult(false, "Page error");
-                    }
-                } else if (!taskActive && request != null && request.isForMainFrame()) {
-                    // prewarm wala page fail hua: task start par normal tareeke se load hoga
-                    singlePreKey = ""; singlePreLoading = false; singlePreReady = false; singlePreBad = "";
-                }
-            }
-        });
-
-        // App start: hamesha dashboard (server decide karta hai: dashboard / saved accounts / login)
         mainWebView.loadUrl(HOSTING_DASHBOARD + "?dk=" + deviceKey);
     }
 
-    // FIX: App khulte hi auto task. Website ka JS load hone tak (max ~20 sec) baar baar check karta hai
-    private void tryAutoStart(final int attempt) {
-        if (attempt > 20) return;
-        uiHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (mainWebView == null) return;
-                mainWebView.evaluateJavascript(
-                    "(function(){if(window.__autoStarted)return 'done';"
-                    + "if(typeof window.onAppAutoStart==='function'){window.__autoStarted=true;window.onAppAutoStart();return 'done';}"
-                    + "return 'wait';})()",
-                    new ValueCallback<String>() {
-                        @Override
-                        public void onReceiveValue(String v) {
-                            if (v != null && v.contains("wait")) tryAutoStart(attempt + 1);
-                        }
-                    });
-            }
-        }, attempt == 0 ? 1500 : 1000);
-    }
-
-    // Normal WebView (Instagram wale): bina secret key ke user agent
-    private void setupWebView(WebView wv) {
-        setupWebView(wv, USER_AGENT);
-    }
-
+    // =========================================================
+    //  MAIN WebView SETUP (sirf dashboard ke liye)
+    // =========================================================
+    @SuppressLint("SetJavaScriptEnabled")
     private void setupWebView(WebView wv, String ua) {
         WebSettings s = wv.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setDatabaseEnabled(true);
-        s.setUserAgentString(ua);
-
-        CookieManager cm = CookieManager.getInstance();
-        cm.setAcceptCookie(true);
-        cm.setAcceptThirdPartyCookies(wv, true);
+        if (ua != null) s.setUserAgentString(ua);
+        CookieManager.getInstance().setAcceptCookie(true);
+        CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true);
     }
 
-    // ------------------------------------------------------------------
-    // Device key (reinstall ke baad saved accounts pehchanne ke liye)
-    // ------------------------------------------------------------------
-    private String computeDeviceKey() {
-        try {
-            String aid = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
-            if (aid == null) aid = "unknown";
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] d = md.digest((aid + ":upfollow").getBytes("UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            for (byte b : d) sb.append(String.format("%02x", b));
-            return sb.toString();
-        } catch (Exception e) {
-            return "0000000000000000000000000000000000000000000000000000000000000000";
-        }
-    }
+    // =========================================================
+    //  BRIDGES
+    // =========================================================
+    public class MainAppInterface {
 
-    // ------------------------------------------------------------------
-    // Navigation: "Add Account" link ko yaha pakadte hain
-    // ------------------------------------------------------------------
-    private boolean handleNav(final String url) {
-        // NAYA: Jis link me open_external=1 ho, wo app se bahar Chrome (ya default browser) me khulega
-        if (url != null && url.contains("open_external=1")) {
-            final String real = url.replace("&open_external=1", "").replace("?open_external=1", "");
-            try {
-                Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(real));
-                // Telegram link ho to Chrome force mat karo, Telegram app seedha khulegi
-                if (!real.startsWith("https://t.me/") && !real.startsWith("tg://")) {
-                    i.setPackage("com.android.chrome");
-                }
-                startActivity(i);
-            } catch (Exception e) {
+        @JavascriptInterface
+        public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
+            if (!trusted()) return;
+            // Multi-account parallel mode
+            if (cookieStr != null && !cookieStr.isEmpty()
+                    && !cookieValue(cookieStr, "ds_user_id").isEmpty()) {
                 try {
-                    // Chrome na ho to phone ka default browser
-                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(real)));
-                } catch (Exception ignored) {}
+                    boolean parallelOk = WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE);
+                    if (parallelOk) {
+                        parallelEnqueue(target, taskType, mediaId, cookieStr);
+                        return;
+                    }
+                } catch (Throwable ignored) {}
             }
-            return true;
+            // Single queue mode
+            if (SINGLE_QUEUE_ENABLED) {
+                singleEnqueue(target, taskType, mediaId, cookieStr);
+            }
         }
-        if (url != null && url.contains("force_authentication=1")) {
+
+        @JavascriptInterface
+        public void executeBrowserAction(String target, String taskType, String mediaId) {
+            runTask(target, taskType, mediaId, "");
+        }
+
+        @JavascriptInterface
+        public void executeBrowserFollow(String target) {
+            runTask(target, "follow", "", "");
+        }
+
+        @JavascriptInterface
+        public void setAccountDelay(final int seconds) {
+            if (!trusted()) return;
+            startGapMs = Math.max(MIN_GAP_MS, Math.min(60, seconds) * 1000L);
+        }
+
+        @JavascriptInterface
+        public void setMaxParallel(final int n) {
+            if (!trusted()) return;
+            maxParallel = Math.max(1, Math.min(3, n));
+        }
+
+        @JavascriptInterface
+        public void setFastMode(boolean on) {}
+
+        @JavascriptInterface
+        public boolean isFastMode() { return false; }
+
+        @JavascriptInterface
+        public void setGapJitter(final int seconds) {
+            if (!trusted()) return;
+            gapJitterMs = Math.max(0, Math.min(10, seconds)) * 1000L;
+        }
+
+        @JavascriptInterface
+        public void clearDeadProfiles() {
+            if (!trusted()) return;
             uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    addMode = true;
-                    captureBusy = false;
-                    // Saare accounts ki cookies server par saved hain, isliye jar saaf karna safe hai.
-                    // Isse Instagram naya login form dikhata hai aur purana session nahi ghusta.
-                    applyInstagramCookies("");
-                    // Instagram ko secret key nahi dikhani: normal user agent lagao
-                    mainWebView.getSettings().setUserAgentString(USER_AGENT);
-                    mainWebView.loadUrl(IG_LOGIN_URL);
+                @Override public void run() {
+                    deadMap.clear(); unavailVotes.clear();
+                    saveMap("dead_map", deadMap, DEAD_TTL_MS, 1500);
                 }
             });
-            return true;
         }
-        return false;
+
+        @JavascriptInterface
+        public void clearDoneCache() {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override public void run() {
+                    doneMap.clear();
+                    saveMap("done_map", doneMap, DONE_TTL_MS, 1500);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void fetchInstagramPostsLive(final String queryUsername) {
+            if (!trusted()) return;
+            final String u = queryUsername == null ? "" : queryUsername.replace("@", "").replaceAll("[^A-Za-z0-9._]", "");
+            uiHandler.post(new Runnable() {
+                @Override public void run() {
+                    if (u.isEmpty()) {
+                        pendingPostsUser = "_";
+                        deliverPosts("{\"success\":false,\"message\":\"Invalid username\"}");
+                    } else { startPosts(u); }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void applySession(final String cookieStr) {
+            if (!trusted() || cookieStr == null || cookieStr.isEmpty()) return;
+            uiHandler.post(new Runnable() {
+                @Override public void run() {
+                    applyInstagramCookies(cookieStr);
+                    injectCookiesToHttp(cookieStr); // OkHttp me bhi lagao
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void searchInstagramProfileLive(final String queryUsername) {
+            if (!trusted()) return;
+            final String u = queryUsername == null ? "" : queryUsername.replace("@", "").replaceAll("[^A-Za-z0-9._]", "");
+            uiHandler.post(new Runnable() {
+                @Override public void run() {
+                    if (u.isEmpty()) {
+                        pendingSearchUser = "_";
+                        deliverSearch("{\"success\":false,\"message\":\"Invalid username\"}");
+                    } else { startSearch(u); }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public String getIgCookies() {
+            if (!trusted()) return "";
+            String c = CookieManager.getInstance().getCookie(IG_URL);
+            return c == null ? "" : c;
+        }
+
+        @JavascriptInterface
+        public String getQueueInfo() {
+            if (!trusted()) return "{}";
+            try {
+                return "{\"queued\":" + (pendingTasks.size() + singleQueue.size())
+                        + ",\"active\":" + (activeSlots > 0 || taskActive)
+                        + ",\"gap_ms\":" + curGapMs + "}";
+            } catch (Exception e) { return "{}"; }
+        }
+
+        @JavascriptInterface
+        public String getDebugLog() {
+            if (!trusted()) return "";
+            StringBuilder sb = new StringBuilder();
+            synchronized (dbgLog) { for (String l : dbgLog) sb.append(l).append('\n'); }
+            return sb.toString();
+        }
+
+        @JavascriptInterface
+        public int getAppVersion() { return APP_VERSION_CODE; }
+
+        @JavascriptInterface
+        public boolean isParallelSupported() {
+            try { return WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE); }
+            catch (Throwable t) { return false; }
+        }
+
+        @JavascriptInterface
+        public void clearPendingTasks() {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override public void run() {
+                    PTask t;
+                    while ((t = pendingTasks.poll()) != null) sendParallelResult(t.uid, t.target, false, "Cancelled");
+                    PTask st;
+                    while ((st = singleQueue.poll()) != null) enqueueResultCall("window.onWorkerResult(false, \"Cancelled\")");
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void setAutoRun(final boolean on) {
+            if (!trusted()) return;
+            prefs.edit().putBoolean("auto_run", on).apply();
+        }
+
+        @JavascriptInterface
+        public boolean isAutoRun() { return trusted() && prefs.getBoolean("auto_run", false); }
+
+        @JavascriptInterface
+        public void setKeepScreenOn(final boolean keepOn) {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override public void run() {
+                    if (keepOn) {
+                        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        startAutomationBackground();
+                        if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(12 * 60 * 60 * 1000L);
+                    } else {
+                        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        stopAutomationBackground();
+                        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void updateNotification(final int accounts, final int tasks, final int coins) {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override public void run() { showOrUpdateNotification(accounts, tasks, coins); }
+            });
+        }
+
+        @JavascriptInterface
+        public void stopNotification() {
+            if (!trusted()) return;
+            uiHandler.post(new Runnable() {
+                @Override public void run() { clearAutomationNotification(); }
+            });
+        }
     }
 
-    // ------------------------------------------------------------------
-    // Instagram login capture (main WebView)
-    // ------------------------------------------------------------------
+    public class IgProbeInterface {
+        @JavascriptInterface
+        public void onIgInfo(final String nonce, final String username) {
+            uiHandler.post(new Runnable() {
+                @Override public void run() {
+                    if (captureBusy && nonce != null && nonce.equals(captureNonce))
+                        finishCapture(username);
+                }
+            });
+        }
+    }
+
+    // =========================================================
+    //  INSTAGRAM LOGIN CAPTURE (main WebView me rehta hai)
+    // =========================================================
     private void checkInstagramLogin(String url) {
         if (url == null || captureBusy) return;
         if (!url.startsWith(IG_URL)) return;
-
         String path = "";
-        try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
-        String[] bad = {"login", "challenge", "checkpoint", "suspended", "disabled",
-                "signup", "two_factor", "password", "recover", "auth_platform"};
-        for (String b : bad) {
-            if (path.contains(b)) return;
-        }
-
+        try { path = Uri.parse(url).getPath().toLowerCase(); } catch (Exception ignored) {}
+        String[] bad = {"login","challenge","checkpoint","suspended","disabled","signup","two_factor","password","recover","auth_platform"};
+        for (String b : bad) { if (path.contains(b)) return; }
         String cookies = CookieManager.getInstance().getCookie(IG_URL);
         if (cookieValue(cookies, "sessionid").isEmpty()) return;
-
         captureBusy = true;
         captureCookies = cookies;
         captureNonce = Long.toHexString(System.nanoTime());
         final String nonce = captureNonce;
         String uid = cookieValue(cookies, "ds_user_id");
-
         if (uid.matches("\\d+")) {
             String js = "(function(){var n='" + nonce + "';"
                     + "function d(u){try{IgProbe.onIgInfo(n,u||'');}catch(e){}}"
@@ -477,18 +1313,10 @@ public class MainActivity extends Activity {
                     + ".then(function(j){d(j&&j.user&&j.user.username);})"
                     + ".catch(function(){d('');});}catch(e){d('');}})();";
             mainWebView.evaluateJavascript(js, null);
-        } else {
-            finishCapture("");
-            return;
-        }
-
-        // Agar username fetch atak jaye to bina username ke aage badho
+        } else { finishCapture(""); return; }
         uiHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (captureBusy && nonce.equals(captureNonce)) {
-                    finishCapture("");
-                }
+            @Override public void run() {
+                if (captureBusy && nonce.equals(captureNonce)) finishCapture("");
             }
         }, 6000);
     }
@@ -497,8 +1325,9 @@ public class MainActivity extends Activity {
         if (!captureBusy) return;
         captureBusy = false;
         captureNonce = "";
-        // Website par wapas jaane se pehle secret key + version wala user agent dobara lagao
         mainWebView.getSettings().setUserAgentString(USER_AGENT_APP);
+        // Captured cookies ko OkHttp me bhi inject karo
+        injectCookiesToHttp(captureCookies);
         try {
             String clean = username == null ? "" : username.replaceAll("[^A-Za-z0-9._]", "");
             String body = "ig_cookies=" + URLEncoder.encode(captureCookies, "UTF-8")
@@ -513,29 +1342,44 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Cookie helpers
-    // ------------------------------------------------------------------
+    private boolean handleNav(String url) {
+        if (url == null) return false;
+        if (url.startsWith(HOSTING_BASE) || url.startsWith(IG_URL)) return false;
+        if (url.contains("force_authentication=1")) {
+            uiHandler.post(new Runnable() {
+                @Override public void run() {
+                    addMode = true;
+                    captureBusy = false;
+                    applyInstagramCookies("");
+                    mainWebView.getSettings().setUserAgentString(USER_AGENT);
+                    mainWebView.loadUrl(IG_LOGIN_URL);
+                }
+            });
+            return true;
+        }
+        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); } catch (Exception ignored) {}
+        return true;
+    }
+
+    // =========================================================
+    //  HELPERS
+    // =========================================================
     private static String cookieValue(String cookies, String name) {
         if (cookies == null) return "";
         for (String part : cookies.split(";")) {
             part = part.trim();
             int i = part.indexOf('=');
-            if (i > 0 && part.substring(0, i).equals(name)) {
-                return part.substring(i + 1);
-            }
+            if (i > 0 && part.substring(0, i).equals(name)) return part.substring(i + 1);
         }
         return "";
     }
 
-    // cookieStr khali ho to sirf Instagram cookies clear hoti hain
     private void applyInstagramCookies(String cookieStr) {
         CookieManager cm = CookieManager.getInstance();
         String existing = cm.getCookie(IG_URL);
         if (existing != null) {
             for (String part : existing.split(";")) {
-                String p = part.trim();
-                int i = p.indexOf('=');
+                String p = part.trim(); int i = p.indexOf('=');
                 String name = i > 0 ? p.substring(0, i) : p;
                 if (name.isEmpty()) continue;
                 cm.setCookie(IG_URL, name + "=; Max-Age=0; Path=/; Domain=.instagram.com");
@@ -544,8 +1388,7 @@ public class MainActivity extends Activity {
         }
         if (cookieStr != null && !cookieStr.isEmpty()) {
             for (String part : cookieStr.split(";")) {
-                String p = part.trim();
-                int i = p.indexOf('=');
+                String p = part.trim(); int i = p.indexOf('=');
                 if (i <= 0) continue;
                 String name = p.substring(0, i);
                 String extra = "; Domain=.instagram.com; Path=/; Secure";
@@ -559,1708 +1402,6 @@ public class MainActivity extends Activity {
     private boolean trusted() {
         String u = mainUrl;
         return u != null && u.startsWith(HOSTING_BASE);
-    }
-
-    // ------------------------------------------------------------------
-    // Result delivery (ek task = ek result)
-    // ------------------------------------------------------------------
-    private void deliverResult(boolean success, String message) {
-        if (!taskActive) return;
-        taskActive = false;
-        uiHandler.removeCallbacks(taskTimeout);
-        String safe = message == null ? "" : message.replace("\\", "\\\\").replace("'", "\\'");
-        // SMOOTH: result page tak pakka pahunche (page reload ho raha ho to ruk kar dobara bhejta hai)
-        // aur message me newline / quote ho to bhi JS na tute. Purana tareeka niche as-is rakha hai.
-        if (RESULT_RETRY_ENABLED) {
-            dbg("single result ok=" + success + " msg=" + message);
-            enqueueResultCall("window.onWorkerResult(" + success + ", "
-                    + JSONObject.quote(message == null ? "" : message) + ")");
-            onSingleTaskEnded();
-            return;
-        }
-        mainWebView.evaluateJavascript(
-                "if(window.onWorkerResult) window.onWorkerResult(" + success + ", '" + safe + "');", null);
-    }
-
-    // FIX: single-worker mode retry (jab tak task poora na ho ya sach me error na ho, aage mat jao)
-    private boolean workerShouldRetry(String msg) {
-        if (!taskActive || workerRetries >= 1) return false;
-        if (System.currentTimeMillis() - workerStartedAt > 14000) return false;
-        String m = msg == null ? "" : msg.toLowerCase();
-        return m.contains("not found") || m.contains("did not register")
-                || m.contains("page error") || m.contains("js error")
-                || m.contains("unavailable");
-    }
-
-    private void retryWorker() {
-        workerRetries++;
-        uiHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (!taskActive) return;
-                try {
-                    workerWebView.reload();
-                } catch (Exception e) {
-                    deliverResult(false, "Page error");
-                }
-            }
-        }, 3000);
-    }
-
-    private static String js(String... lines) {
-        StringBuilder sb = new StringBuilder();
-        for (String l : lines) sb.append(l).append('\n');
-        return sb.toString();
-    }
-
-    // ------------------------------------------------------------------
-    // Shared JS helpers (fatal state detection, popups)
-    // FIX: fatal() ab poore page ka text nahi padhta (bio me "try again later" se false block hota tha)
-    // FIX: gone() ab 8 sec tak lagatar "not available" dikhe tabhi maanta hai
-    // ------------------------------------------------------------------
-    private static final String JS_HEAD = js(
-        "(function() {",
-        "  if (window.__ufRunning) return;",
-        "  window.__ufRunning = true;",
-        "  var finished = false, timer = null, tries = 0, clicked = false, clickedAt = 0;",
-        "  function finish(ok, msg) {",
-        "    if (finished) return;",
-        "    finished = true; window.__ufRunning = false;",
-        "    if (timer) clearInterval(timer);",
-        "    window.WorkerBridge.onTaskResult(ok, msg);",
-        "  }",
-        "  function txt(e) { return ((e.innerText || e.textContent) || '').trim().toLowerCase(); }",
-        "  function lbl(e) { return (e.getAttribute('aria-label') || '').trim().toLowerCase(); }",
-        "  function btns(root) { return Array.prototype.slice.call((root || document).querySelectorAll('button, div[role=button], span[role=button], a[role=button]')); }",
-        "  function bodyText() { return (document.body ? document.body.innerText : '').toLowerCase(); }",
-        "  function fatal() {",
-        "    var p = location.pathname || '';",
-        "    if (p.indexOf('/accounts/suspended') === 0) return 'Suspended: Instagram suspended this account';",
-        "    if (p.indexOf('/accounts/disabled') === 0) return 'Disabled: Instagram disabled this account';",
-        "    if (p.indexOf('/challenge') === 0 || p.indexOf('/checkpoint') === 0 || p.indexOf('/auth_platform') === 0) return 'Blocked: Challenge / Checkpoint';",
-        "    if (p.indexOf('/accounts/login') === 0 || p.indexOf('/accounts/emailsignup') === 0) return 'Session expired';",
-        "    if (document.querySelector('input[name=password]')) return 'Session expired';",
-        "    var hasHdr = !!document.querySelector('header');",
-        "    var t = hasHdr ? '' : bodyText();",
-        "    if (t.indexOf('account has been disabled') > -1 || t.indexOf('account was disabled') > -1) return 'Disabled: Instagram disabled this account';",
-        "    if (t.indexOf('account has been suspended') > -1 || t.indexOf('suspended your account') > -1 || t.indexOf('account is suspended') > -1) return 'Suspended: Instagram suspended this account';",
-        "    var dlg = document.querySelector('div[role=dialog]');",
-        "    var dt = dlg ? (dlg.innerText || '').toLowerCase() : '';",
-        "    if (dt.indexOf('action blocked') > -1 || dt.indexOf('try again later') > -1 || dt.indexOf('we restrict certain activity') > -1) return 'Blocked: Action Limit / Challenge';",
-        "    return null;",
-        "  }",
-        "  var goneSince = 0;",
-        "  function gone() {",
-        "    var t = bodyText();",
-        "    var m = (t.indexOf('page isn') > -1 && t.indexOf('available') > -1) || (t.indexOf('content isn') > -1 && t.indexOf('available') > -1);",
-        "    if (!m || document.querySelector('header')) { goneSince = 0; return false; }",
-        "    if (!goneSince) goneSince = Date.now();",
-        "    return Date.now() - goneSince > 8000;",
-        "  }",
-        "  function dismiss() {",
-        "    var w = ['not now', 'allow all cookies', 'allow essential and optional cookies', 'accept all'];",
-        "    btns().forEach(function(b) { if (w.indexOf(txt(b)) > -1) b.click(); });",
-        "  }"
-    );
-
-    // ------------------------------------------------------------------
-    // FOLLOW SCRIPT
-    // FIX: fail bhejne se pehle API se verify (follow sach me hua ho to coin milega)
-    // ------------------------------------------------------------------
-    private void injectFollowScript(WebView view) {
-        String script = JS_HEAD + js(
-            "  var FOLLOW = ['follow', 'follow back', '\u092b\u0949\u0932\u094b \u0915\u0930\u0947\u0902'];",
-            "  var DONE = ['following', 'requested'];",
-            "  var apiTried = false, apiBusy = false, apiAt = 0, verifyAt = 0;",
-            "  window.__ufLast = Date.now();",
-            "  function find(list, words) {",
-            "    for (var i = 0; i < list.length; i++) { if (words.indexOf(txt(list[i])) > -1) return list[i]; }",
-            "    return null;",
-            "  }",
-            "  function cookie(name) {",
-            "    var c = (document.cookie || '').split(';');",
-            "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(name + '=') === 0) return p.substring(name.length + 1); }",
-            "    return '';",
-            "  }",
-            "  function who() { return (location.pathname || '').split('/').filter(function(x) { return x; })[0] || ''; }",
-            "  var didAct = false, softBusy = false;",
-            "  function acted() { didAct = true; try { window.WorkerBridge.onActed(); } catch (e) {} }",
-            "  function softFail(msg) {",
-            "    if (softBusy) return; softBusy = true;",
-            "    var name = who();",
-            "    if (!name) { finish(false, msg); return; }",
-            "    fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(name), { credentials: 'include', headers: { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest' } })",
-            "    .then(function(r) { return r.text(); })",
-            "    .then(function(t) {",
-            "      var d = null; try { d = JSON.parse(t); } catch (e) {}",
-            "      var u = d && d.data && d.data.user;",
-            "      if (u && (u.followed_by_viewer || u.requested_by_viewer)) finish(true, didAct ? 'Followed Successfully' : 'Already Following');",
-            "      else finish(false, msg);",
-            "    }).catch(function() { finish(false, msg); });",
-            "  }",
-            // ---- Tez raasta: seedha API. Fail ho to neeche purana button-click chalega ----
-            "  function apiFollow() {",
-            "    apiTried = true;",
-            "    var name = who(), csrf = cookie('csrftoken');",
-            "    if (!name || !csrf) return;",
-            "    apiBusy = true; apiAt = Date.now();",
-            "    var H = { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest' };",
-            "    fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(name), { credentials: 'include', headers: H })",
-            "    .then(function(r) { return r.text(); })",
-            "    .then(function(t) {",
-            "      var d = null; try { d = JSON.parse(t); } catch (e) {}",
-            "      var u = d && d.data && d.data.user;",
-            "      if (!u || !u.id) { apiBusy = false; return; }",
-            "      if (u.followed_by_viewer || u.requested_by_viewer) { finish(true, 'Already Following'); return; }",
-            "      var h2 = { 'x-csrftoken': csrf, 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'content-type': 'application/x-www-form-urlencoded' };",
-            "      acted();",
-            "      return fetch('/api/v1/friendships/create/' + u.id + '/', { method: 'POST', credentials: 'include', headers: h2, body: '' })",
-            "      .then(function(r) { return r.text().then(function(t2) { return { s: r.status, t: t2 }; }); })",
-            "      .then(function(x) {",
-            "        apiBusy = false;",
-            "        var low = x.t.toLowerCase().split(' ').join('');",
-            "        if (x.s === 200 && low.indexOf('\"status\":\"ok\"') > -1) { finish(true, 'Followed Successfully'); return; }",
-            "        if (low.indexOf('checkpoint') > -1 || low.indexOf('challenge') > -1) { finish(false, 'Blocked: Challenge / Checkpoint'); return; }",
-            "        if (low.indexOf('login_required') > -1) { finish(false, 'Session expired'); return; }",
-            "        if (low.indexOf('feedback_required') > -1 || x.s === 429 || low.indexOf('\"spam\":true') > -1 || low.indexOf('trylater') > -1) { finish(false, 'Blocked: Action Limit / Challenge'); return; }",
-            "      });",
-            "    }).catch(function() { apiBusy = false; });",
-            "  }",
-            // ---- Click ke baad pakka karo ki follow sach me hua (button late badle to bhi galat 'fail' na jaye) ----
-            "  function verifyFollow() {",
-            "    verifyAt = Date.now();",
-            "    var name = who();",
-            "    if (!name) return;",
-            "    apiBusy = true; apiAt = Date.now();",
-            "    fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(name), { credentials: 'include', headers: { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest' } })",
-            "    .then(function(r) { return r.text(); })",
-            "    .then(function(t) {",
-            "      apiBusy = false;",
-            "      var d = null; try { d = JSON.parse(t); } catch (e) {}",
-            "      var u = d && d.data && d.data.user;",
-            "      if (u && (u.followed_by_viewer || u.requested_by_viewer)) { finish(true, 'Followed Successfully'); }",
-            "    }).catch(function() { apiBusy = false; });",
-            "  }",
-            "  function tick() {",
-            "    try {",
-            "      if (finished) return;",
-            "      window.__ufLast = Date.now();",
-            "      tries++;",
-            "      var f = fatal(); if (f) { finish(false, f); return; }",
-            "      dismiss();",
-            "      if (apiBusy) { if (Date.now() - apiAt > 12000) { apiBusy = false; } else { return; } }",
-            "      if (!apiTried && !clicked) { apiFollow(); if (apiBusy) return; }",
-            // 'unavailable' tabhi jab API bhi kaam na kare aur page 8 sec tak lagatar 'not available' dikhaye
-            "      if (tries >= 3 && !clicked && gone()) { softFail('Profile unavailable'); return; }",
-            "      var scope = (tries > 16) ? document : (document.querySelector('header') || document.querySelector('main') || document);",
-            "      var list = btns(scope);",
-            "      if (clicked) {",
-            "        if (find(list, DONE)) { finish(true, 'Followed Successfully'); return; }",
-            "        var waited = Date.now() - clickedAt;",
-            "        if (waited > 20000) { softFail('Click did not register'); return; }",
-            "        if (waited > 5000 && Date.now() - verifyAt > 3000) { verifyFollow(); }",
-            "        return;",
-            "      }",
-            "      if (find(list, DONE)) { finish(true, 'Already Following'); return; }",
-            "      var fb = find(list, FOLLOW);",
-            "      if (fb) { acted(); fb.click(); clicked = true; clickedAt = Date.now(); return; }",
-            "      if (tries >= 180) { softFail('Follow button not found'); }",
-            "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
-            "  }",
-            "  window.__ufTick = tick;",
-            "  timer = setInterval(tick, 350);",
-            "  tick();",
-            "})();"
-        );
-        view.evaluateJavascript(script, null);
-    }
-
-    // ------------------------------------------------------------------
-    // LIKE SCRIPT: pehle Instagram web API (tez), na chale to DOM button (fallback)
-    // ------------------------------------------------------------------
-    private void injectLikeScript(WebView view) {
-        String script = JS_HEAD + js(
-            "  var LIKE = ['like', '\u092a\u0938\u0902\u0926 \u0915\u0930\u0947\u0902', 'me gusta', 'curtir', 'mi piace', 'suka', 'gef\u00e4llt mir'];",
-            "  var UNLIKE = ['unlike', '\u092a\u0938\u0902\u0926 \u0930\u0926\u094d\u0926 \u0915\u0930\u0947\u0902', 'ya no me gusta', 'descurtir', 'batal suka', 'gef\u00e4llt mir nicht mehr'];",
-            "  var apiTried = false, apiBusy = false, apiAt = 0;",
-            "  window.__ufLast = Date.now();",
-            "  function acted() { try { window.WorkerBridge.onActed(); } catch (e) {} }",
-            "  function byLabel(set) {",
-            "    var els = document.querySelectorAll('svg[aria-label], [role=button][aria-label], button[aria-label]');",
-            "    for (var i = 0; i < els.length; i++) {",
-            "      if (set.indexOf(lbl(els[i])) > -1) {",
-            "        var r = els[i].getBoundingClientRect();",
-            "        if (r.width > 0 && r.height > 0) return els[i];",
-            "      }",
-            "    }",
-            "    return null;",
-            "  }",
-            "  function cookie(name) {",
-            "    var c = (document.cookie || '').split(';');",
-            "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(name + '=') === 0) return p.substring(name.length + 1); }",
-            "    return '';",
-            "  }",
-            "  function callApi() {",
-            "    apiTried = true;",
-            "    var parts = (location.pathname || '').split('/'), sc = '';",
-            "    for (var i = 0; i < parts.length - 1; i++) {",
-            "      if (parts[i] === 'p' || parts[i] === 'reel' || parts[i] === 'reels' || parts[i] === 'tv') { sc = parts[i + 1]; break; }",
-            "    }",
-            "    var csrf = cookie('csrftoken');",
-            "    if (!sc || !csrf || typeof BigInt === 'undefined') return;",
-            "    var a = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';",
-            "    var id = BigInt(0); sc = sc.slice(0, 11);",
-            "    for (var j = 0; j < sc.length; j++) { id = id * BigInt(64) + BigInt(a.indexOf(sc.charAt(j))); }",
-            "    apiBusy = true; apiAt = Date.now();",
-            "    acted();",
-            "    fetch('/api/v1/web/likes/' + id.toString() + '/like/', {",
-            "      method: 'POST', credentials: 'include',",
-            "      headers: { 'x-csrftoken': csrf, 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'content-type': 'application/x-www-form-urlencoded' },",
-            "      body: ''",
-            "    }).then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
-            "    .then(function(x) {",
-            "      apiBusy = false;",
-            "      var low = x.t.toLowerCase().split(' ').join('');",
-            "      if (x.s === 200 && low.indexOf('\"status\":\"ok\"') > -1) { finish(true, 'Post Liked Successfully'); return; }",
-            "      if (low.indexOf('checkpoint') > -1 || low.indexOf('challenge') > -1) { finish(false, 'Blocked: Challenge / Checkpoint'); return; }",
-            "      if (low.indexOf('login_required') > -1) { finish(false, 'Session expired'); return; }",
-            "      if (low.indexOf('feedback_required') > -1 || x.s === 429 || low.indexOf('\"spam\":true') > -1 || low.indexOf('trylater') > -1) { finish(false, 'Blocked: Action Limit / Challenge'); return; }",
-            "      if (x.s === 404) { finish(false, 'Post unavailable'); return; }",
-            "    }).catch(function() { apiBusy = false; });",
-            "  }",
-            "  function tick() {",
-            "    try {",
-            "      if (finished) return;",
-            "      window.__ufLast = Date.now();",
-            "      tries++;",
-            "      var f = fatal(); if (f) { finish(false, f); return; }",
-            "      dismiss();",
-            "      if (apiBusy) { if (Date.now() - apiAt > 12000) { apiBusy = false; } else { return; } }",
-            "      if (byLabel(UNLIKE)) { finish(true, clicked ? 'Post Liked Successfully' : 'Already Liked'); return; }",
-            "      if (!apiTried && !clicked) { callApi(); if (apiBusy) return; }",
-            "      if (tries >= 3 && !clicked && gone()) { finish(false, 'Post unavailable'); return; }",
-            "      if (clicked) {",
-            "        var waited = Date.now() - clickedAt;",
-            "        if (waited > 20000) { finish(false, 'Like did not register'); return; }",
-            "        if (waited > 6000 && !apiTried) { callApi(); }",
-            "        return;",
-            "      }",
-            "      var lk = byLabel(LIKE);",
-            "      if (lk) {",
-            "        var b = lk.closest('button, [role=button]') || lk.parentElement;",
-            "        acted(); b.click(); clicked = true; clickedAt = Date.now(); return;",
-            "      }",
-            "      if (tries >= 180) { finish(false, 'Like button not found'); }",
-            "    } catch (err) { finish(false, 'JS Error: ' + err.message); }",
-            "  }",
-            "  window.__ufTick = tick;",
-            "  timer = setInterval(tick, 350);",
-            "  tick();",
-            "})();"
-        );
-        view.evaluateJavascript(script, null);
-    }
-
-    // ------------------------------------------------------------------
-    // LIVE PROFILE SEARCH (followers.php target search)
-    // Alag hidden WebView use hota hai, taaki running task disturb na ho.
-    // Pehle Instagram API, fail ho to profile page ke meta tags se data nikalta hai.
-    // ------------------------------------------------------------------
-    private boolean searchRunning = false;
-
-    private final Runnable searchTimeout = new Runnable() {
-        @Override
-        public void run() {
-            deliverSearch("{\"success\":false,\"message\":\"Search timeout. Dobara try karo.\"}");
-        }
-    };
-
-    private void startSearch(String u) {
-        pendingSearchUser = u;
-        searchRunning = false;
-        uiHandler.removeCallbacks(searchTimeout);
-        uiHandler.postDelayed(searchTimeout, 20000);
-        String cur = searchWebView.getUrl();
-        if (cur != null && cur.startsWith(IG_URL)) {
-            runSearchJs(u);
-        } else {
-            searchWebView.loadUrl(IG_URL + "/");
-        }
-    }
-
-    private void runSearchJs(String u) {
-        if (searchRunning) return;
-        searchRunning = true;
-        searchWebView.evaluateJavascript(buildSearchJs(u), null);
-    }
-
-    private void deliverSearch(String json) {
-        if (pendingSearchUser == null) return;
-        pendingSearchUser = null;
-        searchRunning = false;
-        uiHandler.removeCallbacks(searchTimeout);
-        mainWebView.evaluateJavascript(
-                "if(window.onInstagramLiveSearchResult) window.onInstagramLiveSearchResult(true, "
-                        + JSONObject.quote(json) + ");", null);
-    }
-
-    private static String buildSearchJs(String u) {
-        return js(
-            "(function() {",
-            "  var U = '" + u + "';",
-            "  var done = false;",
-            "  var H = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'Accept': '*/*' };",
-            "  function out(o) { if (done) return; done = true; SearchBridge.onResult(JSON.stringify(o)); }",
-            "  function fmt(n) {",
-            "    n = Number(n) || 0;",
-            "    return n.toLocaleString('en-US');",
-            "  }",
-            "  function numAfter(t, key) {",
-            "    var k = t.indexOf(key);",
-            "    if (k < 0) return 0;",
-            "    var s = k + key.length, e = s;",
-            "    while (e < t.length && t.charAt(e) >= '0' && t.charAt(e) <= '9') e++;",
-            "    return Number(t.substring(s, e)) || 0;",
-            "  }",
-            "  function good(r) {",
-            "    out({ success: true, username: r.username || U, full_name: r.full_name || '', numeric_id: '' + (r.pk || ''),",
-            "          follower_count: r.fc, followers_formatted: fmt(r.fc) + ' followers', is_verified: !!r.verified, profile_pic: r.pic || '' });",
-            "  }",
-            // ---- Strategy 1: web_profile_info API (kisi bhi 2xx status ko accept karta hai) ----
-            "  function tryApi() {",
-            "    return fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: H })",
-            "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
-            "    .then(function(x) {",
-            "      try {",
-            "        var d = JSON.parse(x.t);",
-            "        var u = (d.data && d.data.user) ? d.data.user : (d.user || null);",
-            "        if (u && u.username) {",
-            "          var fc = (u.edge_followed_by && u.edge_followed_by.count !== undefined) ? u.edge_followed_by.count : (u.follower_count || 0);",
-            "          return { username: u.username, full_name: u.full_name, pk: u.id || u.pk, fc: fc, verified: u.is_verified, pic: u.profile_pic_url_hd || u.profile_pic_url };",
-            "        }",
-            "        if (d && (d.message === 'login_required' || d.require_login)) return { err: 'login' };",
-            "      } catch (e) {}",
-            "      return null;",
-            "    }).catch(function() { return null; });",
-            "  }",
-            // ---- Strategy 2: profile page ke meta tags (og:description me followers) ----
-            "  function tryHtml() {",
-            "    return fetch('/' + encodeURIComponent(U) + '/', { credentials: 'include', headers: { 'Accept': 'text/html' } })",
-            "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
-            "    .then(function(x) {",
-            "      var low = x.t.toLowerCase();",
-            "      if (x.s === 404 || (low.indexOf('page isn') > -1 && low.indexOf('available') > -1 && low.indexOf('og:title') < 0)) return { notfound: true };",
-            "      var doc = new DOMParser().parseFromString(x.t, 'text/html');",
-            "      function meta(p) {",
-            "        var m = Array.prototype.slice.call(doc.querySelectorAll('meta')).filter(function(e) { return e.getAttribute('property') === p || e.getAttribute('name') === p; });",
-            "        return m.length ? (m[0].getAttribute('content') || '') : '';",
-            "      }",
-            "      var desc = meta('og:description') || meta('description');",
-            "      var i = desc.toLowerCase().indexOf(' followers');",
-            "      if (i < 0) return null;",
-            "      var tok = desc.substring(0, i).trim().split(' ').pop().split(',').join('');",
-            "      var mult = 1, last = tok.charAt(tok.length - 1).toUpperCase();",
-            "      if (last === 'K') { mult = 1000; tok = tok.slice(0, -1); }",
-            "      else if (last === 'M') { mult = 1000000; tok = tok.slice(0, -1); }",
-            "      else if (last === 'B') { mult = 1000000000; tok = tok.slice(0, -1); }",
-            "      var fc = Math.round(parseFloat(tok) * mult);",
-            "      if (isNaN(fc)) return null;",
-            "      var exact = numAfter(x.t, '\"edge_followed_by\":{\"count\":') || numAfter(x.t, '\"follower_count\":');",
-            "      if (exact > 0 && Math.abs(exact - fc) <= Math.max(fc * 0.1, 1)) fc = exact;",
-            "      var title = meta('og:title');",
-            "      var fn = title.indexOf(' (@') > -1 ? title.split(' (@')[0] : '';",
-            "      var pk = '', keys = ['\"profile_id\":\"', '\"target_id\":\"', '\"user_id\":\"'];",
-            "      for (var j = 0; j < keys.length && !pk; j++) {",
-            "        var k = x.t.indexOf(keys[j]);",
-            "        if (k > -1) { var e = x.t.indexOf('\"', k + keys[j].length); pk = x.t.substring(k + keys[j].length, e); if (isNaN(Number(pk))) pk = ''; }",
-            "      }",
-            "      return { username: U, full_name: fn, pk: pk, fc: fc, verified: x.t.indexOf('\"is_verified\":true') > -1, pic: meta('og:image') };",
-            "    }).catch(function() { return null; });",
-            "  }",
-            "  tryApi().then(function(a) {",
-            "    if (a && a.username) return a;",
-            "    return tryHtml().then(function(h) { return (h && (h.username || h.notfound)) ? h : (a || h); });",
-            "  }).then(function(r) {",
-            "    if (r && r.username) { good(r); }",
-            "    else if (r && r.notfound) { out({ success: false, message: 'Account not found on Instagram' }); }",
-            "    else if (r && r.err === 'login') { out({ success: false, message: 'Instagram login expire. Account re-login karo.' }); }",
-            "    else { out({ success: false, message: 'Instagram ne response nahi diya. Thodi der baad try karo.' }); }",
-            "  }).catch(function(e) { out({ success: false, message: 'Search error: ' + e.message }); });",
-            "})();"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // TARGET ACCOUNT KE POSTS + REELS (likes page ke liye)
-    // ------------------------------------------------------------------
-    private String pendingPostsUser = null;
-    private boolean postsRunning = false;
-
-    private final Runnable postsTimeout = new Runnable() {
-        @Override
-        public void run() {
-            deliverPosts("{\"success\":false,\"message\":\"Request timed out. Please try again.\"}");
-        }
-    };
-
-    private void startPosts(String u) {
-        pendingPostsUser = u;
-        postsRunning = false;
-        uiHandler.removeCallbacks(postsTimeout);
-        uiHandler.postDelayed(postsTimeout, 40000);
-        searchWebView.loadUrl(IG_URL + "/" + u + "/");
-    }
-
-    private void runPostsJs(String u) {
-        if (postsRunning) return;
-        postsRunning = true;
-        searchWebView.evaluateJavascript(buildPostsJs(u), null);
-    }
-
-    private void deliverPosts(String json) {
-        if (pendingPostsUser == null) return;
-        pendingPostsUser = null;
-        postsRunning = false;
-        uiHandler.removeCallbacks(postsTimeout);
-        mainWebView.evaluateJavascript(
-                "if(window.onInstagramPostsResult) window.onInstagramPostsResult(true, "
-                        + JSONObject.quote(json) + ");", null);
-    }
-
-    private static String buildPostsJs(String u) {
-        return js(
-            "(function() {",
-            "  var U = '" + u + "';",
-            "  var done = false, loginErr = false, missing = false;",
-            "  var H = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'Accept': '*/*' };",
-            "  function out(o) { if (done) return; done = true; SearchBridge.onPosts(JSON.stringify(o)); }",
-            "  function cookie(name) {",
-            "    var c = (document.cookie || '').split(';');",
-            "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(name + '=') === 0) return p.substring(name.length + 1); }",
-            "    return '';",
-            "  }",
-            "  function numAfter(t, key) {",
-            "    var k = t.indexOf(key);",
-            "    if (k < 0) return 0;",
-            "    var s = k + key.length, e = s;",
-            "    while (e < t.length && t.charAt(e) >= '0' && t.charAt(e) <= '9') e++;",
-            "    return Number(t.substring(s, e)) || 0;",
-            "  }",
-            "  function fromNode(n) {",
-            "    return { code: n.shortcode, thumb: n.thumbnail_src || n.display_url || '', likes: (n.edge_liked_by && n.edge_liked_by.count) || 0, video: !!n.is_video, reel: n.product_type === 'clips', ts: n.taken_at_timestamp || 0 };",
-            "  }",
-            "  function fromItem(i) {",
-            "    var th = '';",
-            "    try { th = i.image_versions2.candidates[0].url; } catch (e) {}",
-            "    if (!th) { try { th = i.carousel_media[0].image_versions2.candidates[0].url; } catch (e) {} }",
-            "    return { code: i.code, thumb: th, likes: i.like_count || 0, video: i.media_type === 2, reel: i.product_type === 'clips', ts: i.taken_at || 0 };",
-            "  }",
-            "  function apiProfile() {",
-            "    return fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(U), { credentials: 'include', headers: H })",
-            "    .then(function(r) { return r.text(); })",
-            "    .then(function(t) {",
-            "      try {",
-            "        var d = JSON.parse(t);",
-            "        if (d && (d.message === 'login_required' || d.require_login)) { loginErr = true; return null; }",
-            "        var u = d.data && d.data.user;",
-            "        if (!u) return null;",
-            "        var edges = (u.edge_owner_to_timeline_media && u.edge_owner_to_timeline_media.edges) || [];",
-            "        return { id: u.id, fc: (u.edge_followed_by && u.edge_followed_by.count !== undefined) ? u.edge_followed_by.count : null,",
-            "                 pic: u.profile_pic_url_hd || u.profile_pic_url || '', name: u.full_name || '',",
-            "                 priv: !!(u.is_private && !u.followed_by_viewer), posts: edges.map(function(e) { return fromNode(e.node); }) };",
-            "      } catch (e) { return null; }",
-            "    }).catch(function() { return null; });",
-            "  }",
-            "  function htmlInfo() {",
-            "    return fetch('/' + encodeURIComponent(U) + '/', { credentials: 'include', headers: { 'Accept': 'text/html' } })",
-            "    .then(function(r) { return r.text().then(function(t) { return { s: r.status, t: t }; }); })",
-            "    .then(function(x) {",
-            "      var low = x.t.toLowerCase();",
-            "      if (x.s === 404 || (low.indexOf('page isn') > -1 && low.indexOf('available') > -1 && low.indexOf('og:title') < 0)) { missing = true; return null; }",
-            "      var doc = new DOMParser().parseFromString(x.t, 'text/html');",
-            "      function meta(p) {",
-            "        var m = Array.prototype.slice.call(doc.querySelectorAll('meta')).filter(function(e) { return e.getAttribute('property') === p || e.getAttribute('name') === p; });",
-            "        return m.length ? (m[0].getAttribute('content') || '') : '';",
-            "      }",
-            "      var desc = meta('og:description') || meta('description');",
-            "      var i = desc.toLowerCase().indexOf(' followers');",
-            "      if (i < 0) return null;",
-            "      var tok = desc.substring(0, i).trim().split(' ').pop().split(',').join('');",
-            "      var mult = 1, last = tok.charAt(tok.length - 1).toUpperCase();",
-            "      if (last === 'K') { mult = 1000; tok = tok.slice(0, -1); }",
-            "      else if (last === 'M') { mult = 1000000; tok = tok.slice(0, -1); }",
-            "      else if (last === 'B') { mult = 1000000000; tok = tok.slice(0, -1); }",
-            "      var fc = Math.round(parseFloat(tok) * mult);",
-            "      if (isNaN(fc)) return null;",
-            "      var exact = numAfter(x.t, '\"edge_followed_by\":{\"count\":') || numAfter(x.t, '\"follower_count\":');",
-            "      if (exact > 0 && Math.abs(exact - fc) <= Math.max(fc * 0.1, 1)) fc = exact;",
-            "      var title = meta('og:title');",
-            "      var fn = title.indexOf(' (@') > -1 ? title.split(' (@')[0] : '';",
-            "      var pk = '', keys = ['\"profile_id\":\"', '\"target_id\":\"', '\"user_id\":\"'];",
-            "      for (var j = 0; j < keys.length && !pk; j++) {",
-            "        var k = x.t.indexOf(keys[j]);",
-            "        if (k > -1) { var e = x.t.indexOf('\"', k + keys[j].length); pk = x.t.substring(k + keys[j].length, e); if (isNaN(Number(pk))) pk = ''; }",
-            "      }",
-            "      return { id: pk, fc: fc, pic: meta('og:image'), name: fn, posts: [] };",
-            "    }).catch(function() { return null; });",
-            "  }",
-            "  function viaFeed() {",
-            "    return fetch('/api/v1/feed/user/' + encodeURIComponent(U) + '/username/?count=18', { credentials: 'include', headers: H })",
-            "    .then(function(r) { return r.text(); })",
-            "    .then(function(t) {",
-            "      try {",
-            "        var d = JSON.parse(t);",
-            "        if (d && d.items) return d.items.map(fromItem);",
-            "        if (d && (d.message === 'login_required' || d.require_login)) loginErr = true;",
-            "      } catch (e) {}",
-            "      return [];",
-            "    }).catch(function() { return []; });",
-            "  }",
-            "  function viaClips(id) {",
-            "    var h = { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'x-csrftoken': cookie('csrftoken'), 'content-type': 'application/x-www-form-urlencoded' };",
-            "    return fetch('/api/v1/clips/user/', { method: 'POST', credentials: 'include', headers: h,",
-            "      body: 'target_user_id=' + encodeURIComponent(id) + '&page_size=18&include_feed_video=true' })",
-            "    .then(function(r) { return r.text(); })",
-            "    .then(function(t) {",
-            "      try {",
-            "        var d = JSON.parse(t);",
-            "        if (d && d.items) return d.items.map(function(x) { var m = fromItem(x.media || x); m.reel = true; return m; });",
-            "      } catch (e) {}",
-            "      return [];",
-            "    }).catch(function() { return []; });",
-            "  }",
-            "  function merge(all) {",
-            "    var m = {};",
-            "    all.forEach(function(x) {",
-            "      if (!x.code) return;",
-            "      var o = m[x.code];",
-            "      if (!o) { m[x.code] = x; return; }",
-            "      if (x.reel) o.reel = true;",
-            "      if (!o.thumb) o.thumb = x.thumb;",
-            "      if (x.likes > o.likes) o.likes = x.likes;",
-            "      if (!o.ts) o.ts = x.ts;",
-            "    });",
-            "    return Object.keys(m).map(function(k) { return m[k]; }).sort(function(a, b) { return (b.ts || 0) - (a.ts || 0); });",
-            "  }",
-            "  function scrape() {",
-            "    var root = document.querySelector('main') || document;",
-            "    var as = root.querySelectorAll('a[href*=\"/p/\"], a[href*=\"/reel/\"]');",
-            "    var map = {}, list = [];",
-            "    for (var i = 0; i < as.length; i++) {",
-            "      var a = as[i];",
-            "      var m = (a.getAttribute('href') || '').match(/\\/(p|reel)\\/([A-Za-z0-9_-]+)/);",
-            "      if (!m) continue;",
-            "      var clip = !!a.querySelector('svg[aria-label=\"Clip\"], svg[aria-label=\"Reel\"]');",
-            "      var o = map[m[2]];",
-            "      if (o) { if (m[1] === 'reel' || clip) o.reel = true; continue; }",
-            "      var img = a.querySelector('img');",
-            "      o = { code: m[2], thumb: img ? (img.currentSrc || img.src || '') : '', likes: 0, video: (m[1] === 'reel' || clip || !!a.querySelector('svg[aria-label=\"Video\"]')), reel: (m[1] === 'reel' || clip), ts: 0 };",
-            "      map[m[2]] = o; list.push(o);",
-            "    }",
-            "    return list;",
-            "  }",
-            "  function domPosts() {",
-            "    return new Promise(function(resolve) {",
-            "      var t0 = Date.now(), last = -1, stable = 0;",
-            "      function poll() {",
-            "        var body = (document.body ? document.body.innerText : '').toLowerCase();",
-            "        var list = scrape();",
-            "        if (!list.length && body.indexOf('this account is private') > -1) { resolve({ list: [], priv: true }); return; }",
-            "        if (!list.length && body.indexOf('page isn') > -1 && body.indexOf('available') > -1) { resolve({ list: [], missing: true }); return; }",
-            "        if (list.length > 0 && list.length === last) stable++; else stable = 0;",
-            "        last = list.length;",
-            "        if ((list.length > 0 && stable >= 2) || Date.now() - t0 > 15000) { resolve({ list: list }); return; }",
-            "        try { window.scrollTo(0, document.body.scrollHeight); } catch (e) {}",
-            "        setTimeout(poll, 700);",
-            "      }",
-            "      poll();",
-            "    });",
-            "  }",
-            "  function domFollowers() {",
-            "    try {",
-            "      var as = document.querySelectorAll('a[href*=\"/followers\"]');",
-            "      for (var i = 0; i < as.length; i++) {",
-            "        var sp = as[i].querySelector('span[title]');",
-            "        var s = sp ? sp.getAttribute('title') : '';",
-            "        var n = Number((s || '').split(',').join(''));",
-            "        if (s && !isNaN(n)) return n;",
-            "      }",
-            "    } catch (e) {}",
-            "    return null;",
-            "  }",
-            "  function finish(info, list, priv, miss) {",
-            "    var fc = (info && info.fc !== undefined && info.fc !== null) ? info.fc : domFollowers();",
-            "    if (!list.length && !priv && miss && fc === null) { out({ success: false, message: 'Account not found on Instagram.' }); return; }",
-            "    if (!list.length && !priv && loginErr && fc === null) { out({ success: false, message: 'Instagram session expired. Please log in again.' }); return; }",
-            "    var o = { success: true, username: U, is_private: !!priv, posts: list.slice(0, 30) };",
-            "    if (fc !== null) o.follower_count = fc;",
-            "    if (info && info.pic) o.profile_pic = info.pic;",
-            "    if (info && info.name) o.full_name = info.name;",
-            "    out(o);",
-            "  }",
-            "  if ((location.pathname || '').indexOf('/accounts/login') === 0) { out({ success: false, message: 'Instagram session expired. Please log in again.' }); return; }",
-            "  apiProfile().then(function(p) {",
-            "    return (p ? Promise.resolve(null) : htmlInfo()).then(function(h) {",
-            "      var info = p || h || null;",
-            "      var id = (info && info.id) ? info.id : '';",
-            "      return Promise.all([viaFeed(), id ? viaClips(id) : Promise.resolve([])]).then(function(res) {",
-            "        if (p && p.priv) { finish(info, [], true, false); return; }",
-            "        var list = merge((p ? p.posts : []).concat(res[0] || []).concat(res[1] || []));",
-            "        if (list.length) { finish(info, list, false, false); return; }",
-            "        return domPosts().then(function(dl) { finish(info, dl.list || [], !!dl.priv, !!dl.missing || missing); });",
-            "      });",
-            "    });",
-            "  }).catch(function(e) { out({ success: false, message: 'Posts error: ' + e.message }); });",
-            "})();"
-        );
-    }
-
-    // Search WebView se result lene ke liye
-    public class SearchBridge {
-        @JavascriptInterface
-        public void onResult(final String json) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    deliverSearch(json);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onPosts(final String json) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    deliverPosts(json);
-                }
-            });
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Notification
-    // ------------------------------------------------------------------
-    private void createNotificationChannel() {
-        notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID, "Automation Service", NotificationManager.IMPORTANCE_LOW);
-            channel.setDescription("Shows live automation stats in status bar");
-            channel.setShowBadge(false);
-            if (notificationManager != null) {
-                notificationManager.createNotificationChannel(channel);
-            }
-        }
-    }
-
-    private void showOrUpdateNotification(int accounts, int tasks, int coins) {
-        if (notificationManager == null) return;
-        Notification.Builder builder;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            builder = new Notification.Builder(this, CHANNEL_ID);
-        } else {
-            builder = new Notification.Builder(this);
-        }
-        builder.setContentTitle("UpFollow Running")
-               .setContentText("Accounts: " + accounts + " Active  |  Tasks: " + tasks + "  |  Coins: +" + coins)
-               .setSmallIcon(android.R.drawable.stat_notify_sync)
-               .setOngoing(true);
-        // NAYA: notification par tap karne se app khule
-        Intent open = new Intent(this, MainActivity.class);
-        open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        int pf = Build.VERSION.SDK_INT >= 23
-                ? (PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
-                : PendingIntent.FLAG_UPDATE_CURRENT;
-        builder.setContentIntent(PendingIntent.getActivity(this, 0, open, pf));
-        notificationManager.notify(NOTIFICATION_ID, builder.build());
-    }
-
-    private void clearAutomationNotification() {
-        if (notificationManager != null) {
-            notificationManager.cancel(NOTIFICATION_ID);
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Bridges
-    // ------------------------------------------------------------------
-    public class MainAppInterface {
-
-        // Naya: account ki cookies ke saath task chalao (har account apna session use karta hai)
-        @JavascriptInterface
-        public void runTask(final String target, final String taskType, final String mediaId, final String cookieStr) {
-            if (!trusted()) return;
-            // NAYA: multi-account parallel mode (WebView support na kare to neeche wala purana code chalega)
-            if (parallelEnabled(cookieStr)) {
-                parallelEnqueue(target, taskType, mediaId, cookieStr);
-                return;
-            }
-            // SMOOTH: single mode me ab proper queue (FIFO, accounts ke beech gap, Stop se cancel).
-            // Neeche purana code as-is bacha hai; SINGLE_QUEUE_ENABLED = false karo to wahi chalega.
-            if (SINGLE_QUEUE_ENABLED) {
-                singleEnqueue(target, taskType, mediaId, cookieStr);
-                return;
-            }
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    // Pichhla task abhi chal raha ho to ruko (beech me dusra account na khule)
-                    if (taskActive) {
-                        uiHandler.postDelayed(this, 500);
-                        return;
-                    }
-                    workerActed = false;
-                    workerRetries = 0;
-                    workerStartedAt = System.currentTimeMillis();
-                    currentTaskType = taskType;
-                    taskActive = true;
-                    uiHandler.removeCallbacks(taskTimeout);
-                    uiHandler.postDelayed(taskTimeout, TASK_TIMEOUT_MS);
-
-                    if (cookieStr != null && !cookieStr.isEmpty()) {
-                        applyInstagramCookies(cookieStr);
-                    }
-
-                    String cleanTarget = target == null ? "" : target.replaceAll("[^A-Za-z0-9._]", "");
-                    String url;
-                    if ("like".equalsIgnoreCase(taskType)) {
-                        if (mediaId != null && mediaId.startsWith("https://www.instagram.com/")) {
-                            url = mediaId;
-                        } else if (mediaId != null && !mediaId.isEmpty() && mediaId.matches("[A-Za-z0-9_-]+") && !mediaId.equals("25025320")) {
-                            url = (mediaId.length() <= 12 ? "https://www.instagram.com/reel/" : "https://www.instagram.com/p/") + mediaId + "/";
-                        } else {
-                            url = "https://www.instagram.com/" + cleanTarget + "/";
-                        }
-                    } else {
-                        url = "https://www.instagram.com/" + cleanTarget + "/";
-                    }
-                    workerWebView.loadUrl(url);
-                }
-            });
-        }
-
-        // NAYA: accounts ke beech delay (seconds) set karne ke liye: Android.setAccountDelay(6)
-        @JavascriptInterface
-        public void setAccountDelay(final int seconds) {
-            if (!trusted()) return;
-            startGapMs = Math.max(MIN_GAP_MS, Math.min(60, seconds) * 1000L);
-        }
-
-        // NAYA: ek saath kitne account chalein (1 = ek ke baad ek, sabse safe). Android.setMaxParallel(1)
-        @JavascriptInterface
-        public void setMaxParallel(final int n) {
-            if (!trusted()) return;
-            maxParallel = FORCE_SERIAL ? 1 : Math.max(1, Math.min(3, n));
-        }
-
-        // Purani website ke liye bacha hua (kuch nahi karta): Fast Mode hata diya gaya hai
-        @JavascriptInterface
-        public void setFastMode(final boolean on) {
-        }
-
-        @JavascriptInterface
-        public boolean isFastMode() {
-            return false;
-        }
-
-        // NAYA: gap me random utar-chadhav (seconds, 0-10). Android.setGapJitter(2) => 9 sec me +-2
-        @JavascriptInterface
-        public void setGapJitter(final int seconds) {
-            if (!trusted()) return;
-            gapJitterMs = Math.max(0, Math.min(10, seconds)) * 1000L;
-        }
-
-        // NAYA: dead profiles ki list saaf (admin "Restore" ke liye)
-        @JavascriptInterface
-        public void clearDeadProfiles() {
-            if (!trusted()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    deadMap.clear();
-                    unavailVotes.clear();
-                    saveMap("dead_map", deadMap, DEAD_TTL_MS, 1500);
-                }
-            });
-        }
-
-        // NAYA: "pehle ho chuka" memory saaf
-        @JavascriptInterface
-        public void clearDoneCache() {
-            if (!trusted()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    doneMap.clear();
-                    saveMap("done_map", doneMap, DONE_TTL_MS, 1500);
-                }
-            });
-        }
-
-        // Purana method (compatibility)
-        @JavascriptInterface
-        public void executeBrowserAction(String target, String taskType, String mediaId) {
-            runTask(target, taskType, mediaId, "");
-        }
-
-        @JavascriptInterface
-        public void executeBrowserFollow(String target) {
-            runTask(target, "follow", "", "");
-        }
-
-        // Primary account ki cookie server par sync karne ke liye
-        // Likes page: target account ke posts + reels (thumbnail, likes, code)
-        @JavascriptInterface
-        public void fetchInstagramPostsLive(final String queryUsername) {
-            if (!trusted()) return;
-            final String u = queryUsername == null ? "" : queryUsername.replace("@", "").replaceAll("[^A-Za-z0-9._]", "");
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (u.isEmpty()) {
-                        pendingPostsUser = "_";
-                        deliverPosts("{\"success\":false,\"message\":\"Invalid username\"}");
-                    } else {
-                        startPosts(u);
-                    }
-                }
-            });
-        }
-
-        // Jar me koi Instagram session na ho to dashboard primary ka session laga deta hai
-        @JavascriptInterface
-        public void applySession(final String cookieStr) {
-            if (!trusted() || cookieStr == null || cookieStr.isEmpty()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    applyInstagramCookies(cookieStr);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void searchInstagramProfileLive(final String queryUsername) {
-            if (!trusted()) return;
-            final String u = queryUsername == null ? "" : queryUsername.replace("@", "").replaceAll("[^A-Za-z0-9._]", "");
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (u.isEmpty()) {
-                        pendingSearchUser = "_";
-                        deliverSearch("{\"success\":false,\"message\":\"Invalid username\"}");
-                    } else {
-                        startSearch(u);
-                    }
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public String getIgCookies() {
-            if (!trusted()) return "";
-            String c = CookieManager.getInstance().getCookie(IG_URL);
-            return c == null ? "" : c;
-        }
-
-        // SMOOTH v2: queue ki halat (website ke liye): {"queued":n,"active":bool,"gap_ms":n}
-        @JavascriptInterface
-        public String getQueueInfo() {
-            if (!trusted()) return "{}";
-            try {
-                return "{\"queued\":" + (pendingTasks.size() + singleQueue.size())
-                        + ",\"active\":" + (activeSlots > 0 || taskActive)
-                        + ",\"gap_ms\":" + curGapMs + "}";
-            } catch (Exception e) {
-                return "{}";
-            }
-        }
-
-        // SMOOTH: debug log (last ~150 events). Website me Android.getDebugLog() se padh sakte ho,
-        // "Sync Error" aane par ye bhejne se turant pata chalta hai ki kya hua.
-        @JavascriptInterface
-        public String getDebugLog() {
-            if (!trusted()) return "";
-            StringBuilder sb = new StringBuilder();
-            synchronized (dbgLog) {
-                for (String l : dbgLog) sb.append(l).append('\n');
-            }
-            return sb.toString();
-        }
-
-        // Website ko app ka version batane ke liye (optional use)
-        @JavascriptInterface
-        public int getAppVersion() {
-            return APP_VERSION_CODE;
-        }
-
-        // NAYA: page ko batata hai ki ye phone multi-account parallel support karta hai ya nahi
-        @JavascriptInterface
-        public boolean isParallelSupported() {
-            try {
-                return WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE);
-            } catch (Throwable t) {
-                return false;
-            }
-        }
-
-        // NAYA: Stop dabane par queue me ruke hue tasks cancel (jo chal rahe hain wo khatam honge)
-        @JavascriptInterface
-        public void clearPendingTasks() {
-            if (!trusted()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    PTask t;
-                    while ((t = pendingTasks.poll()) != null) {
-                        sendParallelResult(t.uid, t.target, false, "Cancelled");
-                    }
-                    // SMOOTH: single mode queue ke ruke hue tasks bhi cancel
-                    PTask st;
-                    while ((st = singleQueue.poll()) != null) {
-                        enqueueResultCall("window.onWorkerResult(false, \"Cancelled\")");
-                    }
-                }
-            });
-        }
-
-        // NAYA: Automation ON/OFF yaad rakhne ke liye. ON hone par app khulte hi website ko
-        // window.onAppAutoStart() ka signal milta hai. Stop dabane par setAutoRun(false) bulao.
-        @JavascriptInterface
-        public void setAutoRun(final boolean on) {
-            if (!trusted()) return;
-            prefs.edit().putBoolean("auto_run", on).apply();
-        }
-
-        @JavascriptInterface
-        public boolean isAutoRun() {
-            return trusted() && prefs.getBoolean("auto_run", false);
-        }
-
-        @JavascriptInterface
-        public void setKeepScreenOn(final boolean keepOn) {
-            if (!trusted()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (keepOn) {
-                        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                        startAutomationBackground();
-                        if (wakeLock != null && !wakeLock.isHeld()) {
-                            wakeLock.acquire(12 * 60 * 60 * 1000L);
-                        }
-                    } else {
-                        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                        stopAutomationBackground();
-                        if (wakeLock != null && wakeLock.isHeld()) {
-                            wakeLock.release();
-                        }
-                    }
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void updateNotification(final int accounts, final int tasks, final int coins) {
-            if (!trusted()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    showOrUpdateNotification(accounts, tasks, coins);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void stopNotification() {
-            if (!trusted()) return;
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    clearAutomationNotification();
-                }
-            });
-        }
-    }
-
-    // ==================================================================
-    // SMOOTH PACK (naya): bulk me "Sync Error" kam karne ke liye
-    //  1) Single mode ki proper queue: FIFO, accounts ke beech gap, Stop se cancel
-    //     (pehle har task alag 500ms polling runnable tha: order gadbad, Stop ke baad bhi chal jate the)
-    //  2) Result page tak pakka pahunche: page reload ho raha ho to result gum nahi hota,
-    //     ruk kar dobara bhejta hai (pehle "if(window.onWorkerResult)" fail hone par chupchap gum)
-    //  3) Result string me newline/quote ho to JS na tute (JSONObject.quote)
-    //  4) Task khatam hote hi worker page about:blank: purani script naye task ka result na bhej de
-    //  5) WebView renderer mar jaye to app crash nahi hota
-    //  6) Debug log: getDebugLog()
-    // ==================================================================
-    private static final boolean SINGLE_QUEUE_ENABLED = true;
-    private static final boolean RESULT_RETRY_ENABLED = true;
-    private static final long RESULT_MAX_AGE_MS = 120000L;
-
-    private final ArrayDeque<PTask> singleQueue = new ArrayDeque<PTask>();
-    private long singleLastEnd = 0;
-    private long singleGap = 0;
-    private boolean singlePumpScheduled = false;
-    private final Runnable singlePumpRunnable = new Runnable() {
-        @Override
-        public void run() {
-            singlePumpScheduled = false;
-            singlePump();
-        }
-    };
-
-    private void singleEnqueue(String target, String taskType, String mediaId, String cookieStr) {
-        final PTask t = new PTask();
-        t.target = target == null ? "" : target;
-        t.taskType = taskType == null ? "follow" : taskType;
-        t.mediaId = mediaId == null ? "" : mediaId;
-        t.cookieStr = cookieStr == null ? "" : cookieStr;
-        t.uid = cookieValue(t.cookieStr, "ds_user_id").replaceAll("[^A-Za-z0-9]", "");
-        t.key = taskKey(t.taskType, t.target, t.mediaId);
-        uiHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                singleQueue.add(t);
-                singlePump();
-            }
-        });
-    }
-
-    private void singlePump() {
-        if (taskActive || singleQueue.isEmpty()) return;
-        long wait = singleLastEnd + singleGap - System.currentTimeMillis();
-        if (wait > 0) {
-            singlePrewarm(); // SMOOTH v2: gap me next account ka page taiyar karo
-            if (!singlePumpScheduled) {
-                singlePumpScheduled = true;
-                uiHandler.postDelayed(singlePumpRunnable, wait);
-            }
-            return;
-        }
-        PTask t = singleQueue.poll();
-        if (t == null) return;
-        startSingleTask(t);
-    }
-
-    private void startSingleTask(PTask t) {
-        final String pk = t.uid + "|" + t.key;
-        boolean pre = pk.equals(singlePreKey) && (singlePreLoading || singlePreReady)
-                && System.currentTimeMillis() - singlePreAt < 60000L;
-        boolean preReady = pre && singlePreReady;
-        String preBad = pre ? singlePreBad : "";
-        singlePreKey = ""; singlePreLoading = false; singlePreReady = false; singlePreBad = "";
-
-        workerActed = false;
-        workerRetries = 0;
-        workerExtended = false;
-        workerStartedAt = System.currentTimeMillis();
-        currentTaskType = t.taskType;
-        taskActive = true;
-        uiHandler.removeCallbacks(taskTimeout);
-        uiHandler.postDelayed(taskTimeout, TASK_TIMEOUT_MS + (preReady ? 0L : SLOT_LOAD_ALLOWANCE_MS));
-        dbg("single start uid=" + t.uid + " type=" + t.taskType + " target=" + cleanName(t.target)
-                + " prewarmed=" + pre);
-        notifyStarted(t.uid, cleanName(t.target), t.taskType);
-        if (preBad.length() > 0) {
-            deliverResult(false, preBad);
-            return;
-        }
-        if (preReady) {
-            // page pehle se khula hai: seedha script chalao
-            uiHandler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    if (!taskActive) return;
-                    if ("like".equalsIgnoreCase(currentTaskType)) {
-                        injectLikeScript(workerWebView);
-                    } else {
-                        injectFollowScript(workerWebView);
-                    }
-                }
-            }, 300);
-            return;
-        }
-        if (pre) return; // page abhi load ho raha hai, onPageFinished se script chalegi
-
-        // FAST FOLLOW: follow task me seedha API chalao, page load nahi
-        if (!"like".equalsIgnoreCase(t.taskType)) {
-            if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
-                applyInstagramCookies(t.cookieStr);
-            }
-            singleFastTarget = t.target;
-            singleFastCookies = t.cookieStr;
-            singleFastMediaId = t.mediaId;
-            if (singleWorkerWarm) {
-                // Worker WebView pehle se warm page par hai: seedha API
-                singleFastPending = false;
-                runFastSingle(t.target, t.cookieStr);
-            } else {
-                // Warm page load karo, onPageFinished me API chalegi
-                singleFastPending = true;
-                try {
-                    workerWebView.loadUrl(WARM_URL);
-                } catch (Exception e) {
-                    singleFastFallback(t.target, t.cookieStr, t.mediaId);
-                }
-            }
-            return;
-        }
-
-        // Like task: purana page-load wala flow
-        if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
-            applyInstagramCookies(t.cookieStr);
-        }
-        try {
-            workerWebView.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
-        } catch (Exception e) {
-            deliverResult(false, "Page error");
-        }
-    }
-
-    // FAST FOLLOW: warm WebView se seedha Instagram API call - ZERO page load time
-    private void runFastSingle(final String target, final String cookieStr) {
-        final String name = cleanName(target);
-        if (name.isEmpty()) {
-            deliverResult(false, "Profile unavailable");
-            return;
-        }
-        final long token = workerStartedAt;
-        // Cache me ID hai to aur tez (ek API call skip)
-        String cachedId = getFastIdSingle(name);
-
-        String script = js(
-            "(function(){",
-            "  var TOKEN = " + token + ";",
-            "  var NAME = " + JSONObject.quote(name) + ";",
-            "  var CID = " + JSONObject.quote(cachedId == null ? "" : cachedId) + ";",
-            "  var over = false;",
-            "  function B() { return window.WorkerBridge; }",
-            "  function done(ok, msg) { if (over) return; over = true; try { B().onTaskResult(ok, msg); } catch(e) {} }",
-            "  function fb() { if (over) return; over = true; try { B().onSingleFastFallback(TOKEN); } catch(e) {} }",
-            "  function cookie(n) {",
-            "    var c = (document.cookie || '').split(';');",
-            "    for (var i = 0; i < c.length; i++) {",
-            "      var p = c[i].trim();",
-            "      if (p.indexOf(n + '=') === 0) return p.substring(n.length + 1);",
-            "    }",
-            "    return '';",
-            "  }",
-            "  var csrf = cookie('csrftoken');",
-            "  if (!csrf) { done(false, 'Session expired'); return; }",
-            "  var H = {'x-ig-app-id':'936619743392459','x-requested-with':'XMLHttpRequest'};",
-            "  // Safety timeout",
-            "  setTimeout(function(){ if (!over) fb(); }, 12000);",
-            "  function create(uid, fromCache) {",
-            "    try { B().onActed(); } catch(e) {}",
-            "    var h2 = {",
-            "      'x-csrftoken': csrf,",
-            "      'x-ig-app-id': '936619743392459',",
-            "      'x-requested-with': 'XMLHttpRequest',",
-            "      'content-type': 'application/x-www-form-urlencoded'",
-            "    };",
-            "    fetch('/api/v1/friendships/create/' + uid + '/', {",
-            "      method: 'POST', credentials: 'include', headers: h2, body: ''",
-            "    })",
-            "    .then(function(r){ return r.text().then(function(t){ return {s:r.status, t:t}; }); })",
-            "    .then(function(x){",
-            "      var low = x.t.toLowerCase().split(' ').join('');",
-            "      if (x.s === 200 && low.indexOf('\"status\":\"ok\"') > -1) { done(true, 'Followed Successfully'); return; }",
-            "      if (low.indexOf('checkpoint') > -1 || low.indexOf('challenge') > -1) { done(false, 'Blocked: Challenge / Checkpoint'); return; }",
-            "      if (low.indexOf('login_required') > -1) { done(false, 'Session expired'); return; }",
-            "      if (low.indexOf('feedback_required') > -1 || x.s === 429 || low.indexOf('\"spam\":true') > -1 || low.indexOf('trylater') > -1) { done(false, 'Blocked: Action Limit / Challenge'); return; }",
-            "      if (fromCache && (x.s === 400 || x.s === 404)) { try { B().onSingleFastBadId(NAME); } catch(e) {} }",
-            "      fb();",
-            "    }).catch(function(){ fb(); });",
-            "  }",
-            "  // Cached ID hai to seedha follow karo",
-            "  if (CID) { create(CID, true); return; }",
-            "  // Pehle user info fetch karo (ID + already following check)",
-            "  fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(NAME), {credentials:'include', headers:H})",
-            "  .then(function(r){ return r.text().then(function(t){ return {s:r.status, t:t}; }); })",
-            "  .then(function(x){",
-            "    var low = x.t.toLowerCase();",
-            "    if (low.indexOf('checkpoint_required') > -1 || low.indexOf('challenge_required') > -1) { done(false, 'Blocked: Challenge / Checkpoint'); return; }",
-            "    if (low.indexOf('login_required') > -1) { done(false, 'Session expired'); return; }",
-            "    if (x.s === 429) { fb(); return; }",
-            "    var d = null; try { d = JSON.parse(x.t); } catch(e) {}",
-            "    var u = d && d.data && d.data.user;",
-            "    if (!u || !u.id) { fb(); return; }",
-            "    try { B().onSingleFastId(NAME, String(u.id)); } catch(e) {}",
-            "    if (u.followed_by_viewer || u.requested_by_viewer) { done(true, 'Already Following'); return; }",
-            "    create(String(u.id), false);",
-            "  }).catch(function(){ fb(); });",
-            "})();"
-        );
-        try {
-            workerWebView.evaluateJavascript(script, null);
-        } catch (Exception e) {
-            singleFastFallback(target, cookieStr, singleFastMediaId);
-        }
-    }
-
-    // Fast API fail ho to purana page-load wala flow
-    private void singleFastFallback(String target, String cookieStr, String mediaId) {
-        singleWorkerWarm = false;
-        singleFastPending = false;
-        dbg("single fast fallback -> page load target=" + cleanName(target));
-        try {
-            workerWebView.loadUrl(buildTaskUrl(target, currentTaskType, mediaId));
-        } catch (Exception e) {
-            deliverResult(false, "Page error");
-        }
-    }
-
-    // Fast follow ID cache (single mode ke liye - SharedPreferences use karta hai)
-    private String getFastIdSingle(String name) {
-        if (name == null || name.isEmpty() || prefs == null) return null;
-        return prefs.getString("sfid_" + name.toLowerCase(), null);
-    }
-
-    private void putFastIdSingle(String name, String id) {
-        if (name == null || name.isEmpty() || id == null || !id.matches("[0-9]{3,20}") || prefs == null) return;
-        prefs.edit().putString("sfid_" + name.toLowerCase(), id).apply();
-    }
-
-    private void dropFastIdSingle(String name) {
-        if (name == null || name.isEmpty() || prefs == null) return;
-        prefs.edit().remove("sfid_" + name.toLowerCase()).apply();
-    }
-
-    // ---- Single mode: gap ke dauran next account ka page pehle se load (prewarm) ----
-    private long singlePreAt = 0;
-    private String singlePreKey = "";
-    private boolean singlePreLoading = false;
-    private boolean singlePreReady = false;
-    private String singlePreBad = "";
-    private boolean workerExtended = false;
-
-    private void singlePrewarm() {
-        if (!PREWARM_ENABLED || taskActive) return;
-        PTask t = singleQueue.peek();
-        if (t == null) return;
-
-        // FAST FOLLOW: follow task ke liye warm page load karo (page load nahi hoga real task me)
-        if (!"like".equalsIgnoreCase(t.taskType)) {
-            if (!singleWorkerWarm) {
-                try {
-                    if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
-                        applyInstagramCookies(t.cookieStr);
-                    }
-                    dbg("single prewarm WARM uid=" + t.uid + " target=" + cleanName(t.target));
-                    workerWebView.loadUrl(WARM_URL);
-                } catch (Exception ignored) {}
-            }
-            // Warm hai: ID pehle se nikal lo
-            else {
-                String name = cleanName(t.target);
-                if (!name.isEmpty() && getFastIdSingle(name) == null) {
-                    try {
-                        if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
-                            applyInstagramCookies(t.cookieStr);
-                        }
-                        dbg("single prewarm ID lookup uid=" + t.uid + " target=" + name);
-                        workerWebView.evaluateJavascript(buildSingleIdLookupScript(name), null);
-                    } catch (Exception ignored) {}
-                }
-            }
-            return;
-        }
-
-        // Like task: purana page prewarm
-        String pk = t.uid + "|" + t.key;
-        if (pk.equals(singlePreKey) && (singlePreLoading || singlePreReady)) return;
-        try {
-            if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
-                applyInstagramCookies(t.cookieStr);
-            }
-            singlePreKey = pk;
-            singlePreAt = System.currentTimeMillis();
-            singlePreLoading = true;
-            singlePreReady = false;
-            singlePreBad = "";
-            dbg("single prewarm uid=" + t.uid + " target=" + cleanName(t.target));
-            workerWebView.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
-        } catch (Exception e) {
-            singlePreKey = ""; singlePreLoading = false; singlePreReady = false;
-        }
-    }
-
-    // Gap ke dauran agle target ki numeric ID nikal ke cache me rakh lo
-    private String buildSingleIdLookupScript(String name) {
-        return js(
-            "(function(){",
-            "  var NAME = " + JSONObject.quote(name) + ";",
-            "  var H = {'x-ig-app-id':'936619743392459','x-requested-with':'XMLHttpRequest'};",
-            "  fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(NAME), {credentials:'include', headers:H})",
-            "  .then(function(r){ return r.text(); })",
-            "  .then(function(t){",
-            "    var d = null; try { d = JSON.parse(t); } catch(e) {}",
-            "    var u = d && d.data && d.data.user;",
-            "    if (u && u.id) { try { window.WorkerBridge.onSingleFastId(NAME, String(u.id)); } catch(e) {} }",
-            "  }).catch(function(){});",
-            "})();"
-        );
-    }
-
-    private void singleOnPreFinished(String url) {
-        if (singlePreLoading && url != null && !url.startsWith("about:")) {
-            singlePreLoading = false;
-            singlePreReady = true;
-            singlePreBad = fatalPathReason(url);
-        }
-    }
-
-    // 25 sec poore: agar follow/like ho chuka hai to 15 sec aur verify ke liye, warna fail
-    private void handleSingleTimeout() {
-        if (!taskActive) return;
-        if (workerActed && !workerExtended) {
-            workerExtended = true;
-            dbg("single timeout but action done -> verify window");
-            uiHandler.postDelayed(taskTimeout, TASK_VERIFY_EXTRA_MS);
-            try { workerWebView.evaluateJavascript(POKE_JS, null); } catch (Exception ignored) {}
-            return;
-        }
-        deliverResult(false, "Timeout");
-    }
-
-    // FAST FOLLOW ke liye warm URL (robots.txt - halka page, cookies valid rehti hain)
-    private static final String WARM_URL = "https://www.instagram.com/robots.txt";
-
-    // Task khatam: worker ko warm page par rakh (fast follow ke liye), gap set, agla task
-    private void onSingleTaskEnded() {
-        singleLastEnd = System.currentTimeMillis();
-        singleGap = nextGap();
-        singleFastPending = false;
-        try {
-            workerWebView.stopLoading();
-            // FAST FOLLOW: about:blank nahi, warm page par raho taaki agle task me page load na ho
-            workerWebView.loadUrl(WARM_URL);
-        } catch (Exception ignored) {}
-        singlePump();
-    }
-
-    // ---- Result page tak pakka pahunchane ka system ----
-    private final ArrayDeque<String> pendingResultJs = new ArrayDeque<String>();
-    private final ArrayDeque<Long> pendingResultAt = new ArrayDeque<Long>();
-    private boolean resultFlushBusy = false;
-    private long resultFlushBusyAt = 0;
-    private boolean resultRetryScheduled = false;
-    private boolean resultWaitLogged = false;
-
-    private void enqueueResultCall(String call) {
-        pendingResultJs.add(call);
-        pendingResultAt.add(Long.valueOf(System.currentTimeMillis()));
-        flushResults();
-    }
-
-    private void flushResults() {
-        if (mainWebView == null) return;
-        long now = System.currentTimeMillis();
-        // bahut purane (2 min+) results hata do, naye page ko purana kachra na mile
-        while (!pendingResultAt.isEmpty() && now - pendingResultAt.peek().longValue() > RESULT_MAX_AGE_MS) {
-            pendingResultAt.poll();
-            pendingResultJs.poll();
-        }
-        if (pendingResultJs.isEmpty()) return;
-        if (resultFlushBusy && now - resultFlushBusyAt < 5000L) return;
-        resultFlushBusy = true;
-        resultFlushBusyAt = now;
-        final String call = pendingResultJs.peek();
-        try {
-            mainWebView.evaluateJavascript(
-                    "(function(){if(typeof window.onWorkerResult!=='function')return 'NOHANDLER';"
-                            + "try{" + call + ";}catch(e){return 'E:'+(e&&e.message);}return 'OK';})()",
-                    new ValueCallback<String>() {
-                        @Override
-                        public void onReceiveValue(String v) {
-                            resultFlushBusy = false;
-                            boolean noHandler = v == null || "null".equals(v) || v.contains("NOHANDLER");
-                            if (!noHandler) {
-                                if (v.contains("E:")) {
-                                    dbg("website onWorkerResult ERROR: " + v + " call=" + call);
-                                } else {
-                                    dbg("result delivered to page: " + call);
-                                }
-                                resultWaitLogged = false;
-                                if (pendingResultJs.peek() == call) {
-                                    pendingResultJs.poll();
-                                    pendingResultAt.poll();
-                                }
-                                flushResults(); // agla result (order same rahega)
-                            } else {
-                                if (!resultWaitLogged) {
-                                    resultWaitLogged = true;
-                                    dbg("page onWorkerResult not ready, retrying: " + call);
-                                }
-                                scheduleResultRetry(); // page abhi taiyar nahi, 1 sec baad dobara
-                            }
-                        }
-                    });
-        } catch (Exception e) {
-            resultFlushBusy = false;
-            scheduleResultRetry();
-        }
-    }
-
-    private void scheduleResultRetry() {
-        if (resultRetryScheduled) return;
-        resultRetryScheduled = true;
-        uiHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                resultRetryScheduled = false;
-                flushResults();
-            }
-        }, 1000);
-    }
-
-    // ---- WebView renderer crash handling ----
-    private long lastRecreateAt = 0;
-
-    private void onRendererGone(String who) {
-        dbg("WebView renderer gone: " + who);
-        long now = System.currentTimeMillis();
-        if (now - lastRecreateAt < 20000L) return; // baar baar crash ho to loop me mat phanso
-        lastRecreateAt = now;
-        uiHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                // Activity naye sire se banti hai; Auto-run ON ho to automation khud chalu ho jata hai
-                try { recreate(); } catch (Exception ignored) {}
-            }
-        });
-    }
-
-    private void destroyWebViewSafe(WebView w) {
-        if (w == null) return;
-        try {
-            ViewGroup par = (ViewGroup) w.getParent();
-            if (par != null) par.removeView(w);
-            w.destroy();
-        } catch (Exception ignored) {}
-    }
-
-    // ---- Debug log ----
-    private final ArrayDeque<String> dbgLog = new ArrayDeque<String>();
-
-    private void dbg(String m) {
-        try {
-            String line = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
-                    .format(new java.util.Date()) + " " + m;
-            synchronized (dbgLog) {
-                dbgLog.add(line);
-                while (dbgLog.size() > 150) dbgLog.poll();
-            }
-            Log.d("UpFollow", m);
-        } catch (Exception ignored) {}
-    }
-
-    // ==================================================================
-    // SMOOTH v2: timing + prewarm
-    //  - Ek account ka task max 25 sec (+8 sec agar page pehle se load nahi tha).
-    //    Follow/like ho chuka ho aur 25 sec poore ho jayein to +15 sec sirf verify ke liye
-    //    (taaki follow ho jaye par "Timeout" ke karan coin na kate).
-    //  - Task khatam hone ke baad kam se kam 7 sec ruko. Ye 7 sec kharab nahi jate:
-    //    isi me agle account ka WebView + cookies + target page pehle se load ho jata hai (prewarm).
-    //  - Hamesha ek hi account (FORCE_SERIAL), har task ke baad agla account (STICKY_BATCH = 1).
-    //  - Website ko onWorkerStarted(uid, target, type, maxMs) milta hai, taaki uska timer
-    //    queue me intezaar ke time se nahi, asli start se chale.
-    // ==================================================================
-    private static final long MIN_GAP_MS = 7000L;
-    private static final long TASK_VERIFY_EXTRA_MS = 15000L;
-    private static final long SLOT_VERIFY_EXTRA_MS = 15000L;
-    private static final long SLOT_LOAD_ALLOWANCE_MS = 8000L;
-    private static final boolean FORCE_SERIAL = true;
-    private static final boolean PREWARM_ENABLED = true;
-
-    // Queue me se agla task chunna (bina nikaale): pumpQueue aur prewarm dono yahi use karte hain
-    private PTask choosePending() {
-        PTask pick = null;
-        // 1) Pehle wahi account (WebView garam hai -> tez), jab tak STICKY_BATCH poora na ho
-        if (stickyCount < STICKY_BATCH) {
-            for (PTask t : pendingTasks) {
-                Slot s = slots.get(t.uid);
-                if (s != null && s.active) continue;
-                if (t.uid.equals(lastStartedUid)) { pick = t; break; }
-            }
-        }
-        // 2) Warna agla account (round-robin). Dusra na ho to hi same account ka agla task
-        if (pick == null) {
-            for (PTask t : pendingTasks) {
-                Slot s = slots.get(t.uid);
-                if (s != null && s.active) continue; // is account ka task abhi chal raha hai
-                if (pick == null) pick = t;          // fallback: pehla free task
-                if (!t.uid.equals(lastStartedUid)) { pick = t; break; }
-            }
-        }
-        return pick;
-    }
-
-    // Gap ke dauran: next account ka WebView banao, cookies lagao aur target page load karo
-    private void prewarmNext() {
-        if (!PREWARM_ENABLED || activeSlots > 0) return;
-        PTask pick = choosePending();
-        if (pick == null) return;
-        Slot s = slots.get(pick.uid);
-        try {
-            if (s == null) s = createSlot(pick.uid);
-        } catch (Throwable e) {
-            dbg("prewarm setup error: " + e.getMessage());
-            return;
-        }
-        if (s.active) return;
-        if (pick.key.equals(s.preKey) && (s.preLoading || s.preReady)) return; // pehle se taiyar
-        try {
-            ensureCookies(s, pick.cookieStr);
-            s.preKey = pick.key;
-            s.preAt = System.currentTimeMillis();
-            s.preLoading = true;
-            s.preReady = false;
-            s.preBad = "";
-            dbg("prewarm uid=" + pick.uid + " target=" + cleanName(pick.target));
-            s.wv.loadUrl(buildTaskUrl(pick.target, pick.taskType, pick.mediaId));
-        } catch (Exception e) {
-            s.preKey = ""; s.preLoading = false; s.preReady = false;
-        }
-    }
-
-    private void slotTimeout(Slot s) {
-        if (s == null || !s.active) return;
-        if (s.acted && !s.extended) {
-            s.extended = true;
-            dbg("slot timeout but action done -> verify window uid=" + s.uid);
-            uiHandler.postDelayed(s.timeout, SLOT_VERIFY_EXTRA_MS);
-            try { s.wv.evaluateJavascript(POKE_JS, null); } catch (Exception ignored) {}
-            return;
-        }
-        finishSlot(s, false, "Timeout");
-    }
-
-    private void injectForSlot(Slot s) {
-        if ("like".equalsIgnoreCase(s.taskType)) {
-            injectLikeScript(s.wv);
-        } else {
-            injectFollowScript(s.wv);
-        }
-    }
-
-    // URL ke path se pata chalna ki page login / challenge / suspended jaisa to nahi
-    private String fatalPathReason(String url) {
-        String path = "";
-        try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
-        if (path.startsWith("/accounts/suspended")) return "Suspended: Instagram suspended this account";
-        if (path.startsWith("/accounts/disabled")) return "Disabled: Instagram disabled this account";
-        if (path.startsWith("/challenge") || path.startsWith("/checkpoint") || path.startsWith("/auth_platform")) return "Blocked: Challenge / Checkpoint";
-        if (path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")) return "Session expired";
-        return "";
-    }
-
-    // Website ko batao ki task ASLI me ab shuru hua (uska timer yahi se chalna chahiye)
-    private void notifyStarted(String uid, String target, String type) {
-        try {
-            long maxMs = SLOT_TASK_TIMEOUT_MS + SLOT_LOAD_ALLOWANCE_MS + SLOT_VERIFY_EXTRA_MS;
-            mainWebView.evaluateJavascript(
-                    "try{if(typeof window.onWorkerStarted==='function')window.onWorkerStarted("
-                            + JSONObject.quote(uid == null ? "" : uid) + ","
-                            + JSONObject.quote(target == null ? "" : target) + ","
-                            + JSONObject.quote(type == null ? "" : type) + "," + maxMs + ");}catch(e){}",
-                    null);
-        } catch (Exception ignored) {}
-    }
-
-    // ==================================================================
-    // PARALLEL ENGINE: har account = alag WebView + alag cookie profile
-    // - Accounts ek ke baad ek start hote hain (beech me startGapMs ka gap)
-    // - Ek saath chalne wale accounts MAX_PARALLEL tak
-    // - Round-robin: ek account ka task khatam, agla task dusre account ka
-    // ==================================================================
-    // Ek saath max itne account chalenge (phone overload na ho, isse jyada slow = jyada 'button not found')
-    // DEFAULT 1 = turn by turn: ek account ka task poora hone ke baad hi agla khulega
-    private volatile int maxParallel = 1;
-    // Ek account ke itne tasks ek hi WebView me lagatar (tez, bar bar account switch nahi)
-    // SMOOTH v2: 1 = har task ke baad agla account (round-robin)
-    private static final int STICKY_BATCH = 1;
-    private int stickyCount = 0;
-    // FIX: Parallel task ko poora samay (retry samet). Pehle 40 sec tha.
-    private static final long SLOT_TASK_TIMEOUT_MS = 25000L;
-
-    private class Slot {
-        String uid = "";
-        WebView wv;
-        CookieManager cm;
-        boolean active = false;
-        int retries = 0;
-        String target = "";
-        String taskType = "follow";
-        String mediaId = "";
-        String key = "";
-        Runnable timeout;
-        boolean acted = false;
-        long startedAt = 0;
-        // SMOOTH v2
-        boolean extended = false;
-        String preKey = "";
-        boolean preLoading = false;
-        boolean preReady = false;
-        String preBad = "";
-        long preAt = 0;
-    }
-
-    private class PTask {
-        String uid = "";
-        String target = "";
-        String taskType = "follow";
-        String mediaId = "";
-        String cookieStr = "";
-        String key = "";
-    }
-
-    private final Map<String, Slot> slots = new HashMap<String, Slot>();
-    private final ArrayDeque<PTask> pendingTasks = new ArrayDeque<PTask>();
-    private int activeSlots = 0;
-
-    // Duplicate / dead profile memory (phone me save rehti hai)
-    private final Map<String, Long> doneMap = new HashMap<String, Long>();
-    private final Map<String, Long> deadMap = new HashMap<String, Long>();
-    private final Map<String, HashSet<String>> unavailVotes = new HashMap<String, HashSet<String>>();
-    private static final long DONE_TTL_MS = 30L * 24 * 60 * 60 * 1000L;
-    private static final long DEAD_TTL_MS = 7L * 24 * 60 * 60 * 1000L;
-
-    // Anti-block gap: ek task KHATAM hone ke baad itna ruk ke agla account (default 9 sec +- jitter)
-    private volatile long startGapMs = 7000L;
-    private volatile long gapJitterMs = 0L;
-    private long curGapMs = 7000L;
-    private long lastStartAt = 0;
-    private long lastEndAt = 0;
-    private final Random rnd = new Random();
-    private String lastStartedUid = "";
-    private boolean pumpScheduled = false;
-    private final Runnable pumpRunnable = new Runnable() {
-        @Override
-        public void run() {
-            pumpScheduled = false;
-            pumpQueue();
-        }
-    };
-
-    private long nextGap() {
-        long j = gapJitterMs;
-        long g = startGapMs;
-        // SMOOTH v2: jitter sirf upar ki taraf, gap kabhi MIN_GAP_MS (7 sec) se kam nahi
-        if (j > 0) g += (long) (rnd.nextDouble() * j);
-        return Math.max(MIN_GAP_MS, g);
-    }
-
-    private boolean parallelEnabled(String cookieStr) {
-        if (cookieStr == null || cookieStr.isEmpty()) return false;
-        if (cookieValue(cookieStr, "ds_user_id").isEmpty()) return false;
-        try {
-            return WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE);
-        } catch (Throwable t) {
-            return false;
-        }
     }
 
     private static String cleanName(String s) {
@@ -2286,362 +1427,33 @@ public class MainActivity extends Activity {
         return t != null && System.currentTimeMillis() - t < DEAD_TTL_MS;
     }
 
-    private boolean isDuplicate(PTask t) {
-        for (PTask p : pendingTasks) {
-            if (p.uid.equals(t.uid) && p.key.equals(t.key)) return true;
-        }
-        for (Slot s : slots.values()) {
-            if (s.active && s.uid.equals(t.uid) && s.key.equals(t.key)) return true;
-        }
-        return false;
-    }
-
-    private void parallelEnqueue(String target, String taskType, String mediaId, String cookieStr) {
-        final PTask t = new PTask();
-        t.target = target == null ? "" : target;
-        t.taskType = taskType == null ? "follow" : taskType;
-        t.mediaId = mediaId == null ? "" : mediaId;
-        t.cookieStr = cookieStr;
-        t.uid = cookieValue(cookieStr, "ds_user_id").replaceAll("[^A-Za-z0-9]", "");
-        t.key = taskKey(t.taskType, t.target, t.mediaId);
-        uiHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                boolean like = "like".equalsIgnoreCase(t.taskType);
-                // 1) Bekar (dead) profile: bina kuch kiye skip, website ko bhi bata do
-                if (isDead(t.key)) {
-                    reportDead(t.taskType, cleanName(t.target), "unavailable", t.mediaId);
-                    sendParallelResult(t.uid, t.target, false, "Skipped: dead profile");
-                    return;
-                }
-                // 2) Is account se ye kaam pehle ho chuka hai
-                if (isDone(t.uid + "|" + t.key)) {
-                    sendParallelResult(t.uid, t.target, true, like ? "Already Liked" : "Already Following");
-                    return;
-                }
-                // 3) Wahi task queue me ya abhi chal raha hai (double order)
-                if (isDuplicate(t)) {
-                    sendParallelResult(t.uid, t.target, false, "Duplicate task skipped");
-                    return;
-                }
-                pendingTasks.add(t);
-                pumpQueue();
-            }
-        });
-    }
-
-    // Jab tak current task poora na ho (success ya sach ka error), activeSlots >= maxParallel
-    // rehta hai, isliye dusra account kabhi beech me nahi khulta.
-    private void pumpQueue() {
-        if (pendingTasks.isEmpty() || activeSlots >= maxParallel) return;
-
-        long base = (maxParallel <= 1) ? lastEndAt : lastStartAt;
-        long wait = base + curGapMs - System.currentTimeMillis();
-        if (wait > 0) {
-            prewarmNext(); // SMOOTH v2: gap me next account ko reload karke taiyar rakho
-            if (!pumpScheduled) {
-                pumpScheduled = true;
-                uiHandler.postDelayed(pumpRunnable, wait);
-            }
-            return;
-        }
-
-        PTask pick = choosePending();
-        if (pick != null) {
-            pendingTasks.remove(pick);
-            if (pick.uid.equals(lastStartedUid)) {
-                stickyCount++;
-            } else {
-                releaseIdleSlot(lastStartedUid); // pichhle account ka WebView band
-                stickyCount = 1;
-            }
-            lastStartAt = System.currentTimeMillis();
-            lastStartedUid = pick.uid;
-            curGapMs = nextGap();
-            startOnSlot(pick, slots.get(pick.uid));
-        }
-
-        if (!pendingTasks.isEmpty() && !pumpScheduled) {
-            pumpScheduled = true;
-            uiHandler.postDelayed(pumpRunnable, Math.max(curGapMs, 1000L));
-        }
-    }
-
-    private void startOnSlot(final PTask t, Slot existing) {
-        Slot s = existing;
+    private void notifyStarted(String uid, String target, String type) {
         try {
-            if (s == null) s = createSlot(t.uid);
-        } catch (Throwable e) {
-            lastEndAt = System.currentTimeMillis();
-            sendParallelResult(t.uid, t.target, false, "Setup error: " + e.getMessage());
-            return;
-        }
-
-        final Slot fs = s;
-        // SMOOTH v2: gap ke dauran is account ka page pehle se khul chuka ho to wahi use karo
-        // 60 sec se purana prewarm page bharose layak nahi, naya load karo
-        final boolean pre = t.key.equals(fs.preKey) && (fs.preLoading || fs.preReady)
-                && System.currentTimeMillis() - fs.preAt < 60000L;
-        final boolean preReady = pre && fs.preReady;
-        final String preBad = pre ? fs.preBad : "";
-        fs.preKey = ""; fs.preLoading = false; fs.preReady = false; fs.preBad = "";
-        // Cookies sirf tab lagao jab zaroorat ho (naya WebView ya session badla). Garam WebView ki cookies mat chhedo.
-        ensureCookies(fs, t.cookieStr);
-        fs.acted = false;
-        fs.extended = false;
-        fs.startedAt = System.currentTimeMillis();
-        fs.active = true;
-        fs.retries = 0;
-        fs.target = cleanName(t.target);
-        fs.taskType = t.taskType;
-        fs.mediaId = t.mediaId;
-        fs.key = t.key;
-        activeSlots++;
-        fs.timeout = new Runnable() {
-            @Override
-            public void run() {
-                slotTimeout(fs);
-            }
-        };
-        uiHandler.postDelayed(fs.timeout, SLOT_TASK_TIMEOUT_MS + (preReady ? 0L : SLOT_LOAD_ALLOWANCE_MS));
-        dbg("slot start uid=" + fs.uid + " type=" + fs.taskType + " target=" + fs.target + " prewarmed=" + pre);
-        notifyStarted(fs.uid, fs.target, fs.taskType);
-        if (preBad.length() > 0) {
-            finishSlot(fs, false, preBad);
-            return;
-        }
-        if (preReady) {
-            uiHandler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    if (fs.active) injectForSlot(fs);
-                }
-            }, 300);
-            return;
-        }
-        if (pre) return; // page abhi load ho raha hai, onPageFinished se script chalegi
-        fs.wv.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
-    }
-
-    private void finishSlot(final Slot s, boolean ok, String msg) {
-        if (s == null || !s.active) return;
-        s.active = false;
-        activeSlots--;
-        if (activeSlots < 0) activeSlots = 0;
-        lastEndAt = System.currentTimeMillis();
-        dbg("slot done uid=" + s.uid + " ok=" + ok + " msg=" + msg);
-        if (s.timeout != null) uiHandler.removeCallbacks(s.timeout);
-        if (ok) {
-            doneMap.put(s.uid + "|" + s.key, lastEndAt);
-            saveMap("done_map", doneMap, DONE_TTL_MS, 1500);
-            unavailVotes.remove(s.key);
-        } else if (msg != null && msg.toLowerCase().contains("unavailable")) {
-            noteUnavailable(s);
-        }
-        sendParallelResult(s.uid, s.target, ok, msg);
-        // WebView zinda rakho (agla task isi account ka ho to tez chalega), bas purana page/JS band karo
-        try {
-            s.wv.stopLoading();
-            s.wv.loadUrl("about:blank");
+            long maxMs = TASK_TIMEOUT_MS + 15000L;
+            mainWebView.evaluateJavascript(
+                    "try{if(typeof window.onWorkerStarted==='function')window.onWorkerStarted("
+                            + JSONObject.quote(uid == null ? "" : uid) + ","
+                            + JSONObject.quote(target == null ? "" : target) + ","
+                            + JSONObject.quote(type == null ? "" : type) + "," + maxMs + ");}catch(e){}",
+                    null);
         } catch (Exception ignored) {}
-        scheduleIdleCleanup();
-        pumpQueue();
     }
 
-    // Ruka hua (idle) WebView band karke RAM free karo
-    private void releaseIdleSlot(String uid) {
-        if (uid == null || uid.isEmpty()) return;
-        final Slot s = slots.get(uid);
-        if (s == null || s.active) return;
-        slots.remove(uid);
-        uiHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    ViewGroup par = (ViewGroup) s.wv.getParent();
-                    if (par != null) par.removeView(s.wv);
-                    s.wv.stopLoading();
-                    s.wv.destroy();
-                } catch (Exception ignored) {}
-            }
-        });
+    // Device fingerprint
+    private String computeDeviceKey() {
+        try {
+            @SuppressLint("HardwareIds")
+            String id = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+            if (id == null) id = "";
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest((id + APP_SECRET_KEY).getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : hash) sb.append(String.format("%02x", b));
+            return sb.toString().substring(0, 32);
+        } catch (Exception e) { return "unknown_device"; }
     }
 
-    // Queue khali ho jaye to 45 sec baad saare idle WebView band
-    private final Runnable idleCleanup = new Runnable() {
-        @Override
-        public void run() {
-            if (activeSlots == 0 && pendingTasks.isEmpty()) {
-                for (String u : new ArrayList<String>(slots.keySet())) {
-                    releaseIdleSlot(u);
-                }
-            }
-        }
-    };
-
-    private void scheduleIdleCleanup() {
-        uiHandler.removeCallbacks(idleCleanup);
-        uiHandler.postDelayed(idleCleanup, 45000);
-    }
-
-    // Result page ko jaata hai: onWorkerResult(success, msg, accountId, target)
-    // Pehle 2 arguments purane jaise hain, baaki 2 naye (account pehchanne ke liye)
-    private void sendParallelResult(String uid, String target, boolean ok, String msg) {
-        String safe = (msg == null ? "" : msg).replace("\\", "\\\\").replace("'", "\\'");
-        String safeT = (target == null ? "" : target).replace("\\", "\\\\").replace("'", "\\'");
-        // SMOOTH: result page tak pakka pahunche + special characters se JS na tute.
-        // Purana tareeka niche as-is rakha hai (RESULT_RETRY_ENABLED = false karo to wahi chalega).
-        if (RESULT_RETRY_ENABLED) {
-            enqueueResultCall("window.onWorkerResult(" + ok + ", "
-                    + JSONObject.quote(msg == null ? "" : msg) + ", "
-                    + JSONObject.quote(uid == null ? "" : uid) + ", "
-                    + JSONObject.quote(target == null ? "" : target) + ")");
-            return;
-        }
-        mainWebView.evaluateJavascript(
-                "if(window.onWorkerResult) window.onWorkerResult(" + ok + ", '" + safe + "', '" + uid + "', '" + safeT + "');", null);
-    }
-
-    private String buildTaskUrl(String target, String taskType, String mediaId) {
-        String cleanTarget = target == null ? "" : target.replaceAll("[^A-Za-z0-9._]", "");
-        if ("like".equalsIgnoreCase(taskType)) {
-            if (mediaId != null && mediaId.startsWith("https://www.instagram.com/")) return mediaId;
-            if (mediaId != null && !mediaId.isEmpty() && mediaId.matches("[A-Za-z0-9_-]+") && !mediaId.equals("25025320")) {
-                return (mediaId.length() <= 12 ? "https://www.instagram.com/reel/" : "https://www.instagram.com/p/") + mediaId + "/";
-            }
-        }
-        return "https://www.instagram.com/" + cleanTarget + "/";
-    }
-
-    private void applyCookiesTo(CookieManager cm, String cookieStr) {
-        String existing = cm.getCookie(IG_URL);
-        if (existing != null) {
-            for (String part : existing.split(";")) {
-                String p = part.trim();
-                int i = p.indexOf('=');
-                String name = i > 0 ? p.substring(0, i) : p;
-                if (name.isEmpty()) continue;
-                cm.setCookie(IG_URL, name + "=; Max-Age=0; Path=/; Domain=.instagram.com");
-                cm.setCookie(IG_URL, name + "=; Max-Age=0; Path=/");
-            }
-        }
-        if (cookieStr != null && !cookieStr.isEmpty()) {
-            for (String part : cookieStr.split(";")) {
-                String p = part.trim();
-                int i = p.indexOf('=');
-                if (i <= 0) continue;
-                String name = p.substring(0, i);
-                String extra = "; Domain=.instagram.com; Path=/; Secure";
-                if ("sessionid".equals(name)) extra += "; HttpOnly";
-                cm.setCookie(IG_URL, p + extra);
-            }
-        }
-        cm.flush();
-    }
-
-    // 'not found' / 'unavailable' / page error par 2 baar page reload karke dobara try
-    private boolean shouldRetry(Slot s, String msg) {
-        if (s == null || !s.active || s.retries >= 1) return false;
-        if (System.currentTimeMillis() - s.startedAt > 14000) return false; // retry ke liye samay bacha ho
-        String m = msg == null ? "" : msg.toLowerCase();
-        return m.contains("not found") || m.contains("did not register")
-                || m.contains("page error") || m.contains("js error")
-                || m.contains("unavailable");
-    }
-
-    // reload se pehle 3 sec ruko taaki Instagram ko saans mile
-    private void retrySlot(final Slot s) {
-        s.retries++;
-        uiHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (!s.active) return;
-                try {
-                    s.wv.reload();
-                } catch (Exception e) {
-                    finishSlot(s, false, "Page error");
-                }
-            }
-        }, 3000);
-    }
-
-    private Slot createSlot(String uid) {
-        Slot s = new Slot();
-        s.uid = uid;
-        WebView wv = new WebView(this);
-        String pname = "acc_" + uid;
-        Profile p = ProfileStore.getInstance().getOrCreateProfile(pname);
-        WebViewCompat.setProfile(wv, pname);
-        s.cm = p.getCookieManager();
-
-        WebSettings st = wv.getSettings();
-        st.setJavaScriptEnabled(true);
-        st.setDomStorageEnabled(true);
-        st.setDatabaseEnabled(true);
-        st.setBlockNetworkImage(true); // photos load nahi honge -> tez
-        st.setUserAgentString(USER_AGENT); // normal UA: Instagram ko secret key nahi dikhani
-        s.cm.setAcceptCookie(true);
-        s.cm.setAcceptThirdPartyCookies(wv, true);
-
-        wv.setLayoutParams(new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        wv.setAlpha(0.01f);
-        ViewGroup root = (ViewGroup) findViewById(android.R.id.content);
-        if (root != null) root.addView(wv, 0);
-
-        wv.addJavascriptInterface(new SlotBridge(s), "WorkerBridge");
-        wv.setWebViewClient(new SlotClient(s));
-        s.wv = wv;
-        slots.put(uid, s);
-        return s;
-    }
-
-    private void ensureCookies(Slot s, String cookieStr) {
-        String curSid = cookieValue(s.cm.getCookie(IG_URL), "sessionid");
-        if (curSid.isEmpty() || !curSid.equals(cookieValue(cookieStr, "sessionid"))) {
-            applyCookiesTo(s.cm, cookieStr);
-        }
-    }
-
-    // ==================================================================
-    // Bekar (dead) profile: 2 alag accounts se "unavailable" aaye to dead mano
-    // ==================================================================
-    private void noteUnavailable(Slot s) {
-        HashSet<String> v = unavailVotes.get(s.key);
-        if (v == null) {
-            v = new HashSet<String>();
-            unavailVotes.put(s.key, v);
-        }
-        v.add(s.uid);
-        if (v.size() >= 2) {
-            deadMap.put(s.key, System.currentTimeMillis());
-            saveMap("dead_map", deadMap, DEAD_TTL_MS, 1500);
-            reportDead(s.taskType, s.target, "unavailable", s.mediaId);
-            unavailVotes.remove(s.key);
-        }
-    }
-
-    private static String jsq(String x) {
-        return x == null ? "" : x.replace("\\", "\\\\").replace("'", "\\'");
-    }
-
-    // Website ko batao. Agar website me window.onProfileDead hai to wahi chalega,
-    // warna app khud dead_profile.php ko POST karta hai (website me kuch jodna nahi padta).
-    private void reportDead(String type, String target, String reason, String mediaId) {
-        if (mainWebView == null || !trusted()) return;
-        mainWebView.evaluateJavascript(
-                "(function(){var t='" + jsq(target) + "',ty='" + jsq(type) + "',r='" + jsq(reason)
-                        + "',m='" + jsq(mediaId) + "';"
-                        + "if(window.onProfileDead){window.onProfileDead(t,ty,r,m);return;}"
-                        + "try{var fd=new FormData();fd.append('target',t);fd.append('media',m);"
-                        + "fd.append('type',ty);fd.append('reason',r);fd.append('dk','" + deviceKey + "');"
-                        + "fetch('" + HOSTING_BASE + "dead_profile.php',{method:'POST',body:fd,credentials:'include'});}catch(e){}})();",
-                null);
-    }
-
-    // ==================================================================
-    // Phone me save hone wali chhoti memory (done / dead)
-    // ==================================================================
+    // Map persistence
     private void loadMap(String pref, Map<String, Long> m) {
         try {
             Set<String> set = prefs.getStringSet(pref, null);
@@ -2658,203 +1470,92 @@ public class MainActivity extends Activity {
         try {
             long now = System.currentTimeMillis();
             java.util.Iterator<Map.Entry<String, Long>> it = m.entrySet().iterator();
-            while (it.hasNext()) {
-                if (now - it.next().getValue() > ttl) it.remove();
-            }
+            while (it.hasNext()) { if (now - it.next().getValue() > ttl) it.remove(); }
             while (m.size() > cap) {
-                String oldest = null;
-                long ot = Long.MAX_VALUE;
-                for (Map.Entry<String, Long> e : m.entrySet()) {
-                    if (e.getValue() < ot) { ot = e.getValue(); oldest = e.getKey(); }
-                }
+                String oldest = null; long ot = Long.MAX_VALUE;
+                for (Map.Entry<String, Long> e : m.entrySet()) { if (e.getValue() < ot) { ot = e.getValue(); oldest = e.getKey(); } }
                 if (oldest == null) break;
                 m.remove(oldest);
             }
-            Set<String> out = new HashSet<String>();
+            Set<String> out = new HashSet<>();
             for (Map.Entry<String, Long> e : m.entrySet()) out.add(e.getKey() + "\t" + e.getValue());
             prefs.edit().putStringSet(pref, out).apply();
         } catch (Exception ignored) {}
     }
 
-    public class SlotBridge {
-        private final Slot s;
-        SlotBridge(Slot s) { this.s = s; }
+    // Auto-start
+    private void tryAutoStart(final int attempt) {
+        if (attempt > 20) return;
+        uiHandler.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (mainWebView == null) return;
+                mainWebView.evaluateJavascript(
+                        "(function(){if(window.__autoStarted)return 'done';"
+                                + "if(typeof window.onAppAutoStart==='function'){window.__autoStarted=true;window.onAppAutoStart();return 'done';}"
+                                + "return 'wait';})()",
+                        new ValueCallback<String>() {
+                            @Override public void onReceiveValue(String v) {
+                                if (v != null && v.contains("wait")) tryAutoStart(attempt + 1);
+                            }
+                        });
+            }
+        }, attempt == 0 ? 1500 : 1000);
+    }
 
-        // Script ne follow/like kar diya (API ya click)
-        @JavascriptInterface
-        public void onActed() {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (s.active) s.acted = true;
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onTaskResult(final boolean success, final String message) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (!s.active) return; // purane/band task ka result ignore
-                    if (!success && shouldRetry(s, message)) {
-                        retrySlot(s);
-                        return;
-                    }
-                    String m2 = message;
-                    if (success && s.acted) {
-                        // Hamne khud follow/like kiya, to "Already" nahi "Successfully" bhejo (coin ke liye)
-                        if ("Already Following".equals(m2)) m2 = "Followed Successfully";
-                        else if ("Already Liked".equals(m2)) m2 = "Post Liked Successfully";
-                    }
-                    finishSlot(s, success, m2);
-                }
-            });
+    // =========================================================
+    //  NOTIFICATION
+    // =========================================================
+    private void createNotificationChannel() {
+        notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "Automation Service", NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription("Shows live automation stats in status bar");
+            ch.setShowBadge(false);
+            if (notificationManager != null) notificationManager.createNotificationChannel(ch);
         }
     }
 
-    private class SlotClient extends WebViewClient {
-        private final Slot s;
-        SlotClient(Slot s) { this.s = s; }
-
-        // SMOOTH: is account ka WebView mar jaye to sirf ye task fail ho, app crash na ho,
-        // aur agla task naya WebView bana kar chale
-        @TargetApi(Build.VERSION_CODES.O)
-        @Override
-        public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
-            dbg("renderer gone slot uid=" + s.uid);
-            slots.remove(s.uid); // pump naya WebView banayega
-            finishSlot(s, false, "Page error");
-            destroyWebViewSafe(s.wv);
-            return true;
-        }
-
-        @Override
-        public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-            WebResourceResponse blocked = blockHeavy(request);
-            return blocked != null ? blocked : super.shouldInterceptRequest(view, request);
-        }
-
-        @Override
-        public void onPageFinished(final WebView view, String url) {
-            super.onPageFinished(view, url);
-            // SMOOTH v2: task shuru hone se pehle prewarm wala page load hua
-            if (!s.active) {
-                if (s.preLoading && url != null && !url.startsWith("about:")) {
-                    s.preLoading = false;
-                    s.preReady = true;
-                    s.preBad = fatalPathReason(url);
-                }
-                return;
-            }
-            if (!s.active || url == null || url.startsWith("about:")) return;
-
-            String path = "";
-            try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
-
-            if (path.startsWith("/accounts/suspended")) { finishSlot(s, false, "Suspended: Instagram suspended this account"); return; }
-            if (path.startsWith("/accounts/disabled")) { finishSlot(s, false, "Disabled: Instagram disabled this account"); return; }
-            if (path.startsWith("/challenge") || path.startsWith("/checkpoint") || path.startsWith("/auth_platform")) { finishSlot(s, false, "Blocked: Challenge / Checkpoint"); return; }
-            if (path.startsWith("/accounts/login") || path.startsWith("/accounts/emailsignup")) { finishSlot(s, false, "Session expired"); return; }
-
-            uiHandler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    if (!s.active) return;
-                    if ("like".equalsIgnoreCase(s.taskType)) {
-                        injectLikeScript(view);
-                    } else {
-                        injectFollowScript(view);
-                    }
-                }
-            }, 400);
-        }
-
-        @Override
-        public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-            super.onReceivedError(view, request, error);
-            if (s.active && request != null && request.isForMainFrame()) {
-                if (shouldRetry(s, "page error")) {
-                    retrySlot(s);
-                } else {
-                    finishSlot(s, false, "Page error");
-                }
-            } else if (!s.active && request != null && request.isForMainFrame()) {
-                // prewarm page fail: task start par normal tareeke se load hoga
-                s.preKey = ""; s.preLoading = false; s.preReady = false; s.preBad = "";
-            }
-        }
+    private void showOrUpdateNotification(int accounts, int tasks, int coins) {
+        if (notificationManager == null) return;
+        Notification.Builder b;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) b = new Notification.Builder(this, CHANNEL_ID);
+        else b = new Notification.Builder(this);
+        b.setContentTitle("UpFollow Running")
+                .setContentText("Accounts: " + accounts + " Active  |  Tasks: " + tasks + "  |  Coins: +" + coins)
+                .setSmallIcon(android.R.drawable.stat_notify_sync).setOngoing(true);
+        Intent open = new Intent(this, MainActivity.class);
+        open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        int pf = Build.VERSION.SDK_INT >= 23
+                ? (PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
+                : PendingIntent.FLAG_UPDATE_CURRENT;
+        b.setContentIntent(PendingIntent.getActivity(this, 0, open, pf));
+        notificationManager.notify(NOTIFICATION_ID, b.build());
     }
 
-    // ==================================================================
-    // SPEED: hidden browsers me photos / videos / fonts load nahi hote
-    // (follow/like ko sirf buttons chahiye) -> page 2-3 guna jaldi khulta hai
-    // ==================================================================
-    private WebResourceResponse blockHeavy(WebResourceRequest request) {
-        try {
-            if (request == null || request.getUrl() == null || request.isForMainFrame()) return null;
-            String p = String.valueOf(request.getUrl().getPath()).toLowerCase();
-            if (p.endsWith(".jpg") || p.endsWith(".jpeg") || p.endsWith(".png") || p.endsWith(".webp")
-                    || p.endsWith(".gif") || p.endsWith(".mp4") || p.endsWith(".m4s") || p.endsWith(".webm")
-                    || p.endsWith(".woff") || p.endsWith(".woff2") || p.endsWith(".ttf")) {
-                return new WebResourceResponse("text/plain", "UTF-8", new ByteArrayInputStream(new byte[0]));
-            }
-        } catch (Exception ignored) {}
-        return null;
+    private void clearAutomationNotification() {
+        if (notificationManager != null) notificationManager.cancel(NOTIFICATION_ID);
     }
 
-    // ==================================================================
-    // BACKGROUND FIX: app background me jaaye tab bhi automation na ruke
-    // 1) Foreground service (notification ke saath) -> Android process ko kill/sula nahi karta
-    // 2) Heartbeat -> background me WebView ke JS timers slow ho jaate hain, isliye
-    //    native side se har 1.5 sec page ko "tick" bheja jaata hai
-    // 3) onPause me timers dobara resume
-    // ==================================================================
+    // =========================================================
+    //  BACKGROUND / WAKELOCK
+    // =========================================================
     private boolean automationOn = false;
-    private static final String POKE_JS =
-            "(function(){try{if(window.__ufTick&&window.__ufRunning&&Date.now()-(window.__ufLast||0)>1200){window.__ufTick();}}catch(e){}})();";
-
-    private final Runnable heartbeat = new Runnable() {
-        @Override
-        public void run() {
-            if (!automationOn) return;
-            try {
-                mainWebView.resumeTimers();
-                // Website chahe to is function me apna loop dobara jaga sakti hai
-                mainWebView.evaluateJavascript("if(window.onNativeHeartbeat) window.onNativeHeartbeat();", null);
-                if (taskActive) workerWebView.evaluateJavascript(POKE_JS, null);
-                for (Slot sl : new ArrayList<Slot>(slots.values())) {
-                    if (sl.active && sl.wv != null) sl.wv.evaluateJavascript(POKE_JS, null);
-                }
-            } catch (Exception ignored) {}
-            uiHandler.postDelayed(this, 1500);
-        }
-    };
 
     private void startAutomationBackground() {
         automationOn = true;
-        uiHandler.removeCallbacks(heartbeat);
-        uiHandler.postDelayed(heartbeat, 1500);
         try {
             Intent svc = new Intent(this, AutomationService.class);
-            if (Build.VERSION.SDK_INT >= 26) {
-                startForegroundService(svc);
-            } else {
-                startService(svc);
-            }
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc);
+            else startService(svc);
         } catch (Exception ignored) {}
         requestBatteryExemptionOnce();
     }
 
     private void stopAutomationBackground() {
         automationOn = false;
-        uiHandler.removeCallbacks(heartbeat);
-        try {
-            stopService(new Intent(this, AutomationService.class));
-        } catch (Exception ignored) {}
+        try { stopService(new Intent(this, AutomationService.class)); } catch (Exception ignored) {}
     }
 
-    // Battery optimization se app ko bahar karne ka system popup (sirf ek baar poochta hai)
     private void requestBatteryExemptionOnce() {
         try {
             if (Build.VERSION.SDK_INT < 23 || prefs == null) return;
@@ -2869,94 +1570,46 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {}
     }
 
-    // Instagram page se sirf username lene ke liye (nonce ke bina kaam nahi karta)
-    public class IgProbeInterface {
-        @JavascriptInterface
-        public void onIgInfo(final String nonce, final String username) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (captureBusy && nonce != null && nonce.equals(captureNonce)) {
-                        finishCapture(username);
-                    }
-                }
-            });
-        }
+    // =========================================================
+    //  RENDERER CRASH
+    // =========================================================
+    private long lastRecreateAt = 0;
+    private void onRendererGone(String who) {
+        dbg("WebView renderer gone: " + who);
+        long now = System.currentTimeMillis();
+        if (now - lastRecreateAt < 20000L) return;
+        lastRecreateAt = now;
+        uiHandler.post(new Runnable() {
+            @Override public void run() { try { recreate(); } catch (Exception ignored) {} }
+        });
     }
 
-    public class WorkerAppInterface {
-        // Script ne follow/like kar diya (API ya click), ye yaad rakhne ke liye
-        @JavascriptInterface
-        public void onActed() {
-            workerActed = true;
-        }
-
-        @JavascriptInterface
-        public void onTaskResult(final boolean success, final String message) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    // FIX: fail aaye to pehle retry, tabhi result bhejo jab retry khatam ho
-                    if (!success && workerShouldRetry(message)) {
-                        retryWorker();
-                        return;
-                    }
-                    String m2 = message;
-                    if (success && workerActed) {
-                        // Hamne khud follow/like kiya, to "Already" nahi "Successfully" bhejo (coin ke liye)
-                        if ("Already Following".equals(m2)) m2 = "Followed Successfully";
-                        else if ("Already Liked".equals(m2)) m2 = "Post Liked Successfully";
-                    }
-                    deliverResult(success, m2);
-                }
-            });
-        }
-
-        // ---- FAST FOLLOW callbacks (single mode) ----
-
-        // JS ne ID nikali: cache me save karo
-        @JavascriptInterface
-        public void onSingleFastId(final String name, final String id) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    putFastIdSingle(name, id);
-                }
-            });
-        }
-
-        // Cached ID galat nikli (400/404): cache se hata do
-        @JavascriptInterface
-        public void onSingleFastBadId(final String name) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    dropFastIdSingle(name);
-                }
-            });
-        }
-
-        // Fast API fail: purana page-load wala flow chalao
-        @JavascriptInterface
-        public void onSingleFastFallback(final long token) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (!taskActive || workerStartedAt != token) return;
-                    singleWorkerWarm = false;
-                    singleFastFallback(singleFastTarget, singleFastCookies, singleFastMediaId);
-                }
-            });
-        }
+    // =========================================================
+    //  DEBUG LOG
+    // =========================================================
+    private final ArrayDeque<String> dbgLog = new ArrayDeque<>();
+    private void dbg(String m) {
+        try {
+            String line = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(new java.util.Date()) + " " + m;
+            synchronized (dbgLog) { dbgLog.add(line); while (dbgLog.size() > 150) dbgLog.poll(); }
+            Log.d("UpFollow", m);
+        } catch (Exception ignored) {}
     }
 
+    // =========================================================
+    //  DATA CLASSES
+    // =========================================================
+    private class PTask {
+        String uid = "", target = "", taskType = "follow", mediaId = "", cookieStr = "", key = "";
+    }
+
+    // =========================================================
+    //  LIFECYCLE
+    // =========================================================
     @Override
     protected void onPause() {
         super.onPause();
-        // Background me jaane par bhi WebView ke JS timers chalte rahein
-        if (automationOn) {
-            try { mainWebView.resumeTimers(); } catch (Exception ignored) {}
-        }
+        if (automationOn) { try { mainWebView.resumeTimers(); } catch (Exception ignored) {} }
     }
 
     @Override
@@ -2967,26 +1620,8 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (mainWebView.canGoBack()) {
-            mainWebView.goBack();
-        } else {
-            super.onBackPressed();
-        }
-    }
-
-    // Saare slot WebViews destroy (app band hone par)
-    private void destroyAllSlots() {
-        for (String u : new ArrayList<String>(slots.keySet())) {
-            Slot sl = slots.remove(u);
-            if (sl == null || sl.wv == null) continue;
-            try {
-                if (sl.timeout != null) uiHandler.removeCallbacks(sl.timeout);
-                ViewGroup par = (ViewGroup) sl.wv.getParent();
-                if (par != null) par.removeView(sl.wv);
-                sl.wv.stopLoading();
-                sl.wv.destroy();
-            } catch (Exception ignored) {}
-        }
+        if (mainWebView.canGoBack()) mainWebView.goBack();
+        else super.onBackPressed();
     }
 
     @Override
@@ -2994,10 +1629,8 @@ public class MainActivity extends Activity {
         automationOn = false;
         try { stopService(new Intent(this, AutomationService.class)); } catch (Exception ignored) {}
         uiHandler.removeCallbacksAndMessages(null);
-        destroyAllSlots();
-        if (wakeLock != null && wakeLock.isHeld()) {
-            wakeLock.release();
-        }
+        ioPool.shutdownNow();
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         super.onDestroy();
     }
 }
