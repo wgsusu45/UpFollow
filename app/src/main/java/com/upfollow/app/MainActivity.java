@@ -103,6 +103,13 @@ public class MainActivity extends Activity {
     private String captureNonce = "";
     private String captureCookies = "";
 
+    // FAST FOLLOW - SINGLE MODE: page load nahi, seedha API se follow
+    private boolean singleWorkerWarm = false;   // worker WebView warm page (robots.txt) par hai
+    private boolean singleFastPending = false;  // warm load hone ke baad fast follow chalana hai
+    private String singleFastTarget = "";       // current fast task ka target username
+    private String singleFastCookies = "";      // current fast task ki cookies
+    private String singleFastMediaId = "";      // current fast task ka mediaId (like ke liye)
+
 
     private final Runnable taskTimeout = new Runnable() {
         @Override
@@ -264,8 +271,28 @@ public class MainActivity extends Activity {
             public void onPageFinished(final WebView view, String url) {
                 super.onPageFinished(view, url);
                 // SMOOTH v2: task shuru hone se pehle (gap ke dauran) next account ka page pehle se load ho raha hota hai
-                if (!taskActive) { singleOnPreFinished(url); return; }
+                if (!taskActive) {
+                    singleOnPreFinished(url);
+                    // FAST FOLLOW: warm page (robots.txt) load hua, mark karo
+                    if (url != null && url.startsWith(WARM_URL)) {
+                        singleWorkerWarm = true;
+                    }
+                    return;
+                }
                 if (!taskActive || url == null || url.startsWith("about:")) return;
+
+                // FAST FOLLOW: warm page ready hua, seedha API chalao (page load nahi)
+                if (singleFastPending && url.startsWith(WARM_URL)) {
+                    singleWorkerWarm = true;
+                    singleFastPending = false;
+                    uiHandler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (taskActive) runFastSingle(singleFastTarget, singleFastCookies);
+                        }
+                    }, 30);
+                    return;
+                }
 
                 String path = "";
                 try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
@@ -1656,6 +1683,32 @@ public class MainActivity extends Activity {
             return;
         }
         if (pre) return; // page abhi load ho raha hai, onPageFinished se script chalegi
+
+        // FAST FOLLOW: follow task me seedha API chalao, page load nahi
+        if (!"like".equalsIgnoreCase(t.taskType)) {
+            if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
+                applyInstagramCookies(t.cookieStr);
+            }
+            singleFastTarget = t.target;
+            singleFastCookies = t.cookieStr;
+            singleFastMediaId = t.mediaId;
+            if (singleWorkerWarm) {
+                // Worker WebView pehle se warm page par hai: seedha API
+                singleFastPending = false;
+                runFastSingle(t.target, t.cookieStr);
+            } else {
+                // Warm page load karo, onPageFinished me API chalegi
+                singleFastPending = true;
+                try {
+                    workerWebView.loadUrl(WARM_URL);
+                } catch (Exception e) {
+                    singleFastFallback(t.target, t.cookieStr, t.mediaId);
+                }
+            }
+            return;
+        }
+
+        // Like task: purana page-load wala flow
         if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
             applyInstagramCookies(t.cookieStr);
         }
@@ -1664,6 +1717,115 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             deliverResult(false, "Page error");
         }
+    }
+
+    // FAST FOLLOW: warm WebView se seedha Instagram API call - ZERO page load time
+    private void runFastSingle(final String target, final String cookieStr) {
+        final String name = cleanName(target);
+        if (name.isEmpty()) {
+            deliverResult(false, "Profile unavailable");
+            return;
+        }
+        final long token = workerStartedAt;
+        // Cache me ID hai to aur tez (ek API call skip)
+        String cachedId = getFastIdSingle(name);
+
+        String script = js(
+            "(function(){",
+            "  var TOKEN = " + token + ";",
+            "  var NAME = " + JSONObject.quote(name) + ";",
+            "  var CID = " + JSONObject.quote(cachedId == null ? "" : cachedId) + ";",
+            "  var over = false;",
+            "  function B() { return window.WorkerBridge; }",
+            "  function done(ok, msg) { if (over) return; over = true; try { B().onTaskResult(ok, msg); } catch(e) {} }",
+            "  function fb() { if (over) return; over = true; try { B().onSingleFastFallback(TOKEN); } catch(e) {} }",
+            "  function cookie(n) {",
+            "    var c = (document.cookie || '').split(';');",
+            "    for (var i = 0; i < c.length; i++) {",
+            "      var p = c[i].trim();",
+            "      if (p.indexOf(n + '=') === 0) return p.substring(n.length + 1);",
+            "    }",
+            "    return '';",
+            "  }",
+            "  var csrf = cookie('csrftoken');",
+            "  if (!csrf) { done(false, 'Session expired'); return; }",
+            "  var H = {'x-ig-app-id':'936619743392459','x-requested-with':'XMLHttpRequest'};",
+            "  // Safety timeout",
+            "  setTimeout(function(){ if (!over) fb(); }, 12000);",
+            "  function create(uid, fromCache) {",
+            "    try { B().onActed(); } catch(e) {}",
+            "    var h2 = {",
+            "      'x-csrftoken': csrf,",
+            "      'x-ig-app-id': '936619743392459',",
+            "      'x-requested-with': 'XMLHttpRequest',",
+            "      'content-type': 'application/x-www-form-urlencoded'",
+            "    };",
+            "    fetch('/api/v1/friendships/create/' + uid + '/', {",
+            "      method: 'POST', credentials: 'include', headers: h2, body: ''",
+            "    })",
+            "    .then(function(r){ return r.text().then(function(t){ return {s:r.status, t:t}; }); })",
+            "    .then(function(x){",
+            "      var low = x.t.toLowerCase().split(' ').join('');",
+            "      if (x.s === 200 && low.indexOf('\"status\":\"ok\"') > -1) { done(true, 'Followed Successfully'); return; }",
+            "      if (low.indexOf('checkpoint') > -1 || low.indexOf('challenge') > -1) { done(false, 'Blocked: Challenge / Checkpoint'); return; }",
+            "      if (low.indexOf('login_required') > -1) { done(false, 'Session expired'); return; }",
+            "      if (low.indexOf('feedback_required') > -1 || x.s === 429 || low.indexOf('\"spam\":true') > -1 || low.indexOf('trylater') > -1) { done(false, 'Blocked: Action Limit / Challenge'); return; }",
+            "      if (fromCache && (x.s === 400 || x.s === 404)) { try { B().onSingleFastBadId(NAME); } catch(e) {} }",
+            "      fb();",
+            "    }).catch(function(){ fb(); });",
+            "  }",
+            "  // Cached ID hai to seedha follow karo",
+            "  if (CID) { create(CID, true); return; }",
+            "  // Pehle user info fetch karo (ID + already following check)",
+            "  fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(NAME), {credentials:'include', headers:H})",
+            "  .then(function(r){ return r.text().then(function(t){ return {s:r.status, t:t}; }); })",
+            "  .then(function(x){",
+            "    var low = x.t.toLowerCase();",
+            "    if (low.indexOf('checkpoint_required') > -1 || low.indexOf('challenge_required') > -1) { done(false, 'Blocked: Challenge / Checkpoint'); return; }",
+            "    if (low.indexOf('login_required') > -1) { done(false, 'Session expired'); return; }",
+            "    if (x.s === 429) { fb(); return; }",
+            "    var d = null; try { d = JSON.parse(x.t); } catch(e) {}",
+            "    var u = d && d.data && d.data.user;",
+            "    if (!u || !u.id) { fb(); return; }",
+            "    try { B().onSingleFastId(NAME, String(u.id)); } catch(e) {}",
+            "    if (u.followed_by_viewer || u.requested_by_viewer) { done(true, 'Already Following'); return; }",
+            "    create(String(u.id), false);",
+            "  }).catch(function(){ fb(); });",
+            "})();"
+        );
+        try {
+            workerWebView.evaluateJavascript(script, null);
+        } catch (Exception e) {
+            singleFastFallback(target, cookieStr, singleFastMediaId);
+        }
+    }
+
+    // Fast API fail ho to purana page-load wala flow
+    private void singleFastFallback(String target, String cookieStr, String mediaId) {
+        singleWorkerWarm = false;
+        singleFastPending = false;
+        dbg("single fast fallback -> page load target=" + cleanName(target));
+        try {
+            workerWebView.loadUrl(buildTaskUrl(target, currentTaskType, mediaId));
+        } catch (Exception e) {
+            deliverResult(false, "Page error");
+        }
+    }
+
+    // Fast follow ID cache (single mode ke liye - SharedPreferences use karta hai)
+    private String getFastIdSingle(String name) {
+        if (name == null || name.isEmpty() || prefs == null) return null;
+        return prefs.getString("sfid_" + name.toLowerCase(), null);
+    }
+
+    private void putFastIdSingle(String name, String id) {
+        if (name == null || name.isEmpty() || id == null || !id.matches("[0-9]{3,20}") || prefs == null) return;
+        prefs.edit().putString("sfid_" + name.toLowerCase(), id).apply();
+    }
+
+    private void dropFastIdSingle(String name) {
+        if (name == null || name.isEmpty() || prefs == null) return;
+        prefs.edit().remove("sfid_" + name.toLowerCase()).apply();
     }
 
     // ---- Single mode: gap ke dauran next account ka page pehle se load (prewarm) ----
@@ -1678,6 +1840,35 @@ public class MainActivity extends Activity {
         if (!PREWARM_ENABLED || taskActive) return;
         PTask t = singleQueue.peek();
         if (t == null) return;
+
+        // FAST FOLLOW: follow task ke liye warm page load karo (page load nahi hoga real task me)
+        if (!"like".equalsIgnoreCase(t.taskType)) {
+            if (!singleWorkerWarm) {
+                try {
+                    if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
+                        applyInstagramCookies(t.cookieStr);
+                    }
+                    dbg("single prewarm WARM uid=" + t.uid + " target=" + cleanName(t.target));
+                    workerWebView.loadUrl(WARM_URL);
+                } catch (Exception ignored) {}
+            }
+            // Warm hai: ID pehle se nikal lo
+            else {
+                String name = cleanName(t.target);
+                if (!name.isEmpty() && getFastIdSingle(name) == null) {
+                    try {
+                        if (t.cookieStr != null && !t.cookieStr.isEmpty()) {
+                            applyInstagramCookies(t.cookieStr);
+                        }
+                        dbg("single prewarm ID lookup uid=" + t.uid + " target=" + name);
+                        workerWebView.evaluateJavascript(buildSingleIdLookupScript(name), null);
+                    } catch (Exception ignored) {}
+                }
+            }
+            return;
+        }
+
+        // Like task: purana page prewarm
         String pk = t.uid + "|" + t.key;
         if (pk.equals(singlePreKey) && (singlePreLoading || singlePreReady)) return;
         try {
@@ -1694,6 +1885,23 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             singlePreKey = ""; singlePreLoading = false; singlePreReady = false;
         }
+    }
+
+    // Gap ke dauran agle target ki numeric ID nikal ke cache me rakh lo
+    private String buildSingleIdLookupScript(String name) {
+        return js(
+            "(function(){",
+            "  var NAME = " + JSONObject.quote(name) + ";",
+            "  var H = {'x-ig-app-id':'936619743392459','x-requested-with':'XMLHttpRequest'};",
+            "  fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(NAME), {credentials:'include', headers:H})",
+            "  .then(function(r){ return r.text(); })",
+            "  .then(function(t){",
+            "    var d = null; try { d = JSON.parse(t); } catch(e) {}",
+            "    var u = d && d.data && d.data.user;",
+            "    if (u && u.id) { try { window.WorkerBridge.onSingleFastId(NAME, String(u.id)); } catch(e) {} }",
+            "  }).catch(function(){});",
+            "})();"
+        );
     }
 
     private void singleOnPreFinished(String url) {
@@ -1717,13 +1925,18 @@ public class MainActivity extends Activity {
         deliverResult(false, "Timeout");
     }
 
-    // Task khatam: worker page saaf, gap set, agla task
+    // FAST FOLLOW ke liye warm URL (robots.txt - halka page, cookies valid rehti hain)
+    private static final String WARM_URL = "https://www.instagram.com/robots.txt";
+
+    // Task khatam: worker ko warm page par rakh (fast follow ke liye), gap set, agla task
     private void onSingleTaskEnded() {
         singleLastEnd = System.currentTimeMillis();
         singleGap = nextGap();
+        singleFastPending = false;
         try {
             workerWebView.stopLoading();
-            workerWebView.loadUrl("about:blank");
+            // FAST FOLLOW: about:blank nahi, warm page par raho taaki agle task me page load na ho
+            workerWebView.loadUrl(WARM_URL);
         } catch (Exception ignored) {}
         singlePump();
     }
@@ -1855,18 +2068,12 @@ public class MainActivity extends Activity {
     //  - Website ko onWorkerStarted(uid, target, type, maxMs) milta hai, taaki uska timer
     //    queue me intezaar ke time se nahi, asli start se chale.
     // ==================================================================
-    private static final long MIN_GAP_MS = 3000L;   // pehle 7 sec tha
+    private static final long MIN_GAP_MS = 7000L;
     private static final long TASK_VERIFY_EXTRA_MS = 15000L;
     private static final long SLOT_VERIFY_EXTRA_MS = 15000L;
     private static final long SLOT_LOAD_ALLOWANCE_MS = 8000L;
     private static final boolean FORCE_SERIAL = true;
     private static final boolean PREWARM_ENABLED = true;
-
-    // PERSISTENT BROWSER: true = har account ka WebView app khula rehne tak zinda rahe
-    // (task ke baad band nahi hota, 45 sec idle cleanup bhi nahi). false = purana behaviour.
-    private static final boolean PERSISTENT_BROWSER = true;
-    // RAM bachane ke liye ek saath max itne account ke WebView zinda rakhna (isse zyada hone par sabse purana idle band)
-    private static final int MAX_KEEP_SLOTS = 3;
 
     // Queue me se agla task chunna (bina nikaale): pumpQueue aur prewarm dono yahi use karte hain
     private PTask choosePending() {
@@ -1896,10 +2103,6 @@ public class MainActivity extends Activity {
         if (!PREWARM_ENABLED || activeSlots > 0) return;
         PTask pick = choosePending();
         if (pick == null) return;
-        if (FAST_FOLLOW && !"like".equalsIgnoreCase(pick.taskType)) {
-            prewarmFast(pick);
-            return;
-        }
         Slot s = slots.get(pick.uid);
         try {
             if (s == null) s = createSlot(pick.uid);
@@ -1917,7 +2120,6 @@ public class MainActivity extends Activity {
             s.preReady = false;
             s.preBad = "";
             dbg("prewarm uid=" + pick.uid + " target=" + cleanName(pick.target));
-            s.warm = false;
             s.wv.loadUrl(buildTaskUrl(pick.target, pick.taskType, pick.mediaId));
         } catch (Exception e) {
             s.preKey = ""; s.preLoading = false; s.preReady = false;
@@ -2004,13 +2206,6 @@ public class MainActivity extends Activity {
         boolean preReady = false;
         String preBad = "";
         long preAt = 0;
-        // FAST FOLLOW
-        boolean warm = false;        // WebView abhi halka warm page (robots.txt) par hai
-        boolean fastPending = false; // warm page load hone ke baad fast follow chalana hai
-        boolean fastTried = false;
-        long warmReqAt = 0;
-        long lookupAt = 0;
-        String lookupName = "";
     }
 
     private class PTask {
@@ -2034,9 +2229,9 @@ public class MainActivity extends Activity {
     private static final long DEAD_TTL_MS = 7L * 24 * 60 * 60 * 1000L;
 
     // Anti-block gap: ek task KHATAM hone ke baad itna ruk ke agla account (default 9 sec +- jitter)
-    private volatile long startGapMs = 4000L;      // pehle 7 sec
-    private volatile long gapJitterMs = 1500L;     // thoda random, bot jaisa fixed pattern na bane
-    private long curGapMs = 4000L;
+    private volatile long startGapMs = 7000L;
+    private volatile long gapJitterMs = 0L;
+    private long curGapMs = 7000L;
     private long lastStartAt = 0;
     private long lastEndAt = 0;
     private final Random rnd = new Random();
@@ -2157,11 +2352,7 @@ public class MainActivity extends Activity {
             if (pick.uid.equals(lastStartedUid)) {
                 stickyCount++;
             } else {
-                if (!PERSISTENT_BROWSER) {
-                    releaseIdleSlot(lastStartedUid); // pichhle account ka WebView band
-                } else {
-                    trimSlotsIfNeeded(pick.uid);      // persistent: sirf limit paar hone par purana band
-                }
+                releaseIdleSlot(lastStartedUid); // pichhle account ka WebView band
                 stickyCount = 1;
             }
             lastStartAt = System.currentTimeMillis();
@@ -2205,8 +2396,6 @@ public class MainActivity extends Activity {
         fs.taskType = t.taskType;
         fs.mediaId = t.mediaId;
         fs.key = t.key;
-        fs.fastPending = false;
-        fs.fastTried = false;
         activeSlots++;
         fs.timeout = new Runnable() {
             @Override
@@ -2217,25 +2406,6 @@ public class MainActivity extends Activity {
         uiHandler.postDelayed(fs.timeout, SLOT_TASK_TIMEOUT_MS + (preReady ? 0L : SLOT_LOAD_ALLOWANCE_MS));
         dbg("slot start uid=" + fs.uid + " type=" + fs.taskType + " target=" + fs.target + " prewarmed=" + pre);
         notifyStarted(fs.uid, fs.target, fs.taskType);
-        // FAST FOLLOW: follow task me page load nahi, seedha warm WebView se API
-        if (FAST_FOLLOW && !"like".equalsIgnoreCase(fs.taskType) && !pre) {
-            if (fs.warm) {
-                uiHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (fs.active) runFast(fs);
-                    }
-                });
-            } else {
-                fs.fastPending = true;
-                try {
-                    fs.wv.loadUrl(WARM_URL);
-                } catch (Exception e) {
-                    fastFallback(fs);
-                }
-            }
-            return;
-        }
         if (preBad.length() > 0) {
             finishSlot(fs, false, preBad);
             return;
@@ -2250,184 +2420,7 @@ public class MainActivity extends Activity {
             return;
         }
         if (pre) return; // page abhi load ho raha hai, onPageFinished se script chalegi
-        fs.warm = false;
         fs.wv.loadUrl(buildTaskUrl(t.target, t.taskType, t.mediaId));
-    }
-
-    // ==================================================================
-    // FAST FOLLOW: profile page load kiye bina, khule (warm) WebView se seedha Instagram API
-    // - Har account ka WebView ek halke same-origin page (robots.txt) par khada rehta hai
-    // - Follow task aate hi wahin se: (cached) numeric ID -> friendships/create. Page load = 0 sec
-    // - Gap ke dauran agle target ki numeric ID pehle se nikal ke cache me rakh li jaati hai
-    // - Kuch bhi gadbad ho (ID nahi mili, unknown error) to purana page-wala tareeka apne aap chalta hai
-    // - FAST_FOLLOW = false karo to pura purana behaviour wapas
-    // ==================================================================
-    private static final boolean FAST_FOLLOW = true;
-    private static final String WARM_URL = "https://www.instagram.com/robots.txt";
-    private static final long FAST_LOOKUP_GAP_MS = 4000L;            // do lookups ke beech minimum gap
-    private static final long FAST_LOOKUP_PAUSE_MS = 5L * 60 * 1000; // lookup 429 ke baad 5 min naye lookup nahi
-    private final Map<String, String> fastIdCache = new HashMap<String, String>();
-    private long lastFastLookupAt = 0;
-    private long fastLookupBlockedUntil = 0;
-
-    private String getFastId(String name) {
-        if (name == null || name.isEmpty()) return null;
-        String k = name.toLowerCase();
-        String id = fastIdCache.get(k);
-        if (id == null && prefs != null) {
-            id = prefs.getString("fid_" + k, null);
-            if (id != null) fastIdCache.put(k, id);
-        }
-        return id;
-    }
-
-    private void putFastId(String name, String id) {
-        if (name == null || name.isEmpty() || id == null || !id.matches("[0-9]{3,20}")) return;
-        String k = name.toLowerCase();
-        fastIdCache.put(k, id);
-        if (prefs != null) prefs.edit().putString("fid_" + k, id).apply();
-    }
-
-    private void dropFastId(String name) {
-        if (name == null || name.isEmpty()) return;
-        String k = name.toLowerCase();
-        fastIdCache.remove(k);
-        if (prefs != null) prefs.edit().remove("fid_" + k).apply();
-    }
-
-    // Sirf ID nikalne ki script (prewarm ke liye)
-    private String fastLookupScript(String name) {
-        return js(
-            "(function(){",
-            "  var NAME = " + JSONObject.quote(name) + ";",
-            "  var H = {'x-ig-app-id':'936619743392459','x-requested-with':'XMLHttpRequest'};",
-            "  fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(NAME), {credentials:'include', headers:H})",
-            "  .then(function(r){ if (r.status === 429) { try { window.WorkerBridge.onFastLookupThrottled(); } catch(e) {} return ''; } return r.text(); })",
-            "  .then(function(t){",
-            "    if (!t) return;",
-            "    var d = null; try { d = JSON.parse(t); } catch(e) {}",
-            "    var u = d && d.data && d.data.user;",
-            "    if (u && u.id) { try { window.WorkerBridge.onFastId(NAME, String(u.id)); } catch(e) {} }",
-            "  }).catch(function(){});",
-            "})();"
-        );
-    }
-
-    // Task ke liye fast follow chalao (WebView pehle se warm page par hona chahiye)
-    private void runFast(Slot s) {
-        if (s == null || !s.active) return;
-        String name = cleanName(s.target);
-        if (name.isEmpty()) { finishSlot(s, false, "Profile unavailable"); return; }
-        long now = System.currentTimeMillis();
-        String id = getFastId(name);
-        if (id == null) {
-            if (now < fastLookupBlockedUntil) {   // lookup throttled hai: seedha purane tareeke par
-                fastFallback(s);
-                return;
-            }
-            lastFastLookupAt = now;
-        }
-        s.fastTried = true;
-        String script = js(
-            "(function(){",
-            "  var TOKEN = " + s.startedAt + ";",
-            "  var NAME = " + JSONObject.quote(name) + ";",
-            "  var CID = " + JSONObject.quote(id == null ? "" : id) + ";",
-            "  var over = false;",
-            "  function B() { return window.WorkerBridge; }",
-            "  function done(ok, msg) { if (over) return; over = true; try { B().onFastDone(TOKEN, ok, msg); } catch (e) {} }",
-            "  function fb() { if (over) return; over = true; try { B().onFastFallback(TOKEN); } catch (e) {} }",
-            "  function cookie(n) {",
-            "    var c = (document.cookie || '').split(';');",
-            "    for (var i = 0; i < c.length; i++) { var p = c[i].trim(); if (p.indexOf(n + '=') === 0) return p.substring(n.length + 1); }",
-            "    return '';",
-            "  }",
-            "  var csrf = cookie('csrftoken');",
-            "  if (!csrf) { fb(); return; }",
-            "  var H = {'x-ig-app-id':'936619743392459','x-requested-with':'XMLHttpRequest'};",
-            "  setTimeout(fb, 12000);",
-            "  function create(uid, fromCache) {",
-            "    try { B().onFastActed(TOKEN); } catch (e) {}",
-            "    var h2 = {'x-csrftoken':csrf,'x-ig-app-id':'936619743392459','x-requested-with':'XMLHttpRequest','content-type':'application/x-www-form-urlencoded'};",
-            "    fetch('/api/v1/friendships/create/' + uid + '/', {method:'POST', credentials:'include', headers:h2, body:''})",
-            "    .then(function(r){ return r.text().then(function(t){ return {s:r.status, t:t}; }); })",
-            "    .then(function(x){",
-            "      var low = x.t.toLowerCase().split(' ').join('');",
-            "      if (x.s === 200 && low.indexOf('\"status\":\"ok\"') > -1) { done(true, 'Followed Successfully'); return; }",
-            "      if (low.indexOf('checkpoint') > -1 || low.indexOf('challenge') > -1) { done(false, 'Blocked: Challenge / Checkpoint'); return; }",
-            "      if (low.indexOf('login_required') > -1) { done(false, 'Session expired'); return; }",
-            "      if (low.indexOf('feedback_required') > -1 || x.s === 429 || low.indexOf('\"spam\":true') > -1 || low.indexOf('trylater') > -1) { done(false, 'Blocked: Action Limit / Challenge'); return; }",
-            "      if (fromCache && (x.s === 400 || x.s === 404)) { try { B().onFastBadId(NAME); } catch (e) {} }",
-            "      fb();",
-            "    }).catch(function(){ fb(); });",
-            "  }",
-            "  if (CID) { create(CID, true); return; }",
-            "  fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(NAME), {credentials:'include', headers:H})",
-            "  .then(function(r){ return r.text().then(function(t){ return {s:r.status, t:t}; }); })",
-            "  .then(function(x){",
-            "    var low = x.t.toLowerCase();",
-            "    if (low.indexOf('checkpoint_required') > -1 || low.indexOf('challenge_required') > -1) { done(false, 'Blocked: Challenge / Checkpoint'); return; }",
-            "    if (low.indexOf('login_required') > -1) { done(false, 'Session expired'); return; }",
-            "    if (x.s === 429) { try { B().onFastLookupThrottled(); } catch (e) {} fb(); return; }",
-            "    var d = null; try { d = JSON.parse(x.t); } catch (e) {}",
-            "    var u = d && d.data && d.data.user;",
-            "    if (!u || !u.id) { fb(); return; }",
-            "    try { B().onFastId(NAME, String(u.id)); } catch (e) {}",
-            "    if (u.followed_by_viewer || u.requested_by_viewer) { done(true, 'Already Following'); return; }",
-            "    create(String(u.id), false);",
-            "  }).catch(function(){ fb(); });",
-            "})();"
-        );
-        try {
-            s.wv.evaluateJavascript(script, null);
-        } catch (Exception e) {
-            fastFallback(s);
-        }
-    }
-
-    // Fast raasta na chale to purana page-load wala tareeka
-    private void fastFallback(Slot s) {
-        if (s == null || !s.active) return;
-        dbg("fast follow fallback -> page flow uid=" + s.uid + " target=" + s.target);
-        s.fastPending = false;
-        s.warm = false;
-        try {
-            s.wv.loadUrl(buildTaskUrl(s.target, s.taskType, s.mediaId));
-        } catch (Exception e) {
-            finishSlot(s, false, "Page error");
-        }
-    }
-
-    // Gap ke dauran: WebView ko warm page par rakho + agle target ki ID pehle se nikal lo
-    private void prewarmFast(PTask pick) {
-        Slot s = slots.get(pick.uid);
-        try {
-            if (s == null) s = createSlot(pick.uid);
-        } catch (Throwable e) {
-            dbg("prewarm setup error: " + e.getMessage());
-            return;
-        }
-        if (s.active) return;
-        try {
-            ensureCookies(s, pick.cookieStr);
-            long now = System.currentTimeMillis();
-            if (!s.warm) {
-                if (now - s.warmReqAt > 15000L) {
-                    s.warmReqAt = now;
-                    s.wv.loadUrl(WARM_URL);
-                }
-                return;
-            }
-            String name = cleanName(pick.target);
-            if (name.isEmpty() || getFastId(name) != null) return;
-            if (now < fastLookupBlockedUntil || now - lastFastLookupAt < FAST_LOOKUP_GAP_MS) return;
-            if (name.equalsIgnoreCase(s.lookupName) && now - s.lookupAt < 20000L) return;
-            lastFastLookupAt = now;
-            s.lookupName = name;
-            s.lookupAt = now;
-            dbg("prewarm id lookup uid=" + pick.uid + " target=" + name);
-            s.wv.evaluateJavascript(fastLookupScript(name), null);
-        } catch (Exception ignored) {}
     }
 
     private void finishSlot(final Slot s, boolean ok, String msg) {
@@ -2448,17 +2441,8 @@ public class MainActivity extends Activity {
         sendParallelResult(s.uid, s.target, ok, msg);
         // WebView zinda rakho (agla task isi account ka ho to tez chalega), bas purana page/JS band karo
         try {
-            if (FAST_FOLLOW && PERSISTENT_BROWSER) {
-                // WebView ko halke warm page par rakho, taaki agla task bina page load ke chale
-                s.fastPending = false;
-                if (!s.warm) {
-                    s.wv.stopLoading();
-                    s.wv.loadUrl(WARM_URL);
-                }
-            } else {
-                s.wv.stopLoading();
-                s.wv.loadUrl("about:blank");
-            }
+            s.wv.stopLoading();
+            s.wv.loadUrl("about:blank");
         } catch (Exception ignored) {}
         scheduleIdleCleanup();
         pumpQueue();
@@ -2483,36 +2467,10 @@ public class MainActivity extends Activity {
         });
     }
 
-    // Persistent mode: slots MAX_KEEP_SLOTS se zyada ho jayein to idle slots band karo (current account chhodke)
-    private void trimSlotsIfNeeded(String keepUid) {
-        if (slots.size() <= MAX_KEEP_SLOTS) return;
-        for (String u : new ArrayList<String>(slots.keySet())) {
-            if (slots.size() <= MAX_KEEP_SLOTS) break;
-            if (u.equals(keepUid)) continue;
-            releaseIdleSlot(u);
-        }
-    }
-
-    // App band hone par saare slot WebView sahi se destroy
-    private void destroyAllSlots() {
-        for (String u : new ArrayList<String>(slots.keySet())) {
-            Slot sl = slots.remove(u);
-            if (sl == null || sl.wv == null) continue;
-            try {
-                if (sl.timeout != null) uiHandler.removeCallbacks(sl.timeout);
-                ViewGroup par = (ViewGroup) sl.wv.getParent();
-                if (par != null) par.removeView(sl.wv);
-                sl.wv.stopLoading();
-                sl.wv.destroy();
-            } catch (Exception ignored) {}
-        }
-    }
-
     // Queue khali ho jaye to 45 sec baad saare idle WebView band
     private final Runnable idleCleanup = new Runnable() {
         @Override
         public void run() {
-            if (PERSISTENT_BROWSER) return; // persistent mode: WebView khule rahenge
             if (activeSlots == 0 && pendingTasks.isEmpty()) {
                 for (String u : new ArrayList<String>(slots.keySet())) {
                     releaseIdleSlot(u);
@@ -2733,72 +2691,6 @@ public class MainActivity extends Activity {
             });
         }
 
-        // ---- FAST FOLLOW callbacks (token = task ka startedAt, purane task ka result ignore karne ke liye) ----
-        @JavascriptInterface
-        public void onFastActed(final long token) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (s.active && s.startedAt == token) s.acted = true;
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onFastDone(final long token, final boolean success, final String message) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (!s.active || s.startedAt != token) return;
-                    String m2 = message;
-                    if (success && s.acted && "Already Following".equals(m2)) m2 = "Followed Successfully";
-                    finishSlot(s, success, m2);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onFastFallback(final long token) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (!s.active || s.startedAt != token) return;
-                    fastFallback(s);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onFastId(final String name, final String id) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    putFastId(name, id);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onFastBadId(final String name) {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    dropFastId(name);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onFastLookupThrottled() {
-            uiHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    fastLookupBlockedUntil = System.currentTimeMillis() + FAST_LOOKUP_PAUSE_MS;
-                    dbg("fast lookup throttled -> " + (FAST_LOOKUP_PAUSE_MS / 60000L) + " min pause");
-                }
-            });
-        }
-
         @JavascriptInterface
         public void onTaskResult(final boolean success, final String message) {
             uiHandler.post(new Runnable() {
@@ -2846,18 +2738,8 @@ public class MainActivity extends Activity {
         @Override
         public void onPageFinished(final WebView view, String url) {
             super.onPageFinished(view, url);
-            s.warm = FAST_FOLLOW && url != null && url.startsWith(WARM_URL);
             // SMOOTH v2: task shuru hone se pehle prewarm wala page load hua
             if (!s.active) {
-                if (s.warm) {
-                    // warm page taiyar: agle target ki ID pehle se nikal lo
-                    uiHandler.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            prewarmNext();
-                        }
-                    });
-                }
                 if (s.preLoading && url != null && !url.startsWith("about:")) {
                     s.preLoading = false;
                     s.preReady = true;
@@ -2866,18 +2748,6 @@ public class MainActivity extends Activity {
                 return;
             }
             if (!s.active || url == null || url.startsWith("about:")) return;
-
-            // FAST FOLLOW: warm page khul gaya, ab seedha API chalao
-            if (s.fastPending && url.startsWith(WARM_URL)) {
-                s.fastPending = false;
-                uiHandler.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (s.active) runFast(s);
-                    }
-                }, 30);
-                return;
-            }
 
             String path = "";
             try { path = String.valueOf(Uri.parse(url).getPath()).toLowerCase(); } catch (Exception ignored) {}
@@ -2912,7 +2782,6 @@ public class MainActivity extends Activity {
             } else if (!s.active && request != null && request.isForMainFrame()) {
                 // prewarm page fail: task start par normal tareeke se load hoga
                 s.preKey = ""; s.preLoading = false; s.preReady = false; s.preBad = "";
-                s.warm = false;
             }
         }
     }
@@ -3042,6 +2911,43 @@ public class MainActivity extends Activity {
                 }
             });
         }
+
+        // ---- FAST FOLLOW callbacks (single mode) ----
+
+        // JS ne ID nikali: cache me save karo
+        @JavascriptInterface
+        public void onSingleFastId(final String name, final String id) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    putFastIdSingle(name, id);
+                }
+            });
+        }
+
+        // Cached ID galat nikli (400/404): cache se hata do
+        @JavascriptInterface
+        public void onSingleFastBadId(final String name) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    dropFastIdSingle(name);
+                }
+            });
+        }
+
+        // Fast API fail: purana page-load wala flow chalao
+        @JavascriptInterface
+        public void onSingleFastFallback(final long token) {
+            uiHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!taskActive || workerStartedAt != token) return;
+                    singleWorkerWarm = false;
+                    singleFastFallback(singleFastTarget, singleFastCookies, singleFastMediaId);
+                }
+            });
+        }
     }
 
     @Override
@@ -3065,6 +2971,21 @@ public class MainActivity extends Activity {
             mainWebView.goBack();
         } else {
             super.onBackPressed();
+        }
+    }
+
+    // Saare slot WebViews destroy (app band hone par)
+    private void destroyAllSlots() {
+        for (String u : new ArrayList<String>(slots.keySet())) {
+            Slot sl = slots.remove(u);
+            if (sl == null || sl.wv == null) continue;
+            try {
+                if (sl.timeout != null) uiHandler.removeCallbacks(sl.timeout);
+                ViewGroup par = (ViewGroup) sl.wv.getParent();
+                if (par != null) par.removeView(sl.wv);
+                sl.wv.stopLoading();
+                sl.wv.destroy();
+            } catch (Exception ignored) {}
         }
     }
 
