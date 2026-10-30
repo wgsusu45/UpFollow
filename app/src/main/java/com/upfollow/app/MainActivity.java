@@ -1862,6 +1862,12 @@ public class MainActivity extends Activity {
     private static final boolean FORCE_SERIAL = true;
     private static final boolean PREWARM_ENABLED = true;
 
+    // PERSISTENT BROWSER: true = har account ka WebView app khula rehne tak zinda rahe
+    // (task ke baad band nahi hota, 45 sec idle cleanup bhi nahi). false = purana behaviour.
+    private static final boolean PERSISTENT_BROWSER = true;
+    // RAM bachane ke liye ek saath max itne account ke WebView zinda rakhna (isse zyada hone par sabse purana idle band)
+    private static final int MAX_KEEP_SLOTS = 3;
+
     // Queue me se agla task chunna (bina nikaale): pumpQueue aur prewarm dono yahi use karte hain
     private PTask choosePending() {
         PTask pick = null;
@@ -2139,7 +2145,11 @@ public class MainActivity extends Activity {
             if (pick.uid.equals(lastStartedUid)) {
                 stickyCount++;
             } else {
-                releaseIdleSlot(lastStartedUid); // pichhle account ka WebView band
+                if (!PERSISTENT_BROWSER) {
+                    releaseIdleSlot(lastStartedUid); // pichhle account ka WebView band
+                } else {
+                    trimSlotsIfNeeded(pick.uid);      // persistent: sirf limit paar hone par purana band
+                }
                 stickyCount = 1;
             }
             lastStartAt = System.currentTimeMillis();
@@ -2254,10 +2264,36 @@ public class MainActivity extends Activity {
         });
     }
 
+    // Persistent mode: slots MAX_KEEP_SLOTS se zyada ho jayein to idle slots band karo (current account chhodke)
+    private void trimSlotsIfNeeded(String keepUid) {
+        if (slots.size() <= MAX_KEEP_SLOTS) return;
+        for (String u : new ArrayList<String>(slots.keySet())) {
+            if (slots.size() <= MAX_KEEP_SLOTS) break;
+            if (u.equals(keepUid)) continue;
+            releaseIdleSlot(u);
+        }
+    }
+
+    // App band hone par saare slot WebView sahi se destroy
+    private void destroyAllSlots() {
+        for (String u : new ArrayList<String>(slots.keySet())) {
+            Slot sl = slots.remove(u);
+            if (sl == null || sl.wv == null) continue;
+            try {
+                if (sl.timeout != null) uiHandler.removeCallbacks(sl.timeout);
+                ViewGroup par = (ViewGroup) sl.wv.getParent();
+                if (par != null) par.removeView(sl.wv);
+                sl.wv.stopLoading();
+                sl.wv.destroy();
+            } catch (Exception ignored) {}
+        }
+    }
+
     // Queue khali ho jaye to 45 sec baad saare idle WebView band
     private final Runnable idleCleanup = new Runnable() {
         @Override
         public void run() {
+            if (PERSISTENT_BROWSER) return; // persistent mode: WebView khule rahenge
             if (activeSlots == 0 && pendingTasks.isEmpty()) {
                 for (String u : new ArrayList<String>(slots.keySet())) {
                     releaseIdleSlot(u);
@@ -2729,6 +2765,7 @@ public class MainActivity extends Activity {
         automationOn = false;
         try { stopService(new Intent(this, AutomationService.class)); } catch (Exception ignored) {}
         uiHandler.removeCallbacksAndMessages(null);
+        destroyAllSlots();
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
         }
